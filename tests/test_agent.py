@@ -200,7 +200,9 @@ class AgentTests(unittest.TestCase):
                 self.assertIn("Provider connected.", result.stdout)
                 headers, body = api.requests[0]
                 self.assertEqual(body["model"], "any/custom-model-id")
-                self.assertEqual(len(body["tools"]), 6)
+                self.assertEqual(len(body["tools"]), 7)
+                names = [(tool if provider == "claude" else tool["function"])["name"] for tool in body["tools"]]
+                self.assertIn("delegate_tasks", names)
                 self.assertNotIn("test-key-never-render-me", result.stdout + result.stderr)
                 lowered = {k.lower(): v for k, v in headers.items()}
                 if provider == "claude":

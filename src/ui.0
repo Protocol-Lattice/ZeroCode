@@ -221,7 +221,9 @@ fn handleKey(app: mutref<App>, key: u32) -> Void {
                 approveTool(app)
             }
             if key == 110 || key == 78 {
-                toolResult(app, "Error: the user denied this action. Do not retry it without new instructions.")
+                if app.jobsApproval > 0 { answerJobApproval(app, false) } else {
+                    toolResult(app, "Error: the user denied this action. Do not retry it without new instructions.")
+                }
             }
             return
         }
@@ -589,6 +591,10 @@ fn render(world: World, app: mutref<App>) -> Void raises {
         }
         if app.phase == 3 {
             status = "running command · esc to stop"
+            color = "\x1b[38;5;183m"
+        }
+        if app.phase == 6 {
+            status = "parallel workers · esc to stop"
             color = "\x1b[38;5;183m"
         }
         if app.phase == 5 {

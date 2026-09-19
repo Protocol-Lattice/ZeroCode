@@ -207,6 +207,7 @@ The application supports four LLM providers:
 - `--provider <name>` – Select the AI provider (openai, claude, gemini, openrouter)
 - `--model <model>` – Choose a model (default: provider-specific)
 - `--max-turns <N>` – Maximum conversation turns
+- `--parallel <N>` – Concurrent file workers or model subagents (1–4, default 4)
 - `--cwd <dir>` – Working directory for the agent
 
 ## Example Usage
@@ -224,6 +225,44 @@ The application supports four LLM providers:
 # Connect to OpenRouter (free tier)
 ./dist/zero-coding --provider openrouter --model any/custom-model-id
 ```
+
+## Parallel work and subagents
+
+The coordinator can call `delegate_tasks` to run up to four independent model
+subagents. Each task declares a prompt, a mode (`read`, `write`, or `edit`), and
+one to eight exact workspace file paths. For example:
+
+```json
+{"tasks":[
+  {"mode":"read","paths":["src/parser.0"],"prompt":"Review the parser and report proposed changes."},
+  {"mode":"edit","paths":["README.md"],"prompt":"Correct the documented command examples."}
+]}
+```
+
+Subagents inherit the selected provider, model and active skill instructions,
+with separate conversations and a maximum of four model requests each. `read`
+allows reading; `edit` also allows fragment edits; `write` also allows creating
+or replacing files. Runtime checks restrict every file operation to the declared
+paths. Subagents cannot run commands, call MCP tools, load skills, or delegate
+again. Only the coordinator can modify `zero.graph`; subagents return proposals
+for graph changes. The coordinator receives an ordered list of task statuses and
+summaries. Delegation uses additional model requests beyond the coordinator's
+`--max-turns` budget.
+
+Consecutive `read_file`, `write_file`, and `edit_file` calls also run in a worker
+pool, without another model request. `--parallel` bounds both pools; setting it
+to `1` makes execution serial. Operations that may write overlapping paths wait
+for earlier owners, including ASCII case aliases. Jobs with non-ASCII paths are
+conservatively serialized against writers to cover filesystem case and Unicode
+normalization aliases. Results enter conversation
+history in their original order. Commands, MCP calls, file listings, skill loads,
+and task completion wait for preceding file work.
+
+Each mutation retains its own preview and approval. Other independent workers
+continue while one waits for a decision. Headless runs deny mutations unless
+`--approve` is supplied. `Esc` cancels the pool and its nested HTTP processes;
+changes already completed remain on disk. Existing workspace, symlink, ignore,
+and stale-preview checks apply in workers too.
 
 ## Streaming, files, and conversation limits
 
@@ -359,7 +398,8 @@ Both MCP and skills are implemented in Zero, in `src/mcp.0` and `src/skills.0`.
 ## Development
 
 - **Source**: `src/main.0` is the entry point; modules group code by responsibility
-- **Tests**: `tests/` covers providers, file operations, streaming, context compaction, extensions, and installation
+- **Parallel execution**: `src/parallel.0` owns worker scheduling, scoped subagents, approvals, and ordered results
+- **Tests**: `tests/` covers providers, file operations, concurrency, streaming, context compaction, extensions, and installation
 - **Build**: `Makefile` – Handles compilation and distribution
 
 After editing the source projection, synchronize and validate the program graph:

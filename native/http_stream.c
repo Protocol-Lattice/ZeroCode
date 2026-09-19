@@ -9,6 +9,47 @@
 #include <string.h>
 #include <strings.h>
 #include <stdint.h>
+#include <limits.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+/* A nested HTTP worker belongs to its model worker's group, so cancelling the
+ * model worker also reaches the transport. Root HTTP workers keep their group. */
+static pid_t zero_expected_parent;
+static int zero_join_attempted;
+
+static int zero_stream_parent_alive(void) {
+    return !zero_join_attempted || (zero_expected_parent > 1
+        && getppid() == zero_expected_parent
+        && getpgrp() == zero_expected_parent
+        && getpgid(zero_expected_parent) == zero_expected_parent);
+}
+
+int zero_worker_pid(void) {
+    return (int)getpid();
+}
+
+int zero_join_worker_group(unsigned int expected_parent) {
+    zero_join_attempted = 1;
+    zero_expected_parent = 0;
+    if (expected_parent <= 1 || expected_parent > INT_MAX) return 0;
+    pid_t parent = (pid_t)expected_parent;
+    if (getppid() != parent || getpgid(parent) != parent) return 0;
+    if (setpgid(0, parent) != 0) return 0;
+    zero_expected_parent = parent;
+    /* The parent can exit between the first identity check and setpgid. */
+    return zero_stream_parent_alive();
+}
+
+static int zero_stream_progress(void *opaque, curl_off_t download_total,
+        curl_off_t downloaded, curl_off_t upload_total, curl_off_t uploaded) {
+    (void)opaque;
+    (void)download_total;
+    (void)downloaded;
+    (void)upload_total;
+    (void)uploaded;
+    return !zero_stream_parent_alive();
+}
 
 typedef struct {
     long status;
@@ -61,7 +102,7 @@ static size_t zero_stream_body(char *data, size_t size, size_t count, void *opaq
 }
 
 int zero_http_stream(unsigned int expected) {
-    if (!expected || expected > 122880) return 1;
+    if (!zero_stream_parent_alive() || !expected || expected > 122880) return 1;
     char *request = calloc((size_t)expected + 1, 1);
     if (!request) return 1;
     if (fread(request, 1, expected, stdin) != expected || memchr(request, 0, expected)) {
@@ -114,8 +155,11 @@ int zero_http_stream(unsigned int expected) {
     ZERO_CURL_SET(CURLOPT_TIMEOUT, 90L);
     ZERO_CURL_SET(CURLOPT_NOSIGNAL, 1L);
     ZERO_CURL_SET(CURLOPT_FOLLOWLOCATION, 0L);
+    ZERO_CURL_SET(CURLOPT_NOPROGRESS, 0L);
+    ZERO_CURL_SET(CURLOPT_XFERINFOFUNCTION, zero_stream_progress);
 #undef ZERO_CURL_SET
-    CURLcode result = setup == CURLE_OK ? curl_easy_perform(curl) : setup;
+    CURLcode result = !zero_stream_parent_alive() ? CURLE_ABORTED_BY_CALLBACK
+        : setup == CURLE_OK ? curl_easy_perform(curl) : setup;
     if (result == CURLE_OK && !zero_stream_prefix(&state)) result = CURLE_WRITE_ERROR;
     curl_easy_cleanup(curl);
     curl_slist_free_all(headers);

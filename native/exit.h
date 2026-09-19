@@ -3,6 +3,8 @@
 
 /* The hosted Zero entry point returns Void. Forward its explicit status to libc. */
 void exit(int status);
+int zero_worker_pid(void);
+int zero_join_worker_group(unsigned int expected_parent);
 int zero_http_stream(unsigned int expected);
 
 

@@ -1,0 +1,1021 @@
+fn jobChild(app: ref<App>, index: usize) -> ProcChild {
+    if index == 0 {
+        return app.jobChild0
+    }
+    if index == 1 {
+        return app.jobChild1
+    }
+    if index == 2 {
+        return app.jobChild2
+    }
+    return app.jobChild3
+}
+
+fn setJobChild(app: mutref<App>, index: usize, value: ProcChild) -> Void {
+    if index == 0 {
+        app.jobChild0 = value
+        return
+    }
+    if index == 1 {
+        app.jobChild1 = value
+        return
+    }
+    if index == 2 {
+        app.jobChild2 = value
+        return
+    }
+    app.jobChild3 = value
+}
+
+fn jobTx(app: ref<App>, index: usize) -> MutSpan<u8> {
+    if index == 0 {
+        return app.jobTx0
+    }
+    if index == 1 {
+        return app.jobTx1
+    }
+    if index == 2 {
+        return app.jobTx2
+    }
+    return app.jobTx3
+}
+
+fn jobRx(app: ref<App>, index: usize) -> MutSpan<u8> {
+    if index == 0 {
+        return app.jobRx0
+    }
+    if index == 1 {
+        return app.jobRx1
+    }
+    if index == 2 {
+        return app.jobRx2
+    }
+    return app.jobRx3
+}
+
+fn jobState(app: ref<App>, index: usize) -> usize {
+    if index == 0 {
+        return app.jobState0
+    }
+    if index == 1 {
+        return app.jobState1
+    }
+    if index == 2 {
+        return app.jobState2
+    }
+    return app.jobState3
+}
+
+fn setJobState(app: mutref<App>, index: usize, value: usize) -> Void {
+    if index == 0 {
+        app.jobState0 = value
+        return
+    }
+    if index == 1 {
+        app.jobState1 = value
+        return
+    }
+    if index == 2 {
+        app.jobState2 = value
+        return
+    }
+    app.jobState3 = value
+}
+
+fn jobSent(app: ref<App>, index: usize) -> usize {
+    if index == 0 {
+        return app.jobSent0
+    }
+    if index == 1 {
+        return app.jobSent1
+    }
+    if index == 2 {
+        return app.jobSent2
+    }
+    return app.jobSent3
+}
+
+fn setJobSent(app: mutref<App>, index: usize, value: usize) -> Void {
+    if index == 0 {
+        app.jobSent0 = value
+        return
+    }
+    if index == 1 {
+        app.jobSent1 = value
+        return
+    }
+    if index == 2 {
+        app.jobSent2 = value
+        return
+    }
+    app.jobSent3 = value
+}
+
+fn jobStarted(app: ref<App>, index: usize) -> Duration {
+    if index == 0 {
+        return app.jobStarted0
+    }
+    if index == 1 {
+        return app.jobStarted1
+    }
+    if index == 2 {
+        return app.jobStarted2
+    }
+    return app.jobStarted3
+}
+
+fn setJobStarted(app: mutref<App>, index: usize, value: Duration) -> Void {
+    if index == 0 {
+        app.jobStarted0 = value
+        return
+    }
+    if index == 1 {
+        app.jobStarted1 = value
+        return
+    }
+    if index == 2 {
+        app.jobStarted2 = value
+        return
+    }
+    app.jobStarted3 = value
+}
+
+fn jobFailed(app: ref<App>, index: usize) -> Bool {
+    if index == 0 {
+        return app.jobFailed0
+    }
+    if index == 1 {
+        return app.jobFailed1
+    }
+    if index == 2 {
+        return app.jobFailed2
+    }
+    return app.jobFailed3
+}
+
+fn setJobFailed(app: mutref<App>, index: usize, value: Bool) -> Void {
+    if index == 0 {
+        app.jobFailed0 = value
+        return
+    }
+    if index == 1 {
+        app.jobFailed1 = value
+        return
+    }
+    if index == 2 {
+        app.jobFailed2 = value
+        return
+    }
+    app.jobFailed3 = value
+}
+
+// Worker processes own private App buffers. Only the coordinator modifies history
+// and the Zero graph. Slot states: queued, running, approval, result, done, committed.
+fn foldedByte(value: u8) -> u8 {
+    if value >= 65 && value <= 90 {
+        return value + 32_u8
+    }
+    return value
+}
+
+fn graphPath(path: Span<u8>) -> Bool {
+    if std.mem.len(path) < 10 {
+        return false
+    }
+    let start: usize = std.mem.len(path) - 10
+    if start > 0 && path[start - 1] != 47 {
+        return false
+    }
+    let name: Span<u8> = "zero.graph"
+    var i: usize = 0
+    while i < 10 {
+        if foldedByte(path[start + i]) != name[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn overlappingPath(left: Span<u8>, right: Span<u8>) -> Bool {
+    // macOS may treat Unicode case or normalization variants as one path.
+    // Conservatively serialize non-ASCII owners when a writer is involved.
+    var byte: usize = 0
+    while byte < std.mem.len(left) {
+        if left[byte] >= 128 {
+            return true
+        }
+        byte = byte + 1
+    }
+    byte = 0
+    while byte < std.mem.len(right) {
+        if right[byte] >= 128 {
+            return true
+        }
+        byte = byte + 1
+    }
+    var i: usize = 0
+    while i < std.mem.len(left) && i < std.mem.len(right) {
+        if foldedByte(left[i]) != foldedByte(right[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    if i == std.mem.len(left) && i == std.mem.len(right) {
+        return true
+    }
+    if i < std.mem.len(left) {
+        return left[i] == 47
+    }
+    return right[i] == 47
+}
+
+fn jobPlan(app: ref<App>, index: usize) -> Span<u8> {
+    return arrayItem(bytes(app.jobsPlan), index)
+}
+
+fn jobsConflict(app: ref<App>, earlier: usize, later: usize) -> Bool {
+    let left: Span<u8> = jobPlan(app, earlier)
+    let right: Span<u8> = jobPlan(app, later)
+    if std.mem.eql(field(left, "mode"), "\"read\"") && std.mem.eql(field(right, "mode"), "\"read\"") {
+        return false
+    }
+    var a: usize = 0
+    while a < 8 {
+        let rawLeft: Span<u8> = arrayItem(field(left, "paths"), a)
+        if std.mem.eql(rawLeft, "null") {
+            break
+        }
+        var leftStorage: [2048]u8 = [0_u8; 2048]
+        let leftPath: MutSpan<u8> = buffer(leftStorage)
+        if !decode(leftPath, rawLeft) {
+            return true
+        }
+        var b: usize = 0
+        while b < 8 {
+            let rawRight: Span<u8> = arrayItem(field(right, "paths"), b)
+            if std.mem.eql(rawRight, "null") {
+                break
+            }
+            var rightStorage: [2048]u8 = [0_u8; 2048]
+            let rightPath: MutSpan<u8> = buffer(rightStorage)
+            if !decode(rightPath, rawRight) {
+                return true
+            }
+            if overlappingPath(bytes(leftPath), bytes(rightPath)) {
+                return true
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    return false
+}
+
+fn workerSaveSummary(app: mutref<App>, text: Span<u8>) -> Void {
+    var storage: [8192]u8 = [0_u8; 8192]
+    let copy: MutSpan<u8> = buffer(storage)
+    append(copy, utf8Prefix(text, 6000_usize))
+    setText(app.errors, bytes(copy))
+}
+
+fn workerToolAllowed(app: ref<App>) -> Bool {
+    let name: Span<u8> = bytes(app.toolName)
+    if std.mem.eql(name, "finish_task") {
+        return app.workerMode == 2
+    }
+    if !std.mem.eql(name, "read_file") && !std.mem.eql(name, "write_file") && !std.mem.eql(name, "edit_file") {
+        return false
+    }
+    let mode: Span<u8> = field(bytes(app.mcpConfig), "mode")
+    let write: Bool = !std.mem.eql(name, "read_file")
+    if write && std.mem.eql(mode, "\"read\"") {
+        return false
+    }
+    if std.mem.eql(name, "write_file") && std.mem.eql(mode, "\"edit\"") {
+        return false
+    }
+    var storage: [2048]u8 = [0_u8; 2048]
+    let path: MutSpan<u8> = buffer(storage)
+    if !decode(path, field(bytes(app.arguments), "path")) || !safeRelative(bytes(path)) {
+        return false
+    }
+    if write && graphPath(bytes(path)) {
+        return false
+    }
+    let paths: Span<u8> = field(bytes(app.mcpConfig), "paths")
+    var i: usize = 0
+    while i < 8 {
+        let item: Span<u8> = arrayItem(paths, i)
+        if std.mem.eql(item, "null") {
+            break
+        }
+        var allowedStorage: [2048]u8 = [0_u8; 2048]
+        let allowed: MutSpan<u8> = buffer(allowedStorage)
+        if decode(allowed, item) && std.mem.eql(bytes(path), bytes(allowed)) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn builtinAllowed(app: ref<App>, index: usize) -> Bool {
+    if app.workerMode == 0 {
+        return index != 6 || app.skillCount > 0
+    }
+    if index == 0 || index == 5 {
+        return true
+    }
+    let mode: Span<u8> = field(bytes(app.mcpConfig), "mode")
+    if index == 1 {
+        return std.mem.eql(mode, "\"write\"")
+    }
+    if index == 2 {
+        return std.mem.eql(mode, "\"write\"") || std.mem.eql(mode, "\"edit\"")
+    }
+    return false
+}
+
+fn workerQuoted(output: MutSpan<u8>, text: Span<u8>) -> Void {
+    put(output, 34_u8)
+    let hex: Span<u8> = "0123456789abcdef"
+    var i: usize = 0
+    while i < std.mem.len(text) {
+        let byte: u8 = text[i]
+        if byte == 10 {
+            append(output, "\\n")
+        } else if byte == 13 {
+            append(output, "\\r")
+        } else if byte == 9 {
+            append(output, "\\t")
+        } else if byte == 8 {
+            append(output, "\\b")
+        } else if byte == 12 {
+            append(output, "\\f")
+        } else if byte == 34 || byte == 92 {
+            put(output, 92_u8)
+            put(output, byte)
+        } else if byte < 32 {
+            append(output, "\\u00")
+            put(output, hex[(byte / 16) as usize])
+            put(output, hex[(byte % 16) as usize])
+        } else {
+            put(output, byte)
+        }
+        i = i + 1
+    }
+    put(output, 34_u8)
+}
+
+fn workerEmit(world: World, app: mutref<App>, kind: String, text: Span<u8>) -> Void raises {
+    var storage: [114704]u8 = [0_u8; 114704]
+    let output: MutSpan<u8> = buffer(storage)
+    append(output, "{\"type\":")
+    quoted(output, kind)
+    append(output, ",\"text\":")
+    workerQuoted(output, text)
+    append(output, ",\"id\":")
+    quoted(output, bytes(app.toolId))
+    append(output, ",\"failed\":")
+    if app.exitCode != 0 {
+        append(output, "true")
+    } else {
+        append(output, "false")
+    }
+    append(output, ",\"files_changed\":")
+    number(output, app.filesChanged)
+    append(output, ",\"tokens\":")
+    number(output, app.tokens)
+    append(output, "}\n")
+    if !bufOk(output) {
+        raise WorkerProtocolLimit
+    }
+    check world.out.write(bytes(output))
+}
+
+fn workerFlush(world: World, app: mutref<App>) -> Void raises {
+    if app.phase == 4 && !app.workerApprovalSent {
+        check workerEmit(world, app, "approval", bytes(app.transcript))
+        app.workerApprovalSent = true
+        clear(app.transcript)
+    } else if bufLen(app.transcript) > 0 {
+        check workerEmit(world, app, "log", utf8Prefix(bytes(app.transcript), 12000_usize))
+        clear(app.transcript)
+    }
+}
+
+fn workerControl(app: mutref<App>) -> Void {
+    if app.phase != 4 {
+        return
+    }
+    var data: [256]u8 = [0_u8; 256]
+    let count: Maybe<usize> = std.term.readInput(data)
+    if !count.has {
+        return
+    }
+    var i: usize = 0
+    while i < count.value {
+        if data[i] == 10 {
+            let control: Span<u8> = bytes(app.keyboard)
+            var idStorage: [256]u8 = [0_u8; 256]
+            let id: MutSpan<u8> = buffer(idStorage)
+            if !std.json.validateBytes(control) || !decode(id, field(control, "id")) || !std.mem.eql(bytes(id), bytes(app.toolId)) {
+                failTurn(app, "Invalid worker approval response.")
+                return
+            }
+            let approved: Bool = std.mem.eql(field(control, "action"), "\"approve\"")
+            clear(app.keyboard)
+            app.workerApprovalSent = false
+            if approved {
+                approveTool(app)
+            } else {
+                toolResult(app, "Error: the user denied this action. Do not retry it without new instructions.")
+            }
+            return
+        }
+        put(app.keyboard, data[i])
+        if !bufOk(app.keyboard) {
+            failTurn(app, "Worker approval response exceeded its limit.")
+            return
+        }
+        i = i + 1
+    }
+}
+
+fn loadWorker(app: mutref<App>) -> Bool {
+    let expected: Maybe<u32> = std.args.parseU32(2_usize)
+    if !expected.has {
+        return false
+    }
+    if expected.value == 0 || expected.value as usize > capacity(app.mcpConfig) {
+        return false
+    }
+    clear(app.mcpConfig)
+    let started: Duration = std.time.monotonic()
+    var data: [4096]u8 = [0_u8; 4096]
+    while bufLen(app.mcpConfig) < expected.value as usize {
+        var wanted: usize = expected.value as usize - bufLen(app.mcpConfig)
+        if wanted > 4096 {
+            wanted = 4096
+        }
+        let count: Maybe<usize> = std.term.readInput(data[..wanted])
+        if count.has {
+            append(app.mcpConfig, std.mem.prefix(data, count.value))
+        }
+        if std.time.hasElapsed(started, std.time.monotonic(), std.time.seconds(10)) {
+            return false
+        }
+        let slept: Bool = std.time.sleep(std.time.ms(5))
+    }
+    let config: Span<u8> = bytes(app.mcpConfig)
+    if !std.json.validateBytes(config) {
+        return false
+    }
+    let provider: Maybe<u32> = std.json.u32(config, "provider")
+    if !provider.has {
+        return false
+    }
+    if provider.value > 3 {
+        return false
+    }
+    app.provider = provider.value as usize
+    if !decode(app.model, field(config, "model")) || !decode(app.key, field(config, "key")) || !decode(app.endpoint, field(config, "endpoint")) {
+        return false
+    }
+    if !decode(app.activeSkill, field(config, "instructions")) {
+        return false
+    }
+    app.approve = std.mem.eql(field(config, "approve"), "true")
+    app.headless = true
+    app.parallelLimit = 1
+    app.maxTurns = 4
+    if std.mem.eql(field(config, "kind"), "\"tool\"") {
+        app.workerMode = 1
+        clear(app.pending)
+        put(app.pending, 91_u8)
+        append(app.pending, field(config, "call"))
+        put(app.pending, 93_u8)
+        app.phase = 2
+    } else {
+        app.workerMode = 2
+        if !decode(app.input, field(config, "prompt")) || bufLen(app.input) == 0 {
+            return false
+        }
+        if !userMessage(app, bytes(app.input)) {
+            return false
+        }
+        startRequest(app)
+    }
+    return true
+}
+
+fn runWorker(world: World, app: mutref<App>) -> i32 raises {
+    app.workerMode = 1
+    if !parseOptions(app) || !loadWorker(app) {
+        workerSaveSummary(app, "Error: invalid worker configuration.")
+        app.exitCode = 1
+        check workerEmit(world, app, "result", bytes(app.errors))
+        return 1
+    }
+    check eventLoop(world, app)
+    stopChild(app)
+    if app.workerMode == 1 {
+        check workerEmit(world, app, "result", bytes(app.response))
+    } else {
+        check workerEmit(world, app, "result", bytes(app.errors))
+    }
+    forgetKey(app)
+    return app.exitCode
+}
+
+fn stopJobs(app: mutref<App>) -> Void {
+    var i: usize = 0
+    while i < 4 {
+        let child: ProcChild = jobChild(app, i)
+        if std.proc.childValid(child) {
+            let killed: Bool = std.proc.killGroupPid(std.proc.pid(child))
+            let closed: Bool = std.proc.close(child)
+            setJobChild(app, i, std.proc.spawnChild(""))
+        }
+        setJobState(app, i, 0_usize)
+        i = i + 1
+    }
+    app.jobsMode = 0
+    app.jobsApproval = 0
+    app.jobsRepeated = false
+}
+
+fn failJob(app: mutref<App>, index: usize, message: Span<u8>) -> Void {
+    let child: ProcChild = jobChild(app, index)
+    if std.proc.childValid(child) {
+        let killed: Bool = std.proc.killGroupPid(std.proc.pid(child))
+        let closed: Bool = std.proc.close(child)
+        setJobChild(app, index, std.proc.spawnChild(""))
+    }
+    setText(jobTx(app, index), message)
+    setJobState(app, index, 4_usize)
+    setJobFailed(app, index, true)
+    if app.jobsApproval == index + 1 {
+        app.jobsApproval = 0
+        app.phase = 6
+        app.view = 0
+    }
+}
+
+fn startJob(app: mutref<App>, index: usize) -> Void {
+    let output: MutSpan<u8> = jobTx(app, index)
+    let plan: Span<u8> = jobPlan(app, index)
+    clear(output)
+    append(output, "{\"provider\":")
+    number(output, app.provider)
+    append(output, ",\"model\":")
+    quoted(output, bytes(app.model))
+    append(output, ",\"key\":")
+    quoted(output, bytes(app.key))
+    append(output, ",\"endpoint\":")
+    quoted(output, bytes(app.endpoint))
+    append(output, ",\"instructions\":")
+    quoted(output, bytes(app.activeSkill))
+    append(output, ",\"approve\":")
+    if app.approve {
+        append(output, "true")
+    } else {
+        append(output, "false")
+    }
+    append(output, ",\"mode\":")
+    append(output, field(plan, "mode"))
+    append(output, ",\"paths\":")
+    append(output, field(plan, "paths"))
+    if app.jobsMode == 1 {
+        append(output, ",\"kind\":\"tool\",\"call\":")
+        append(output, field(plan, "call"))
+    } else {
+        append(output, ",\"kind\":\"agent\",\"prompt\":")
+        append(output, field(plan, "prompt"))
+    }
+    put(output, 125_u8)
+    if !bufOk(output) || bufLen(output) > 32768 {
+        failJob(app, index, "Error: worker instructions or arguments exceed 32 KiB.")
+        return
+    }
+    var storage: [128]u8 = [0_u8; 128]
+    let args: MutSpan<u8> = buffer(storage)
+    append(args, "--job-worker\n")
+    number(args, bufLen(output))
+    let child: ProcChild = std.proc.spawnChildArgs(bytes(app.executable), bytes(args), bytes(app.workspace), "")
+    setJobChild(app, index, child)
+    if !std.proc.childValid(child) {
+        failJob(app, index, "Error: could not start worker.")
+        return
+    }
+    setJobSent(app, index, 0_usize)
+    setJobStarted(app, index, std.time.monotonic())
+    setJobState(app, index, 1_usize)
+    clear(jobRx(app, index))
+}
+
+fn jobEvent(app: mutref<App>, index: usize) -> Void {
+    let message: Span<u8> = bytes(jobRx(app, index))
+    if !std.json.validateBytes(message) {
+        failJob(app, index, "Error: worker returned invalid JSON.")
+        return
+    }
+    let kind: Span<u8> = field(message, "type")
+    if std.mem.eql(kind, "\"log\"") {
+        if decode(app.scratch, field(message, "text")) && app.jobsApproval == 0 {
+            logEntry(app, "  PARALLEL WORKER", bytes(app.scratch))
+        }
+    } else if std.mem.eql(kind, "\"approval\"") {
+        if jobState(app, index) != 1 || !std.str.startsWith(field(message, "id"), "\"") {
+            failJob(app, index, "Error: invalid worker approval state.")
+            return
+        }
+        setText(jobTx(app, index), message)
+        if !bufOk(jobTx(app, index)) {
+            failJob(app, index, "Error: worker preview is too large.")
+            return
+        }
+        setJobState(app, index, 2_usize)
+    } else if std.mem.eql(kind, "\"result\"") {
+        if jobState(app, index) != 1 || !decode(jobTx(app, index), field(message, "text")) {
+            failJob(app, index, "Error: invalid or oversized worker result.")
+            return
+        }
+        setJobState(app, index, 3_usize)
+        setJobFailed(app, index, std.mem.eql(field(message, "failed"), "true"))
+        let files: Maybe<u32> = std.json.u32(message, "files_changed")
+        let tokens: Maybe<u32> = std.json.u32(message, "tokens")
+        if files.has {
+            app.filesChanged = app.filesChanged + files.value as usize
+        }
+        if tokens.has {
+            app.tokens = app.tokens + tokens.value as usize
+        }
+    } else {
+        failJob(app, index, "Error: unknown worker message.")
+    }
+}
+
+fn pollJob(app: mutref<App>, index: usize) -> Void {
+    let state: usize = jobState(app, index)
+    if state == 0 || state >= 4 {
+        return
+    }
+    let child: ProcChild = jobChild(app, index)
+    // Drain after observing exit before closing, so final pipe bytes cannot race us.
+    let running: Bool = std.proc.running(child)
+    let tx: MutSpan<u8> = jobTx(app, index)
+    if state == 1 && jobSent(app, index) < bufLen(tx) {
+        let count: Maybe<usize> = std.proc.writeStdin(child, std.mem.dropPrefix(bytes(tx), jobSent(app, index)))
+        if count.has {
+            setJobSent(app, index, jobSent(app, index) + count.value)
+        }
+    }
+    var data: [4096]u8 = [0_u8; 4096]
+    var drain: usize = 0
+    while drain < 16 {
+        let count: Maybe<usize> = std.proc.readStdout(child, data)
+        var size: usize = 0
+        if count.has {
+            size = count.value
+        }
+        if size == 0 {
+            break
+        }
+        var i: usize = 0
+        while i < size {
+            if jobState(app, index) >= 3 {
+                failJob(app, index, "Error: unexpected output after worker completion.")
+                return
+            }
+            if data[i] == 10 {
+                jobEvent(app, index)
+                clear(jobRx(app, index))
+                if jobState(app, index) >= 4 {
+                    return
+                }
+            } else {
+                put(jobRx(app, index), data[i])
+                if !bufOk(jobRx(app, index)) {
+                    failJob(app, index, "Error: worker message exceeds 112 KiB.")
+                    return
+                }
+            }
+            i = i + 1
+        }
+        drain = drain + 1
+    }
+    let errors: Maybe<usize> = std.proc.readStderr(child, data)
+    if jobState(app, index) == 1 && std.time.hasElapsed(jobStarted(app, index), std.time.monotonic(), std.time.seconds(420)) {
+        failJob(app, index, "Error: worker timed out.")
+        return
+    }
+    if running {
+        return
+    }
+    // Wait one extra poll when the drain bound was reached, to consume all pipes.
+    if drain == 16 {
+        return
+    }
+    let status: ProcStatus = std.proc.wait(child)
+    let closed: Bool = std.proc.close(child)
+    setJobChild(app, index, std.proc.spawnChild(""))
+    if jobState(app, index) != 3 || bufLen(jobRx(app, index)) != 0 {
+        failJob(app, index, "Error: worker exited before a complete result.")
+        return
+    }
+    if std.proc.failed(status) && !jobFailed(app, index) {
+        failJob(app, index, "Error: worker process failed.")
+        return
+    }
+    setJobState(app, index, 4_usize)
+}
+
+fn answerJobApproval(app: mutref<App>, approved: Bool) -> Void {
+    if app.jobsApproval == 0 {
+        return
+    }
+    let index: usize = app.jobsApproval - 1
+    let tx: MutSpan<u8> = jobTx(app, index)
+    clear(app.packet)
+    append(app.packet, "{\"id\":")
+    append(app.packet, field(bytes(tx), "id"))
+    append(app.packet, ",\"action\":")
+    if approved {
+        quoted(app.packet, "approve")
+    } else {
+        quoted(app.packet, "deny")
+    }
+    append(app.packet, "}\n")
+    setText(tx, bytes(app.packet))
+    setJobSent(app, index, 0_usize)
+    setJobState(app, index, 1_usize)
+    setJobStarted(app, index, std.time.monotonic())
+    app.jobsApproval = 0
+    app.phase = 6
+    app.view = 0
+}
+
+fn showJobApproval(app: mutref<App>) -> Void {
+    if app.jobsApproval != 0 {
+        return
+    }
+    var i: usize = 0
+    while i < app.jobsCount {
+        if jobState(app, i) == 2 {
+            app.jobsApproval = i + 1
+            if app.headless {
+                answerJobApproval(app, false)
+                return
+            }
+            if !decode(app.scratch, field(bytes(jobTx(app, i)), "text")) {
+                failJob(app, i, "Error: invalid worker preview.")
+                return
+            }
+            logEntry(app, "  WORKER · REVIEW CHANGE", bytes(app.scratch))
+            app.phase = 4
+            app.view = 4
+            return
+        }
+        i = i + 1
+    }
+}
+
+fn commitJobs(app: mutref<App>) -> Void {
+    if app.jobsMode == 1 {
+        while app.jobsCommitted < app.jobsCount && jobState(app, app.jobsCommitted) == 4 {
+            let index: usize = app.jobsCommitted
+            if !loadCurrentTool(app) {
+                return
+            }
+            toolResult(app, bytes(jobTx(app, index)))
+            if app.jobsMode == 0 {
+                return
+            }
+            if app.phase != 2 {
+                stopJobs(app)
+                return
+            }
+            setJobState(app, index, 5_usize)
+            app.jobsCommitted = app.jobsCommitted + 1
+            if app.jobsApproval > 0 {
+                app.phase = 4
+                app.view = 4
+            } else {
+                app.phase = 6
+            }
+        }
+        if app.jobsCommitted == app.jobsCount {
+            app.jobsMode = 0
+            app.phase = 2
+            if app.jobsRepeated {
+                finishToolBatch(app, "The model repeated the same tool call and result three times. This turn was stopped; completed changes are kept. Send a new message if more work is needed.", false)
+            }
+        }
+        return
+    }
+    var i: usize = 0
+    while i < app.jobsCount {
+        if jobState(app, i) != 4 {
+            return
+        }
+        i = i + 1
+    }
+    clear(app.scratch)
+    append(app.scratch, "{\"tasks\":[")
+    i = 0
+    while i < app.jobsCount {
+        if i > 0 {
+            put(app.scratch, 44_u8)
+        }
+        append(app.scratch, "{\"index\":")
+        number(app.scratch, i)
+        append(app.scratch, ",\"status\":")
+        if jobFailed(app, i) {
+            quoted(app.scratch, "failed")
+        } else {
+            quoted(app.scratch, "completed")
+        }
+        append(app.scratch, ",\"summary\":")
+        quoted(app.scratch, utf8Prefix(bytes(jobTx(app, i)), 3000_usize))
+        put(app.scratch, 125_u8)
+        i = i + 1
+    }
+    append(app.scratch, "]}")
+    app.jobsMode = 0
+    toolResult(app, bytes(app.scratch))
+}
+
+fn pollJobs(app: mutref<App>) -> Void {
+    if app.jobsMode == 0 {
+        return
+    }
+    var running: usize = 0
+    var i: usize = 0
+    while i < app.jobsCount {
+        pollJob(app, i)
+        if jobState(app, i) > 0 && jobState(app, i) < 4 {
+            running = running + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < app.jobsCount && running < app.parallelLimit {
+        if jobState(app, i) == 0 {
+            var blocked: Bool = false
+            var earlier: usize = 0
+            while earlier < i {
+                if jobState(app, earlier) < 4 && jobsConflict(app, earlier, i) {
+                    blocked = true
+                }
+                earlier = earlier + 1
+            }
+            if !blocked {
+                startJob(app, i)
+                running = running + 1
+            }
+        }
+        i = i + 1
+    }
+    commitJobs(app)
+    if app.jobsMode > 0 {
+        showJobApproval(app)
+    }
+}
+
+fn beginJobs(app: mutref<App>, mode: usize, count: usize) -> Void {
+    app.jobsMode = mode
+    app.jobsCount = count
+    app.jobsCommitted = 0
+    app.jobsRepeated = false
+    app.jobsApproval = 0
+    var i: usize = 0
+    while i < 4 {
+        setJobState(app, i, 0_usize)
+        setJobFailed(app, i, false)
+        clear(jobRx(app, i))
+        clear(jobTx(app, i))
+        i = i + 1
+    }
+    app.phase = 6
+    app.view = 0
+    logEntry(app, "  PARALLEL TASKS", "Independent work runs concurrently; file ownership and ordered results are coordinated here.")
+}
+
+fn startDelegation(app: mutref<App>) -> Void {
+    let tasks: Span<u8> = field(bytes(app.arguments), "tasks")
+    let count: Maybe<usize> = std.json.arrayCount(tasks)
+    if !count.has {
+        toolResult(app, "Error: tasks must be an array.")
+        return
+    }
+    if count.value == 0 || count.value > 4 {
+        toolResult(app, "Error: delegate between one and four tasks.")
+        return
+    }
+    var i: usize = 0
+    while i < count.value {
+        let task: Span<u8> = arrayItem(tasks, i)
+        let mode: Span<u8> = field(task, "mode")
+        if !std.mem.eql(mode, "\"read\"") && !std.mem.eql(mode, "\"write\"") && !std.mem.eql(mode, "\"edit\"") {
+            toolResult(app, "Error: task mode must be read, write or edit.")
+            return
+        }
+        var promptStorage: [8192]u8 = [0_u8; 8192]
+        let prompt: MutSpan<u8> = buffer(promptStorage)
+        if !decode(prompt, field(task, "prompt")) || bufLen(prompt) == 0 {
+            toolResult(app, "Error: task prompt is empty or too large.")
+            return
+        }
+        let paths: Span<u8> = field(task, "paths")
+        let length: Maybe<usize> = std.json.arrayCount(paths)
+        if !length.has {
+            toolResult(app, "Error: declare exact file paths for every task.")
+            return
+        }
+        if length.value == 0 || length.value > 8 {
+            toolResult(app, "Error: declare one to eight exact paths per task.")
+            return
+        }
+        var j: usize = 0
+        while j < length.value {
+            var pathStorage: [2048]u8 = [0_u8; 2048]
+            let path: MutSpan<u8> = buffer(pathStorage)
+            if !decode(path, arrayItem(paths, j)) || !safeRelative(bytes(path)) {
+                toolResult(app, "Error: invalid task path.")
+                return
+            }
+            if !std.mem.eql(mode, "\"read\"") && graphPath(bytes(path)) {
+                toolResult(app, "Error: only the coordinator can modify zero.graph. Delegate analysis and return proposed graph changes.")
+                return
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    setText(app.jobsPlan, tasks)
+    if !bufOk(app.jobsPlan) {
+        toolResult(app, "Error: delegated tasks exceed the worker plan limit.")
+        return
+    }
+    beginJobs(app, 2_usize, count.value)
+}
+
+fn tryFileBatch(app: mutref<App>) -> Bool {
+    if app.workerMode != 0 || app.parallelLimit < 2 {
+        return false
+    }
+    clear(app.jobsPlan)
+    put(app.jobsPlan, 91_u8)
+    var count: usize = 0
+    while count < 4 && app.toolIndex + count < 64 {
+        let call: Span<u8> = arrayItem(bytes(app.pending), app.toolIndex + count)
+        var name: Span<u8> = field(call, "name")
+        var args: Span<u8> = field(call, "input")
+        if app.provider != 2 {
+            name = field(field(call, "function"), "name")
+            if !decode(app.scratch, field(field(call, "function"), "arguments")) {
+                break
+            }
+            args = bytes(app.scratch)
+        }
+        if !std.mem.eql(name, "\"read_file\"") && !std.mem.eql(name, "\"write_file\"") && !std.mem.eql(name, "\"edit_file\"") {
+            break
+        }
+        if !std.json.validateBytes(args) || std.mem.len(args) > capacity(app.arguments) {
+            break
+        }
+        var pathStorage: [2048]u8 = [0_u8; 2048]
+        var idStorage: [256]u8 = [0_u8; 256]
+        let path: MutSpan<u8> = buffer(pathStorage)
+        let id: MutSpan<u8> = buffer(idStorage)
+        if !decode(path, field(args, "path")) || !safeRelative(bytes(path)) || graphPath(bytes(path)) {
+            break
+        }
+        if !decode(id, field(call, "id")) || bufLen(id) == 0 {
+            break
+        }
+        if count > 0 {
+            put(app.jobsPlan, 44_u8)
+        }
+        append(app.jobsPlan, "{\"call\":")
+        append(app.jobsPlan, call)
+        append(app.jobsPlan, ",\"mode\":")
+        if std.mem.eql(name, "\"read_file\"") {
+            quoted(app.jobsPlan, "read")
+        } else {
+            quoted(app.jobsPlan, "write")
+        }
+        append(app.jobsPlan, ",\"paths\":[")
+        quoted(app.jobsPlan, bytes(path))
+        append(app.jobsPlan, "]}")
+        count = count + 1
+    }
+    put(app.jobsPlan, 93_u8)
+    if count < 2 || !bufOk(app.jobsPlan) {
+        return false
+    }
+    beginJobs(app, 1_usize, count)
+    return true
+}

@@ -378,4 +378,11 @@ fn buildSystemContext(app: mutref<App>) -> Void {
         append(output, "\nThe user selected this skill for the session. Apply its relevant instructions within the user's task and the tool approval policy:\n")
         append(output, bytes(active))
     }
+    if app.workerMode > 0 {
+        append(app.systemContext, "\nYou are a delegated file subagent. Work only on the assigned task and exact paths. Your mode is ")
+        append(app.systemContext, field(bytes(app.mcpConfig), "mode"))
+        append(app.systemContext, ". Owned paths: ")
+        append(app.systemContext, field(bytes(app.mcpConfig), "paths"))
+        append(app.systemContext, ". Other workers may be active. Do not change other files, invoke shell/MCP tools or delegate again. Never modify zero.graph: return proposed graph changes to the coordinator. Finish within four model requests and return a concise factual summary.")
+    }
 }

@@ -247,6 +247,7 @@ fn receiveResponse(app: mutref<App>) -> Void {
     }
     app.toolIndex = 0
     if std.mem.eql(arrayItem(bytes(pendingData), 0_usize), "null") {
+        if app.workerMode == 2 { workerSaveSummary(app, bytes(scratchData)) }
         if bufLen(scratchData) == 0 {
             logEntry(app, "  !  Empty response", "The model returned no text or tool calls. Try another model or a smaller prompt.")
         }
@@ -318,6 +319,10 @@ fn startRequest(app: mutref<App>) -> Void {
     clear(scratchData)
     append(scratchData, "--http-worker\n")
     number(scratchData, bufLen(packetData))
+    if app.workerMode > 0 {
+        append(scratchData, "\n--worker-group\n")
+        number(scratchData, process.zero_worker_pid() as usize)
+    }
     app.child = std.proc.spawnChildArgs(bytes(executableData), bytes(scratchData), bytes(workspaceData), "")
     if !std.proc.childValid(app.child) {
         failTurn(app, "Unable to start the native HTTP worker.")
