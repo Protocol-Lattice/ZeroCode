@@ -19,6 +19,7 @@ A terminal coding assistant built with **Zero**, with native file tools, streami
 - **Streaming** – incremental text and tool-call deltas for all four providers, with cancellation
 - **Large files** – UTF-8 range reads and approved edits of files up to 64 MiB
 - **Bounded context** – automatic shortening of old tool output and a digest of older exchanges
+- **Project memory** – automatic task recaps and saved facts persist across sessions, with commands to inspect and forget them
 - **Host builds** – Linux and macOS builds using the pinned Zero compiler and system libcurl
 
 ## Project Structure
@@ -31,6 +32,7 @@ zero-coding/
 ├── src/providers.0     # Provider configuration and request/response mapping
 ├── src/streaming.0     # SSE parsing and incremental message assembly
 ├── src/context.0       # History, tool results and automatic compaction
+├── src/memory.0         # Persistent project facts, approvals and atomic storage
 ├── src/mcp.0           # Persistent MCP stdio connections
 ├── src/skills.0        # Skill discovery and loading
 ├── src/ui.0            # Terminal rendering and keyboard input
@@ -213,6 +215,7 @@ The application supports four LLM providers:
 - `--max-turns <N>` – Maximum conversation turns
 - `--parallel <N>` – Concurrent file workers or model subagents (1–4, default 4)
 - `--cwd <dir>` – Working directory for the agent
+- `--no-memory` – Disable reading and changing saved project memory for this run
 
 ## Example Usage
 
@@ -243,8 +246,9 @@ one to eight exact workspace file paths. For example:
 ]}
 ```
 
-Subagents inherit the selected provider, model and active skill instructions,
-with separate conversations and a maximum of four model requests each. `read`
+Subagents inherit the selected provider, model, active skill instructions and a
+read-only snapshot of project memory, with separate conversations and a maximum
+of four model requests each. `read`
 allows reading; `edit` also allows fragment edits; `write` also allows creating
 or replacing files. Runtime checks restrict every file operation to the declared
 paths. Subagents cannot run commands, call MCP tools, load skills, or delegate
@@ -303,6 +307,71 @@ compaction based on byte budgets, without an extra model request: omitted detail
 may need to be read again. It does not calculate a provider-specific token window.
 If the active request, tool batch, or tool catalog alone exceeds the available
 space, the client reports an error and asks for a smaller task or catalog.
+
+## Project memory
+
+Zero automatically saves a short recap after a successful task, using the final
+response or `finish_task` summary. No separate command, approval or extra model
+request is needed. The latest three recaps are kept, newest first, alongside
+lasting project facts and preferences that you or the model explicitly save.
+Recaps are bounded excerpts, not a separate AI summary; long responses are
+shortened at a UTF-8 boundary.
+
+Memory lives in `.zero-agent/memory.json` under the workspace selected by `--cwd`.
+It is included in subsequent model requests for all four providers, including
+chat-only mode, and survives conversation compaction, `/clear`, and provider or
+model changes. It is treated as reference data; the current task and tool
+restrictions still take precedence.
+
+Manage notes directly in the TUI:
+
+```text
+/memory                              Show saved facts, recent recaps and commands
+/memory set testing Run make test.    Add or replace the note named testing
+/memory delete testing               Forget that note
+/memory clear                        Forget all saved facts and recaps
+```
+
+These explicit commands work without an API key. They also work headlessly:
+
+```sh
+zero-coding --cwd /path/to/project --prompt '/memory set testing Run make test.'
+zero-coding --cwd /path/to/project --prompt '/memory'
+```
+
+The model can use the `memory` tool with `action` set to `list`, `set`, `delete`,
+or `clear`. `set` takes a `key` and `content`; `delete` takes a `key`. Listing runs
+without approval. Model-requested changes show a preview and require approval, or
+`--approve` in headless mode. Delegated subagents receive a snapshot of the notes
+but cannot call this tool or change the store.
+
+Full conversations and tool logs are not automatically persisted. Failed,
+cancelled or empty responses and tasks containing tool errors or denied actions
+do not get a recap. Recaps containing the active API key are also skipped.
+An explicit `memory` deletion or clear suppresses the recap for that task so
+the final acknowledgement does not reintroduce forgotten information.
+
+Saved facts and recaps are sent to your selected provider as context. Avoid
+storing secrets. Use `--no-memory` to disable both reading and changing memory for a session; existing
+notes remain on disk. Demo mode also disables memory. Deleting notes removes them
+from future memory context; use `/clear` as well to discard messages from the
+current conversation that may already mention them.
+
+The store is limited to 32 named facts, three recaps, and 8 KiB of encoded JSON.
+Keys contain 1–64 ASCII letters, digits, underscores or hyphens; each note contains at most 1,024 UTF-8
+bytes. Older recaps are dropped first when space is needed. If named facts leave
+no room for a new recap, automatic saving reports that it was skipped and keeps
+the facts intact. New stores use a private directory and files use mode `0600`.
+The directory is already excluded from this repository and from normal file tools; add
+`.zero-agent/` to other projects' `.gitignore` files if needed.
+
+Saves compare the store with the preview under a short write lock and replace it
+atomically. A conflicting or busy save fails without overwriting another
+session's changes; list memory and retry. Invalid, oversized, unreadable or
+symlinked stores are reported and left untouched. Repair the file before saving
+again. If a process is forcibly killed during the write, a stale
+`.zero-agent/memory.lock` directory may need to be removed after confirming no
+save is active.
 
 ## MCP servers
 
@@ -403,7 +472,8 @@ Both MCP and skills are implemented in Zero, in `src/mcp.0` and `src/skills.0`.
 
 - **Source**: `src/main.0` is the entry point; modules group code by responsibility
 - **Parallel execution**: `src/parallel.0` owns worker scheduling, scoped subagents, approvals, and ordered results
-- **Tests**: `tests/` covers providers, file operations, concurrency, streaming, context compaction, extensions, and installation
+- **Memory**: `src/memory.0` owns bounded project notes, persistence and memory tool/command handling
+- **Tests**: `tests/` covers providers, file operations, concurrency, streaming, context compaction, persistent memory, extensions, and installation
 - **Build**: `Makefile` – Handles compilation and distribution
 
 After editing the source projection, synchronize and validate the program graph:

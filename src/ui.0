@@ -575,7 +575,8 @@ fn render(world: World, app: mutref<App>) -> Void raises {
         paint(app, 14_usize, 7_usize, "\x1b[38;5;250m", "/quit         Exit  ·  Ctrl-D")
         paint(app, 15_usize, 7_usize, "\x1b[38;5;250m", "/mcp          Connect and manage MCP tool servers")
         paint(app, 16_usize, 7_usize, "\x1b[38;5;250m", "/skills       List skills  ·  /skill NAME selects one")
-        paint(app, 17_usize, 7_usize, "\x1b[38;5;245m", "↑/↓ scroll · PgUp/PgDn page · Esc cancel · Paste supported")
+        paint(app, 17_usize, 7_usize, "\x1b[38;5;250m", "/memory       View, set or forget saved project facts")
+        paint(app, 7_usize, 7_usize, "\x1b[38;5;245m", "↑/↓ scroll · PgUp/PgDn page · Esc cancel · Paste supported")
     } else if bufLen(transcriptData) == 0 {
         renderWelcome(app, rows, columns)
     } else {

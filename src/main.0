@@ -1,6 +1,7 @@
 use buffers
 use workspace
 use context
+use memory
 use skills
 use mcp
 use providers
@@ -62,6 +63,9 @@ type App {
     skills: MutSpan<u8>,
     activeSkill: MutSpan<u8>,
     systemContext: MutSpan<u8>,
+    memory: MutSpan<u8>,
+    memoryEnabled: Bool,
+    memorySkipSave: Bool,
     mcpRx0: MutSpan<u8>,
     mcpRx1: MutSpan<u8>,
     mcpRx2: MutSpan<u8>,
@@ -258,6 +262,7 @@ fn parseOptions(app: mutref<App>) -> Bool {
     app.demo = hasArg("--demo")
     app.toolsEnabled = !hasArg("--chat-only")
     app.headless = hasArg("--prompt")
+    app.memoryEnabled = !hasArg("--no-memory") && !app.demo
     if !bufOk(modelData) || !bufOk(endpointData) || !bufOk(keyData) || !bufOk(workspaceData) || !bufOk(executableData) {
         return false
     }
@@ -391,6 +396,7 @@ fn finishToolBatch(app: mutref<App>, summary: Span<u8>, complete: Bool) -> Void 
     app.view = 0
     app.exitCode = 0
     if complete {
+        autoSaveMemory(app, summary)
         logEntry(app, "  TASK COMPLETE", summary)
     } else {
         app.exitCode = 1
@@ -439,7 +445,7 @@ fn stopChild(app: mutref<App>) -> Void {
 fn appendTools(output: MutSpan<u8>, provider: usize, app: ref<App>) -> Void {
     append(output, "[ ")
     var index: usize = 0
-    let builtins: usize = 8
+    let builtins: usize = 9
     var written: usize = 0
     while index < builtins {
         if !builtinAllowed(app, index) { index = index + 1
@@ -498,6 +504,7 @@ fn appendTools(output: MutSpan<u8>, provider: usize, app: ref<App>) -> Void {
 }
 
 fn toolNameAt(index: usize) -> String {
+    if index == 8 { return "memory" }
     if index == 7 { return "delegate_tasks" }
     if index == 6 {
         return "load_skill"
@@ -596,7 +603,9 @@ fn nextTool(app: mutref<App>) -> Void {
         launchCommand(app, bytes(scratchData))
         return
     }
-    if std.mem.eql(bytes(toolNameData), "run_command") {
+    if std.mem.eql(bytes(toolNameData), "memory") {
+        if !prepareMemory(app) { return }
+    } else if std.mem.eql(bytes(toolNameData), "run_command") {
         if !decode(scratchData, field(bytes(argumentsData), "command")) || bufLen(scratchData) == 0 {
             toolResult(app, "Error: command must be a nonempty string.")
             return
@@ -638,6 +647,10 @@ fn approveTool(app: mutref<App>) -> Void {
         callMcpTool(app)
         return
     }
+    if std.mem.eql(bytes(toolNameData), "memory") {
+        applyMemory(app)
+        return
+    }
     if std.mem.eql(bytes(toolNameData), "run_command") {
         let valid: Bool = decode(scratchData, field(bytes(argumentsData), "command"))
         if !valid || bufLen(scratchData) == 0 {
@@ -655,10 +668,13 @@ fn approveTool(app: mutref<App>) -> Void {
 }
 
 fn helpText() -> String {
-    return "Zero Coding TUI 0.1.0 — written in Zero\n\nUsage: zero-coding [options]\n\n  --provider NAME   openrouter, openai, claude, gemini\n  --model ID        Any exact model ID from that provider\n  --cwd PATH        Workspace directory (default: current directory)\n  --endpoint URL    Override the complete provider API endpoint\n  --prompt TEXT     Run one task without a TUI; writes are denied by default\n  --chat-only       Chat without tools (for models without tool support)\n  --approve         Allow all model-requested writes, shell commands and MCP calls\n  --parallel N      Concurrent file workers/subagents (1–4, default 4)\n  --max-turns N     Maximum model requests per task (1–50, default 20)\n  --mcp NAME|all    Connect configured MCP stdio servers at startup\n  --mcp-config PATH MCP JSON configuration (default: .mcp.json)\n  --skills-dir PATH Additional skill collection directory\n  --skill NAME      Select a skill for this session\n  --no-skills       Disable skill discovery\n  --demo            Preview a simulated session, without keys or changes\n  --snapshot        Render one terminal frame and exit\n  --self-test       Run native core tests without network access\n  --help            Show this help\n  --version         Show the application version\n\nAPI keys: OPENROUTER_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY,\n          GEMINI_API_KEY (or GOOGLE_API_KEY), or enter one with /key.\nKeys are held in memory and never stored in the project.\n\nTUI: /provider /model /key /clear /status /tools on|off /help /quit\n     /mcp /skills /skill NAME|off\n     Ctrl-P provider picker, Esc cancel, Up/Down or PgUp/PgDn scroll.\n\nFile tools are confined to relative, non-symlink workspace paths.\nApproved shell commands run as your user and are not sandboxed.\n"
+    return "Zero Coding TUI 0.1.0 — written in Zero\n\nUsage: zero-coding [options]\n\n  --provider NAME   openrouter, openai, claude, gemini\n  --model ID        Any exact model ID from that provider\n  --cwd PATH        Workspace directory (default: current directory)\n  --endpoint URL    Override the complete provider API endpoint\n  --prompt TEXT     Run one task; workspace writes require --approve\n  --chat-only       Chat without tools (for models without tool support)\n  --approve         Allow model-requested file/memory writes, commands and MCP calls\n  --parallel N      Concurrent file workers/subagents (1–4, default 4)\n  --max-turns N     Maximum model requests per task (1–50, default 20)\n  --mcp NAME|all    Connect configured MCP stdio servers at startup\n  --mcp-config PATH MCP JSON configuration (default: .mcp.json)\n  --skills-dir PATH Additional skill collection directory\n  --skill NAME      Select a skill for this session\n  --no-skills       Disable skill discovery\n  --no-memory       Disable persistent project memory for this session\n  --demo            Preview a simulated session, without keys or changes\n  --snapshot        Render one terminal frame and exit\n  --self-test       Run native core tests without network access\n  --help            Show this help\n  --version         Show the application version\n\nAPI keys: OPENROUTER_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY,\n          GEMINI_API_KEY (or GOOGLE_API_KEY), or enter one with /key.\nKeys are held in memory and never stored in the project.\n\nMemory: successful tasks automatically save up to three recent recaps.\nUse --no-memory to disable saved context and automatic persistence.\n\nTUI: /provider /model /key /clear /status /tools on|off /help /quit\n     /mcp /skills /skill NAME|off /memory [list|set KEY TEXT|delete KEY|clear]\n     Ctrl-P provider picker, Esc cancel, Up/Down or PgUp/PgDn scroll.\n\nFile tools are confined to relative, non-symlink workspace paths.\nApproved shell commands run as your user and are not sandboxed.\n"
 }
 
 fn toolSchema(index: usize) -> String {
+    if index == 8 {
+        return "{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"list\",\"set\",\"delete\",\"clear\"]},\"key\":{\"type\":\"string\",\"description\":\"Required for set/delete: 1–64 letters, digits, underscores or hyphens\"},\"content\":{\"type\":\"string\",\"description\":\"Required for set: a concise project fact, at most 1024 UTF-8 bytes\"}},\"required\":[\"action\"],\"additionalProperties\":false}"
+    }
     if index == 7 {
         return "{\"type\":\"object\",\"properties\":{\"tasks\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":4,\"items\":{\"type\":\"object\",\"properties\":{\"mode\":{\"type\":\"string\",\"enum\":[\"read\",\"write\",\"edit\"]},\"paths\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":8,\"items\":{\"type\":\"string\"}},\"prompt\":{\"type\":\"string\"}},\"required\":[\"mode\",\"paths\",\"prompt\"],\"additionalProperties\":false}}},\"required\":[\"tasks\"],\"additionalProperties\":false}"
     }
@@ -684,6 +700,7 @@ fn toolSchema(index: usize) -> String {
 }
 
 fn toolDescription(index: usize) -> String {
+    if index == 8 { return "List or maintain project memory that survives restarts. Use set to add/update a named fact, delete to forget a key, or clear to forget all notes. Mutations require approval. Store useful project facts and preferences, never secrets or raw conversations. Limited to 32 entries and 8 KiB total." }
     if index == 7 { return "Delegate one to four independent file tasks to model subagents with separate contexts. Declare exact owned paths and read/write/edit mode. Subagents have up to four model requests each. Overlapping writes are serialized, and mutations require approval. They cannot modify zero.graph or run commands; return proposed graph changes for the coordinator to apply." }
     if index == 6 {
         return "Load instructions or a text reference for an available skill. Respects .gitignore and rejects unsafe paths and symlinks. This does not execute bundled scripts or grant tool approvals."
@@ -909,6 +926,11 @@ fn submit(app: mutref<App>) -> Void {
     if app.view != 0 || std.mem.len(input) == 0 {
         return
     }
+    if std.mem.eql(input, "/memory") || std.str.startsWith(input, "/memory ") {
+        memoryCommand(app, input)
+        eraseInput(app)
+        return
+    }
     if std.mem.eql(input, "/mcp") || std.str.startsWith(input, "/mcp ") {
         mcpCommand(app, input)
         eraseInput(app)
@@ -1003,6 +1025,7 @@ fn submit(app: mutref<App>) -> Void {
     }
     app.turnStart = bufLen(historyData)
     app.turn = 0
+    app.memorySkipSave = false
     app.repeatCount = 0
     clear(app.lastToolSnapshot)
     app.exitCode = 0
@@ -1065,7 +1088,7 @@ fn readyApp(world: World, app: mutref<App>) -> i32 raises {
             check world.out.write("Prompt is empty or exceeds 8 KiB.\n")
             return 1
         }
-        if bufLen(app.key) == 0 {
+        if bufLen(app.key) == 0 && !std.mem.eql(prompt.value, "/memory") && !std.str.startsWith(prompt.value, "/memory ") {
             app.exitCode = 1
         }
         submit(app)
@@ -1108,13 +1131,22 @@ fn extensionReady(world: World, app: mutref<App>) -> i32 {
     return code
 }
 
+fn memoryStorage(world: World, app: mutref<App>) -> i32 {
+    var storage: [8208]u8 = [0_u8; 8208]
+    let previous: MutSpan<u8> = app.memory
+    app.memory = buffer(storage)
+    let code: i32 = extensionReady(world, app)
+    app.memory = previous
+    return code
+}
+
 // Keep buffer frames in dependency order for bounded provenance analysis.
 // Restore caller-owned spans on exit so no stack-backed view escapes its frame.
 fn poolStorage4(world: World, app: mutref<App>) -> i32 {
     var jobsPlanStorage: [49152]u8 = [0_u8; 49152]
     let previousjobsPlan: MutSpan<u8> = app.jobsPlan
     app.jobsPlan = buffer(jobsPlanStorage)
-    let code: i32 = extensionReady(world, app)
+    let code: i32 = memoryStorage(world, app)
     app.jobsPlan = previousjobsPlan
     return code
 }
@@ -1282,7 +1314,7 @@ fn extensionStorage1(world: World, app: mutref<App>) -> i32 {
 }
 
 fn extensionStorage0(world: World, app: mutref<App>) -> i32 {
-    var storage: [32784]u8 = [0_u8; 32784]
+    var storage: [65552]u8 = [0_u8; 65552]
     let previousmcpConfig: MutSpan<u8> = app.mcpConfig
     app.mcpConfig = buffer(storage)
     let code: i32 = extensionStorage1(world, app)
@@ -1407,7 +1439,7 @@ fn runApplication(world: World) -> i32 {
     var mcpRx1Empty: [32]u8 = [0_u8; 32]
     var mcpRx2Empty: [32]u8 = [0_u8; 32]
     var mcpRx3Empty: [32]u8 = [0_u8; 32]
-    var app: App = App { provider: 0, view: 0, selection: 0, phase: 0, alive: true, headless: false, approve: false, demo: false, paste: false, history: buffer(historyEmpty), transcript: buffer(transcriptEmpty), input: buffer(input), model: buffer(model), key: buffer(key), endpoint: buffer(endpoint), workspace: buffer(workspace), executable: buffer(executable), pending: buffer(pendingEmpty), arguments: buffer(arguments), toolId: buffer(toolId), toolName: buffer(toolName), result: buffer(result), packet: buffer(packetEmpty), response: buffer(responseEmpty), errors: buffer(errors), scratch: buffer(scratchEmpty), frame: buffer(frame), keyboard: buffer(keyboard), child: std.proc.spawnChild(""), sent: 0, toolIndex: 0, turn: 0, maxTurns: 20, toolCount: 0, filesChanged: 0, tokens: 0, scroll: 0, turnStart: 0, started: std.time.monotonic(), tick: 0, exitCode: 0, toolsEnabled: true, lastToolSnapshot: buffer(snapshotEmpty), repeatCount: 0, mcpConfig: buffer(mcpConfigEmpty), mcpTools: buffer(mcpToolsEmpty), mcpTx: buffer(mcpTxEmpty), mcpCursor: buffer(mcpCursorEmpty), skills: buffer(skillsEmpty), activeSkill: buffer(activeSkillEmpty), systemContext: buffer(systemContextEmpty), mcpRx0: buffer(mcpRx0Empty), mcpRx1: buffer(mcpRx1Empty), mcpRx2: buffer(mcpRx2Empty), mcpRx3: buffer(mcpRx3Empty), mcpChild0: std.proc.spawnChild(""), mcpChild1: std.proc.spawnChild(""), mcpChild2: std.proc.spawnChild(""), mcpChild3: std.proc.spawnChild(""), mcpCount: 0, mcpIndex: 0, mcpStage: 0, mcpRequest: 0, mcpSent: 0, mcpPage: 0, mcpConnectAll: false, skillCount: 0, streamMode: 0, httpStatus: 0, streamActive: 0, streamDone: false, streamVisible: false, streamLine: buffer(responseEmpty), streamEvent: buffer(responseEmpty), streamMessage: buffer(responseEmpty), workerMode: 0, workerApprovalSent: false, parallelLimit: 4, jobsMode: 0, jobsCount: 0, jobsCommitted: 0, jobsRepeated: false, jobsApproval: 0, jobsPlan: buffer(responseEmpty), jobChild0: std.proc.spawnChild(""), jobTx0: buffer(responseEmpty), jobRx0: buffer(responseEmpty), jobState0: 0, jobSent0: 0, jobStarted0: std.time.monotonic(), jobFailed0: false, jobChild1: std.proc.spawnChild(""), jobTx1: buffer(responseEmpty), jobRx1: buffer(responseEmpty), jobState1: 0, jobSent1: 0, jobStarted1: std.time.monotonic(), jobFailed1: false, jobChild2: std.proc.spawnChild(""), jobTx2: buffer(responseEmpty), jobRx2: buffer(responseEmpty), jobState2: 0, jobSent2: 0, jobStarted2: std.time.monotonic(), jobFailed2: false, jobChild3: std.proc.spawnChild(""), jobTx3: buffer(responseEmpty), jobRx3: buffer(responseEmpty), jobState3: 0, jobSent3: 0, jobStarted3: std.time.monotonic(), jobFailed3: false }
+    var app: App = App { provider: 0, view: 0, selection: 0, phase: 0, alive: true, headless: false, approve: false, demo: false, paste: false, history: buffer(historyEmpty), transcript: buffer(transcriptEmpty), input: buffer(input), model: buffer(model), key: buffer(key), endpoint: buffer(endpoint), workspace: buffer(workspace), executable: buffer(executable), pending: buffer(pendingEmpty), arguments: buffer(arguments), toolId: buffer(toolId), toolName: buffer(toolName), result: buffer(result), packet: buffer(packetEmpty), response: buffer(responseEmpty), errors: buffer(errors), scratch: buffer(scratchEmpty), frame: buffer(frame), keyboard: buffer(keyboard), child: std.proc.spawnChild(""), sent: 0, toolIndex: 0, turn: 0, maxTurns: 20, toolCount: 0, filesChanged: 0, tokens: 0, scroll: 0, turnStart: 0, started: std.time.monotonic(), tick: 0, exitCode: 0, toolsEnabled: true, lastToolSnapshot: buffer(snapshotEmpty), repeatCount: 0, mcpConfig: buffer(mcpConfigEmpty), mcpTools: buffer(mcpToolsEmpty), mcpTx: buffer(mcpTxEmpty), mcpCursor: buffer(mcpCursorEmpty), skills: buffer(skillsEmpty), activeSkill: buffer(activeSkillEmpty), systemContext: buffer(systemContextEmpty), memory: buffer(responseEmpty), memoryEnabled: true, memorySkipSave: false, mcpRx0: buffer(mcpRx0Empty), mcpRx1: buffer(mcpRx1Empty), mcpRx2: buffer(mcpRx2Empty), mcpRx3: buffer(mcpRx3Empty), mcpChild0: std.proc.spawnChild(""), mcpChild1: std.proc.spawnChild(""), mcpChild2: std.proc.spawnChild(""), mcpChild3: std.proc.spawnChild(""), mcpCount: 0, mcpIndex: 0, mcpStage: 0, mcpRequest: 0, mcpSent: 0, mcpPage: 0, mcpConnectAll: false, skillCount: 0, streamMode: 0, httpStatus: 0, streamActive: 0, streamDone: false, streamVisible: false, streamLine: buffer(responseEmpty), streamEvent: buffer(responseEmpty), streamMessage: buffer(responseEmpty), workerMode: 0, workerApprovalSent: false, parallelLimit: 4, jobsMode: 0, jobsCount: 0, jobsCommitted: 0, jobsRepeated: false, jobsApproval: 0, jobsPlan: buffer(responseEmpty), jobChild0: std.proc.spawnChild(""), jobTx0: buffer(responseEmpty), jobRx0: buffer(responseEmpty), jobState0: 0, jobSent0: 0, jobStarted0: std.time.monotonic(), jobFailed0: false, jobChild1: std.proc.spawnChild(""), jobTx1: buffer(responseEmpty), jobRx1: buffer(responseEmpty), jobState1: 0, jobSent1: 0, jobStarted1: std.time.monotonic(), jobFailed1: false, jobChild2: std.proc.spawnChild(""), jobTx2: buffer(responseEmpty), jobRx2: buffer(responseEmpty), jobState2: 0, jobSent2: 0, jobStarted2: std.time.monotonic(), jobFailed2: false, jobChild3: std.proc.spawnChild(""), jobTx3: buffer(responseEmpty), jobRx3: buffer(responseEmpty), jobState3: 0, jobSent3: 0, jobStarted3: std.time.monotonic(), jobFailed3: false }
     return toolGuardStorage(world, &mut app)
 }
 

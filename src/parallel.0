@@ -322,6 +322,7 @@ fn workerToolAllowed(app: ref<App>) -> Bool {
 
 fn builtinAllowed(app: ref<App>, index: usize) -> Bool {
     if app.workerMode == 0 {
+        if index == 8 { return app.memoryEnabled }
         return index != 6 || app.skillCount > 0
     }
     if index == 0 || index == 5 {
@@ -486,6 +487,12 @@ fn loadWorker(app: mutref<App>) -> Bool {
     if !decode(app.activeSkill, field(config, "instructions")) {
         return false
     }
+    app.memoryEnabled = std.mem.eql(field(config, "memory_enabled"), "true")
+    clear(app.memory)
+    if app.memoryEnabled {
+        if !decode(app.memory, field(config, "memory")) { return false }
+        if bufLen(app.memory) > 0 && !validMemory(bytes(app.memory)) { return false }
+    }
     app.approve = std.mem.eql(field(config, "approve"), "true")
     app.headless = true
     app.parallelLimit = 1
@@ -577,6 +584,10 @@ fn startJob(app: mutref<App>, index: usize) -> Void {
     quoted(output, bytes(app.endpoint))
     append(output, ",\"instructions\":")
     quoted(output, bytes(app.activeSkill))
+    append(output, ",\"memory_enabled\":")
+    if app.memoryEnabled && bufOk(app.memory) { append(output, "true") } else { append(output, "false") }
+    append(output, ",\"memory\":")
+    quoted(output, bytes(app.memory))
     append(output, ",\"approve\":")
     if app.approve {
         append(output, "true")
@@ -595,8 +606,8 @@ fn startJob(app: mutref<App>, index: usize) -> Void {
         append(output, field(plan, "prompt"))
     }
     put(output, 125_u8)
-    if !bufOk(output) || bufLen(output) > 32768 {
-        failJob(app, index, "Error: worker instructions or arguments exceed 32 KiB.")
+    if !bufOk(output) || bufLen(output) > 65536 {
+        failJob(app, index, "Error: worker instructions or arguments exceed 64 KiB.")
         return
     }
     var storage: [128]u8 = [0_u8; 128]

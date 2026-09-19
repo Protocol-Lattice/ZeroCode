@@ -116,6 +116,10 @@ def environment(endpoint=None, keys=True):
 
 class Terminal:
     def __init__(self, args, env, rows=24, columns=80, command=None):
+        self.workspace_temporary = None
+        if command is None and "--cwd" not in args:
+            self.workspace_temporary = tempfile.TemporaryDirectory(prefix="zero terminal ")
+            args = [*args, "--cwd", self.workspace_temporary.name]
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
         self.original = termios.tcgetattr(slave)
@@ -163,14 +167,18 @@ class Terminal:
         restored = termios.tcgetattr(self.slave)
         os.close(self.master)
         os.close(self.slave)
+        if self.workspace_temporary is not None:
+            self.workspace_temporary.cleanup()
         return restored
 
 
 class AgentTests(unittest.TestCase):
     def run_agent(self, api, provider="openrouter", directory=None, extra=(), prompt="Please do the task.", max_turns=4):
-        return subprocess.run([str(EXE), "--provider", provider, "--model", "any/custom-model-id",
-                               "--cwd", str(directory or ROOT), "--max-turns", str(max_turns), "--prompt", prompt, *extra],
-                              env=environment(api.url), text=True, capture_output=True, timeout=15)
+        workspace = contextlib.nullcontext(directory) if directory is not None else tempfile.TemporaryDirectory(prefix="zero agent ")
+        with workspace as folder:
+            return subprocess.run([str(EXE), "--provider", provider, "--model", "any/custom-model-id",
+                                   "--cwd", str(folder), "--max-turns", str(max_turns), "--prompt", prompt, *extra],
+                                  env=environment(api.url), text=True, capture_output=True, timeout=15)
 
     def test_native_core(self):
         result = subprocess.run([str(EXE), "--self-test"], capture_output=True, text=True, timeout=5)
@@ -200,9 +208,10 @@ class AgentTests(unittest.TestCase):
                 self.assertIn("Provider connected.", result.stdout)
                 headers, body = api.requests[0]
                 self.assertEqual(body["model"], "any/custom-model-id")
-                self.assertEqual(len(body["tools"]), 7)
+                self.assertEqual(len(body["tools"]), 8)
                 names = [(tool if provider == "claude" else tool["function"])["name"] for tool in body["tools"]]
                 self.assertIn("delegate_tasks", names)
+                self.assertIn("memory", names)
                 self.assertNotIn("test-key-never-render-me", result.stdout + result.stderr)
                 lowered = {k.lower(): v for k, v in headers.items()}
                 if provider == "claude":

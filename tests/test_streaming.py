@@ -54,8 +54,8 @@ class StreamingTests(unittest.TestCase):
             yield sse(chunk({"content": " finished."}, "stop"))
             yield sse("[DONE]")
 
-        with MockAPI([StreamReply(chunks())]) as api:
-            process = subprocess.Popen([str(agent.EXE), "--prompt", "stream a response"],
+        with tempfile.TemporaryDirectory() as folder, MockAPI([StreamReply(chunks())]) as api:
+            process = subprocess.Popen([str(agent.EXE), "--cwd", folder, "--prompt", "stream a response"],
                                        env=environment(api.url), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             output = bytearray()
             try:

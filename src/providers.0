@@ -247,6 +247,7 @@ fn receiveResponse(app: mutref<App>) -> Void {
     }
     app.toolIndex = 0
     if std.mem.eql(arrayItem(bytes(pendingData), 0_usize), "null") {
+        autoSaveMemory(app, bytes(scratchData))
         if app.workerMode == 2 { workerSaveSummary(app, bytes(scratchData)) }
         if bufLen(scratchData) == 0 {
             logEntry(app, "  !  Empty response", "The model returned no text or tool calls. Try another model or a smaller prompt.")

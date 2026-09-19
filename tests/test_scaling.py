@@ -100,6 +100,10 @@ class ScalingTests(unittest.TestCase):
     def test_long_tool_history_compacts_without_losing_task_or_tool_pairs(self):
         for provider in ("openrouter", "claude"):
             with self.subTest(provider=provider), tempfile.TemporaryDirectory() as folder:
+                memory = Path(folder, ".zero-agent/memory.json")
+                memory.parent.mkdir()
+                memory.write_text(json.dumps({"version": 1, "entries": [
+                    {"key": "architecture", "content": "PERSISTENT_FACT_MUST_SURVIVE"}]}))
                 responses = []
                 for index in range(12):
                     path = f"file{index}.txt"
@@ -113,6 +117,8 @@ class ScalingTests(unittest.TestCase):
                     self.assertIn("CONTEXT COMPACTED", result.stdout)
                     for _, request in api.requests:
                         self.assertIn("CURRENT_TASK_MUST_SURVIVE", json.dumps(request["messages"]))
+                        system = request["system"] if provider == "claude" else request["messages"][0]["content"]
+                        self.assertIn("PERSISTENT_FACT_MUST_SURVIVE", system)
                         assert_tool_pairs(self, request["messages"], provider)
 
     def test_large_tool_batch_stays_balanced_during_compaction(self):

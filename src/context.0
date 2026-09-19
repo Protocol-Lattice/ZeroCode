@@ -208,6 +208,7 @@ fn userMessage(app: mutref<App>, message: Span<u8>) -> Bool {
 }
 
 fn appendToolResult(app: mutref<App>, result: Span<u8>) -> Void {
+    if std.str.startsWith(result, "Error:") { app.memorySkipSave = true }
     let historyData: MutSpan<u8> = app.history
     let pendingData: MutSpan<u8> = app.pending
     let toolIdData: MutSpan<u8> = app.toolId

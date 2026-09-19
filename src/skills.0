@@ -369,6 +369,7 @@ fn buildSystemContext(app: mutref<App>) -> Void {
     let skills: MutSpan<u8> = app.skills
     let active: MutSpan<u8> = app.activeSkill
     setText(output, selectedSystem(app.toolsEnabled))
+    appendMemoryContext(app)
     if app.skillCount > 0 && app.toolsEnabled {
         append(output, "\nAvailable skills (metadata only): ")
         append(output, bytes(skills))
