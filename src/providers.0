@@ -93,6 +93,7 @@ fn configureProvider(app: mutref<App>, provider: usize) -> Void {
     if provider == 3 && bufLen(keyData) == 0 {
         setText(keyData, std.env.getOr("GOOGLE_API_KEY", ""))
     }
+    rememberLogKey(app, bytes(keyData))
     clear(historyData)
     app.turn = 0
 }

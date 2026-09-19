@@ -539,6 +539,7 @@ fn runWorker(world: World, app: mutref<App>) -> i32 raises {
 fn stopJobs(app: mutref<App>) -> Void {
     var i: usize = 0
     while i < 4 {
+        sessionLogWorker(app, i, "", 2_usize)
         let child: ProcChild = jobChild(app, i)
         if std.proc.childValid(child) {
             let killed: Bool = std.proc.killGroupPid(std.proc.pid(child))
@@ -554,6 +555,7 @@ fn stopJobs(app: mutref<App>) -> Void {
 }
 
 fn failJob(app: mutref<App>, index: usize, message: Span<u8>) -> Void {
+    sessionLogWorker(app, index, "", 2_usize)
     let child: ProcChild = jobChild(app, index)
     if std.proc.childValid(child) {
         let killed: Bool = std.proc.killGroupPid(std.proc.pid(child))
@@ -634,8 +636,9 @@ fn jobEvent(app: mutref<App>, index: usize) -> Void {
     }
     let kind: Span<u8> = field(message, "type")
     if std.mem.eql(kind, "\"log\"") {
-        if decode(app.scratch, field(message, "text")) && app.jobsApproval == 0 {
-            logEntry(app, "  PARALLEL WORKER", bytes(app.scratch))
+        if decode(app.scratch, field(message, "text")) {
+            sessionLogWorker(app, index, bytes(app.scratch), 0_usize)
+            if app.jobsApproval == 0 { displayEntry(app, "  PARALLEL WORKER", bytes(app.scratch)) }
         }
     } else if std.mem.eql(kind, "\"approval\"") {
         if jobState(app, index) != 1 || !std.str.startsWith(field(message, "id"), "\"") {
@@ -649,6 +652,7 @@ fn jobEvent(app: mutref<App>, index: usize) -> Void {
         }
         setJobState(app, index, 2_usize)
     } else if std.mem.eql(kind, "\"result\"") {
+        sessionLogWorker(app, index, "", 1_usize)
         if jobState(app, index) != 1 || !decode(jobTx(app, index), field(message, "text")) {
             failJob(app, index, "Error: invalid or oversized worker result.")
             return
@@ -748,6 +752,8 @@ fn answerJobApproval(app: mutref<App>, approved: Bool) -> Void {
         return
     }
     let index: usize = app.jobsApproval - 1
+    if approved { sessionLogText(app, "approval", "WORKER", "approved", false) }
+    else { sessionLogText(app, "approval", "WORKER", "denied", false) }
     let tx: MutSpan<u8> = jobTx(app, index)
     clear(app.packet)
     append(app.packet, "{\"id\":")

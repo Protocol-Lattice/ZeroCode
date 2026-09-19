@@ -1,0 +1,240 @@
+// One private JSONL journal per coordinator session. Each record is appended
+// immediately; display clearing and context compaction never touch the journal.
+fn sessionLogUnavailable(app: mutref<App>) -> Void {
+    if !app.logEnabled { return }
+    app.logEnabled = false
+    app.logFailed = true
+    process.zero_log_close()
+    displayEntry(app, "  SESSION LOG UNAVAILABLE", "Cannot save session logs. Logging is disabled for this run; the task can continue. Check .zero-agent/sessions permissions and available disk space.")
+}
+
+fn rememberLogKey(app: mutref<App>, key: Span<u8>) -> Void {
+    if !app.logEnabled || std.mem.len(key) == 0 { return }
+    // Keys are kept only in RAM, including keys replaced through /key.
+    if std.mem.len(key) > 2032 || containsNul(key) {
+        sessionLogUnavailable(app)
+        return
+    }
+    let secrets: Span<u8> = bytes(app.logSecrets)
+    var start: usize = 0
+    var at: usize = 0
+    while at < std.mem.len(secrets) {
+        if secrets[at] == 0 {
+            if std.mem.eql(slice(secrets, start, at), key) { return }
+            start = at + 1
+        }
+        at = at + 1
+    }
+    append(app.logSecrets, key)
+    put(app.logSecrets, 0_u8)
+    if !bufOk(app.logSecrets) { sessionLogUnavailable(app) }
+}
+
+fn writeSessionLog(app: mutref<App>, event: Span<u8>, title: Span<u8>, text: Span<u8>, position: usize) -> Void {
+    if !app.logEnabled { return }
+    var storage: [32768]u8 = [0_u8; 32768]
+    let record: MutSpan<u8> = buffer(storage)
+    append(record, "{\"version\":1,\"seq\":")
+    number(record, app.logSequence)
+    append(record, ",\"time\":")
+    number(record, std.time.wallSeconds() as usize)
+    append(record, ",\"event\":")
+    quoted(record, event)
+    append(record, ",\"title\":")
+    quoted(record, title)
+    append(record, ",\"part\":")
+    number(record, position / 2)
+    append(record, ",\"last\":")
+    if position % 2 == 1 { append(record, "true") } else { append(record, "false") }
+    append(record, ",\"text\":")
+    quoted(record, text)
+    append(record, "}\n")
+    if !bufOk(record) { sessionLogUnavailable(app)
+        return }
+    process.zero_log_reset()
+    var index: usize = 0
+    while index < bufLen(record) {
+        process.zero_log_byte(record[index] as u32)
+        index = index + 1
+    }
+    if process.zero_log_flush() != 1 { sessionLogUnavailable(app) }
+}
+
+// Redact whole keys before splitting records. For streamed text, retain only a
+// suffix that could become a key in the next delta, so chunk boundaries cannot
+// bypass redaction. A cancelled/incomplete suffix is redacted at stream end.
+fn sessionLogText(app: mutref<App>, event: Span<u8>, title: Span<u8>, text: Span<u8>, streaming: Bool) -> Void {
+    if !app.logEnabled { return }
+    var storage: [4112]u8 = [0_u8; 4112]
+    let output: MutSpan<u8> = buffer(storage)
+    let secrets: Span<u8> = bytes(app.logSecrets)
+    app.logSequence = app.logSequence + 1
+    var at: usize = 0
+    var part: usize = 0
+    while at < std.mem.len(text) {
+        let remaining: Span<u8> = std.mem.dropPrefix(text, at)
+        var matched: usize = 0
+        var partial: Bool = false
+        var start: usize = 0
+        var keyEnd: usize = 0
+        while keyEnd < std.mem.len(secrets) {
+            if secrets[keyEnd] == 0 {
+                let key: Span<u8> = slice(secrets, start, keyEnd)
+                if std.str.startsWith(remaining, key) && std.mem.len(key) > matched { matched = std.mem.len(key) }
+                if streaming && std.mem.len(remaining) < std.mem.len(key) && std.str.startsWith(key, remaining) { partial = true }
+                start = keyEnd + 1
+            }
+            keyEnd = keyEnd + 1
+        }
+        if partial {
+            setText(app.logTail, remaining)
+            break
+        }
+        if matched > 0 {
+            append(output, "[REDACTED]")
+            at = at + matched
+        } else {
+            // Invalid command-output bytes are represented safely in JSON.
+            let width: Maybe<usize> = std.unicode.widthAt(text, at)
+            let cp: Maybe<u32> = std.unicode.decodeAt(text, at)
+            if width.has && cp.has {
+                append(output, slice(text, at, at + width.value))
+                at = at + width.value
+            } else {
+                append(output, "�")
+                at = at + 1
+            }
+        }
+        if bufLen(output) >= 3072 && at < std.mem.len(text) {
+            writeSessionLog(app, event, title, bytes(output), part * 2)
+            clear(output)
+            part = part + 1
+        }
+    }
+    if bufLen(output) > 0 || !streaming || part > 0 {
+        writeSessionLog(app, event, title, bytes(output), part * 2 + 1)
+    }
+}
+
+fn sessionLogEntry(app: mutref<App>, title: Span<u8>, text: Span<u8>) -> Void {
+    sessionLogText(app, "entry", std.str.trimAscii(title), text, false)
+}
+
+fn sessionLogDelta(app: mutref<App>, text: Span<u8>) -> Void {
+    if !app.logEnabled { return }
+    var storage: [36864]u8 = [0_u8; 36864]
+    let combined: MutSpan<u8> = buffer(storage)
+    append(combined, bytes(app.logTail))
+    append(combined, text)
+    clear(app.logTail)
+    app.logStreaming = true
+    if !bufOk(combined) { sessionLogUnavailable(app)
+        return }
+    sessionLogText(app, "assistant_delta", "ZERO", bytes(combined), true)
+}
+
+// Independent tails prevent concurrent worker streams from revealing keys
+// split across messages, or combining fragments from different workers.
+fn sessionLogWorker(app: mutref<App>, index: usize, text: Span<u8>, finish: usize) -> Void {
+    if !app.logEnabled { return }
+    let previousTail: MutSpan<u8> = app.logTail
+    if index == 0 { app.logTail = app.logWorkerTail0 }
+    else if index == 1 { app.logTail = app.logWorkerTail1 }
+    else if index == 2 { app.logTail = app.logWorkerTail2 }
+    else { app.logTail = app.logWorkerTail3 }
+    var storage: [48]u8 = [0_u8; 48]
+    let title: MutSpan<u8> = buffer(storage)
+    append(title, "WORKER ")
+    number(title, index + 1)
+    if finish == 0 {
+        var combinedStorage: [36864]u8 = [0_u8; 36864]
+        let combined: MutSpan<u8> = buffer(combinedStorage)
+        append(combined, bytes(app.logTail))
+        append(combined, text)
+        clear(app.logTail)
+        if bufOk(combined) { sessionLogText(app, "worker_delta", bytes(title), bytes(combined), true) }
+        else { sessionLogUnavailable(app) }
+    }
+    else if bufLen(app.logTail) > 0 {
+        if finish == 1 { sessionLogText(app, "worker_delta", bytes(title), bytes(app.logTail), false) }
+        else { sessionLogText(app, "worker_delta", bytes(title), "[REDACTED]", false) }
+        clear(app.logTail)
+    }
+    app.logTail = previousTail
+}
+
+fn finishSessionLogStream(app: mutref<App>, completed: Bool) -> Void {
+    if !app.logStreaming { return }
+    app.logStreaming = false
+    if bufLen(app.logTail) > 0 {
+        if completed { sessionLogText(app, "assistant_delta", "ZERO", bytes(app.logTail), false) }
+        else { sessionLogText(app, "assistant_delta", "ZERO", "[REDACTED]", false) }
+        clear(app.logTail)
+    }
+    if completed {
+        sessionLogText(app, "stream_end", "ZERO", "completed", false)
+    } else {
+        sessionLogText(app, "stream_end", "ZERO", "interrupted", false)
+    }
+}
+
+fn startSessionLog(app: mutref<App>) -> Void {
+    app.logEnabled = !hasArg("--no-session-logs") && !app.demo && !hasArg("--snapshot") && app.workerMode == 0
+    if !app.logEnabled { return }
+    var index: usize = 0
+    while index < 4 {
+        rememberLogKey(app, std.env.getOr(keyVariable(index), ""))
+        index = index + 1
+    }
+    rememberLogKey(app, std.env.getOr("GOOGLE_API_KEY", ""))
+    rememberLogKey(app, bytes(app.key))
+    if !app.logEnabled { return }
+    var storage: [8192]u8 = [0_u8; 8192]
+    let args: MutSpan<u8> = buffer(storage)
+    append(args, "-c\ncd -- \"$1\" || exit 1; umask 077; [ ! -L .zero-agent ] && [ ! -L .zero-agent/sessions ] || exit 1; mkdir -p .zero-agent/sessions || exit 1; d=$(mktemp -d .zero-agent/sessions/session-XXXXXXXX) || exit 1; : > \"$d/events.jsonl\" || exit 1; printf '%s/%s/events.jsonl' \"$PWD\" \"$d\"\nzero-session-log\n")
+    append(args, bytes(app.workspace))
+    var pathStorage: [8192]u8 = [0_u8; 8192]
+    let path: Maybe<usize> = std.proc.captureArgs("/bin/sh", bytes(args), pathStorage)
+    if !bufOk(args) || !path.has { sessionLogUnavailable(app)
+        return }
+    if path.value == 0 || path.value >= 8192 { sessionLogUnavailable(app)
+        return }
+    setText(app.logPath, std.mem.prefix(pathStorage, path.value))
+    if !bufOk(app.logPath) { sessionLogUnavailable(app)
+        return }
+    process.zero_log_reset()
+    index = 0
+    while index < bufLen(app.logPath) {
+        process.zero_log_byte(pathStorage[index] as u32)
+        index = index + 1
+    }
+    if process.zero_log_open() != 1 { sessionLogUnavailable(app)
+        return }
+    clear(args)
+    append(args, "Provider: ")
+    append(args, providerSlug(app.provider))
+    append(args, "\nModel: ")
+    append(args, bytes(app.model))
+    append(args, "\nWorkspace: ")
+    append(args, bytes(app.workspace))
+    sessionLogText(app, "session_start", "SESSION", bytes(args), false)
+}
+
+fn closeSessionLog(app: mutref<App>, code: i32) -> Void {
+    finishSessionLogStream(app, false)
+    if app.phase != 0 { sessionLogText(app, "session_end", "SESSION", "interrupted", false) }
+    else if code != 0 || app.exitCode != 0 { sessionLogText(app, "session_end", "SESSION", "error", false) }
+    else { sessionLogText(app, "session_end", "SESSION", "closed", false) }
+    app.logEnabled = false
+    process.zero_log_close()
+    let secretsData: MutSpan<u8> = app.logSecrets
+    let erased: usize = std.mem.fill(secretsData, 0_u8)
+    clear(app.logSecrets)
+    clear(app.logTail)
+}
+
+fn showSessionLog(app: mutref<App>) -> Void {
+    if app.logEnabled { logEntry(app, "  SESSION LOG", bytes(app.logPath)) }
+    else if app.logFailed { logEntry(app, "  SESSION LOG", "Saving failed; logging is disabled for this run. Earlier records may remain in .zero-agent/sessions/.") }
+    else { logEntry(app, "  SESSION LOG", "Session logging is disabled for this run.") }
+}

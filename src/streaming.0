@@ -64,6 +64,7 @@ fn streamText(app: mutref<App>, raw: Span<u8>) -> Void {
     if bufLen(text) == 0 {
         return
     }
+    sessionLogDelta(app, bytes(text))
     if bufLen(app.transcript) + bufLen(text) + 64 > capacity(app.transcript) {
         clear(app.transcript)
     }
@@ -302,6 +303,7 @@ fn finishHttp(app: mutref<App>) -> Void {
         failTurn(app, "Provider stream was interrupted before completion. No partial tool calls were executed.")
         return
     }
+    finishSessionLogStream(app, true)
     clear(app.response)
     append(app.response, "200\n")
     let message: Span<u8> = bytes(app.streamMessage)

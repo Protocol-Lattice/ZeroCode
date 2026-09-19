@@ -47,6 +47,8 @@ class ScalingTests(unittest.TestCase):
             with MockAPI([reply("openrouter", calls=calls), reply("openrouter", "Read ranges.")]) as api:
                 result = self.run_agent(api, directory=folder)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("line: żółw 🐢\n", result.stdout)
+                self.assertNotIn(r"\u000a", result.stdout)
                 pages = [msg["content"] for msg in api.requests[1][1]["messages"] if msg["role"] == "tool"]
                 for raw in pages[:-1]:
                     page = json.loads(raw)
@@ -54,6 +56,56 @@ class ScalingTests(unittest.TestCase):
                     self.assertEqual(page["content"].encode(), content[page["offset"]:page["next_offset"]])
                     self.assertEqual(page["truncated"], page["next_offset"] < len(content))
                 self.assertIn("past the end", pages[-1])
+
+    def test_paged_read_displays_text_without_changing_provider_payload(self):
+        content = 'First line\nSecond line with "quotes" and żółw 🐢\nTabbed\tvalue\n'
+        for provider in ("openrouter", "openai", "claude", "gemini"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as folder:
+                Path(folder, "notes.txt").write_text(content)
+                with MockAPI([reply(provider, calls=[("read_file", {"path": "notes.txt", "offset": 0, "limit": 12000})]),
+                              reply(provider, "Read finished.")]) as api:
+                    result = self.run_agent(api, provider, folder)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn('First line\nSecond line with "quotes" and żółw 🐢\nTabbed  value\n', result.stdout)
+                    self.assertIn("[File bytes 0–", result.stdout)
+                    for escape in (r"\u000a", r"\u0009", r'\"', '"next_offset":'):
+                        self.assertNotIn(escape, result.stdout)
+                    if provider == "claude":
+                        raw = next(block["content"] for message in api.requests[1][1]["messages"]
+                                   for block in message.get("content", []) if isinstance(block, dict) and block.get("type") == "tool_result")
+                    else:
+                        raw = next(message["content"] for message in api.requests[1][1]["messages"] if message["role"] == "tool")
+                    page = json.loads(raw)
+                    self.assertEqual(page["content"], content)
+                    self.assertEqual(page["next_offset"], len(content.encode()))
+
+    def test_literal_backslash_sequences_in_source_are_preserved(self):
+        content = r'Literal source: \u000a and \n and "quotes".'
+        for extra_args in ({}, {"offset": 0, "limit": 12000}):
+            with self.subTest(args=extra_args), tempfile.TemporaryDirectory() as folder:
+                Path(folder, "source.txt").write_text(content)
+                with MockAPI([reply("openrouter", calls=[("read_file", {"path": "source.txt", **extra_args})]),
+                              reply("openrouter", "Done.")]) as api:
+                    result = self.run_agent(api, directory=folder)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn(content, result.stdout)
+
+    def test_tui_large_file_read_renders_real_line_breaks(self):
+        content = 'First readable line\nSecond readable line\n' + 'More documentation.\n' * 2000
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "large.md").write_text(content)
+            with MockAPI([reply("openrouter", calls=[("read_file", {"path": "large.md", "offset": 0, "limit": 90})]),
+                          reply("openrouter", "Read finished.")]) as api:
+                terminal = Terminal(["--cwd", folder], environment(api.url))
+                try:
+                    terminal.wait_for("Your terminal.")
+                    terminal.send("Read the file\r")
+                    terminal.wait_for("Read finished.")
+                    self.assertIn(b"First readable line", terminal.output)
+                    self.assertIn(b"Second readable line", terminal.output)
+                    self.assertNotIn(b"\\u000a", terminal.output)
+                finally:
+                    terminal.close()
 
     def test_large_edit_crosses_chunk_boundary_and_preserves_mode(self):
         original = b"a" * 32760 + "unique żółw marker".encode() + b"b" * (2 * 1024 * 1024)

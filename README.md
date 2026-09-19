@@ -33,10 +33,12 @@ zero-coding/
 ├── src/streaming.0     # SSE parsing and incremental message assembly
 ├── src/context.0       # History, tool results and automatic compaction
 ├── src/memory.0         # Persistent project facts, approvals and atomic storage
+├── src/logs.0           # Automatic local session journals and key redaction
 ├── src/mcp.0           # Persistent MCP stdio connections
 ├── src/skills.0        # Skill discovery and loading
 ├── src/ui.0            # Terminal rendering and keyboard input
 ├── native/http_stream.c # HTTP transport worker
+├── native/session_log.c # Bounded native append writer
 ├── tests/              # Black-box tests of the compiled binary
 ├── zero.toml           # Package manifest
 ├── zero.graph          # Canonical Zero program graph
@@ -216,6 +218,7 @@ The application supports four LLM providers:
 - `--parallel <N>` – Concurrent file workers or model subagents (1–4, default 4)
 - `--cwd <dir>` – Working directory for the agent
 - `--no-memory` – Disable reading and changing saved project memory for this run
+- `--no-session-logs` – Disable automatic session logging for this run
 
 ## Example Usage
 
@@ -345,7 +348,7 @@ without approval. Model-requested changes show a preview and require approval, o
 `--approve` in headless mode. Delegated subagents receive a snapshot of the notes
 but cannot call this tool or change the store.
 
-Full conversations and tool logs are not automatically persisted. Failed,
+Memory contains facts and recaps; full activity is saved separately in session logs. Failed,
 cancelled or empty responses and tasks containing tool errors or denied actions
 do not get a recap. Recaps containing the active API key are also skipped.
 An explicit `memory` deletion or clear suppresses the recap for that task so
@@ -372,6 +375,45 @@ symlinked stores are reported and left untouched. Repair the file before saving
 again. If a process is forcibly killed during the write, a stale
 `.zero-agent/memory.lock` directory may need to be removed after confirming no
 save is active.
+
+## Automatic session logs
+
+Every normal session automatically creates
+`.zero-agent/sessions/session-XXXXXXXX/events.jsonl` under its workspace. Each
+prompt, displayed reply, tool preview/result, approval, and error is appended as
+it happens. Streaming replies are saved incrementally, so received text remains
+available even if the process is killed before the task completes. Parallel
+worker activity is collected in the coordinator's journal.
+
+Use `/logs` to show the current file, or inspect it without an API key:
+
+```sh
+zero-coding --cwd /path/to/project --prompt '/logs'
+```
+
+Each line is a JSON object with a schema `version`, sequence `seq`, Unix-seconds
+`time`, `event`, `title`, and `text`. Large entries share a sequence number and
+use zero-based `part` values with `last: true` on the final part. Streamed text
+uses `assistant_delta` records followed by `stream_end`; normal sessions finish
+with `session_end`. Worker output uses `worker_delta` with a worker title.
+An absent end record can indicate an abrupt termination.
+Writes reach the operating system after each record; this is process-crash persistence, not
+a guarantee against power loss. A forcibly interrupted write may leave a partial
+last line; earlier complete JSON lines remain readable.
+
+`/clear`, context compaction, and memory deletion retain the journal. Restarting
+creates a new file, so simultaneous sessions never share a journal. Logs are not
+loaded into model context and are not automatically pruned. Delete old session
+directories when you no longer need them.
+
+Files use mode `0600` inside private session directories. Configured provider API
+keys and keys entered through `/key` are redacted, including across streaming
+chunks; the key dialog itself is never recorded. Logs can still contain other
+sensitive text from prompts or tool output. Keep `.zero-agent/` out of version
+control. `--no-session-logs` disables logs independently of `--no-memory`; use
+both flags to disable both persistence mechanisms. Demo, snapshot, help, and
+self-test runs do not create logs. If storage fails, a visible warning disables
+logging for that run while the task continues.
 
 ## MCP servers
 

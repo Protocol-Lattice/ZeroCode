@@ -2,6 +2,7 @@
 
 PREFIX ?= $(HOME)/.local
 INSTALL_FLAGS ?=
+ARGS ?=
 
 setup:
 	./scripts/setup-zero.sh
@@ -10,7 +11,7 @@ build:
 	./scripts/build.sh
 
 run: build
-	./dist/zero-coding
+	./dist/zero-coding $(ARGS)
 
 test: build
 	./dist/zero-coding --self-test

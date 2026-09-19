@@ -54,7 +54,7 @@ class MemoryTests(unittest.TestCase):
                 self.assertEqual(json.loads(path.read_text())["recent"], ["Remembered."])
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
                 self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
-                self.assertEqual([item.name for item in path.parent.iterdir()], ["memory.json"])
+                self.assertEqual({item.name for item in path.parent.iterdir()}, {"memory.json", "sessions"})
                 self.assertNotIn("test-key-never-render-me", path.read_text())
                 with MockAPI([reply(provider, calls=[("memory", {"action": "list"})]),
                               reply(provider, "Recalled.")]) as api:
@@ -71,7 +71,7 @@ class MemoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as other:
             result = self.command(folder, "/memory")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertFalse(memory_file(folder).parent.exists())
+            self.assertFalse(memory_file(folder).exists())
             for text in ("/memory set build make build", "/memory set tests make test", "/memory set build make setup build"):
                 result = self.command(folder, text)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -218,7 +218,7 @@ class MemoryTests(unittest.TestCase):
             result = self.command(folder, "/memory clear")
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(path.read_bytes(), before)
-            self.assertEqual({item.name for item in path.parent.iterdir()}, {"memory.json", "memory.lock"})
+            self.assertEqual({item.name for item in path.parent.iterdir()}, {"memory.json", "memory.lock", "sessions"})
             lock.rmdir()
             self.assertEqual(self.command(folder, "/memory clear").returncode, 0)
 

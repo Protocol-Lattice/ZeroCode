@@ -217,7 +217,7 @@ fn appendToolResult(app: mutref<App>, result: Span<u8>) -> Void {
         return
     }
     app.toolCount = app.toolCount + 1
-    logEntry(app, "  TOOL RESULT", result)
+    logToolResult(app, result)
     if app.provider == 2 {
         if app.toolIndex == 0 {
             append(historyData, ",{\"role\":\"user\",\"content\":[")

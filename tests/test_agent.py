@@ -186,7 +186,7 @@ class AgentTests(unittest.TestCase):
         self.assertIn("tests passed", result.stdout)
 
     def test_make_run_in_standard_terminal(self):
-        terminal = Terminal([], environment(keys=False), command=["make", "run"])
+        terminal = Terminal([], environment(keys=False), command=["make", "run", "ARGS=--no-session-logs"])
         try:
             terminal.wait_for("Your terminal.", timeout=20)
             self.assertIn(b"\x1b[48;5;234m", terminal.output)
@@ -425,8 +425,10 @@ class AgentTests(unittest.TestCase):
 
     def test_missing_key_and_invalid_provider(self):
         for args in (("--prompt", "hello"), ("--provider", "invalid", "--prompt", "hello")):
-            result = subprocess.run([str(EXE), *args], env=environment(keys=False), text=True, capture_output=True, timeout=5)
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            with tempfile.TemporaryDirectory(prefix="zero invalid ") as folder:
+                result = subprocess.run([str(EXE), "--cwd", folder, *args], env=environment(keys=False),
+                                        text=True, capture_output=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_tui_model_switch_and_chat_mode(self):
         with MockAPI([reply("openrouter", "Switched successfully.")]) as api:

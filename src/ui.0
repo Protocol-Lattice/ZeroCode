@@ -93,7 +93,7 @@ fn runInteractive(world: World, app: mutref<App>) -> Bool raises {
     return true
 }
 
-fn logEntry(app: mutref<App>, title: Span<u8>, text: Span<u8>) -> Void {
+fn displayEntry(app: mutref<App>, title: Span<u8>, text: Span<u8>) -> Void {
     let transcriptData: MutSpan<u8> = app.transcript
     if bufLen(transcriptData) + std.mem.len(text) + 256 > capacity(transcriptData) {
         clear(transcriptData)
@@ -104,6 +104,47 @@ fn logEntry(app: mutref<App>, title: Span<u8>, text: Span<u8>) -> Void {
     cleanText(transcriptData, text)
     append(transcriptData, "\n\n")
     app.scroll = 0
+}
+
+fn logEntry(app: mutref<App>, title: Span<u8>, text: Span<u8>) -> Void {
+    sessionLogEntry(app, title, text)
+    displayEntry(app, title, text)
+}
+
+// Paged file reads carry JSON metadata for the model. Render their decoded
+// content for people without unescaping arbitrary source text or tool output.
+fn logToolResult(app: mutref<App>, result: Span<u8>) -> Void {
+    sessionLogEntry(app, "  TOOL RESULT", result)
+    if std.mem.eql(bytes(app.toolName), "read_file") && std.json.validateBytes(result) {
+        let fields: Maybe<usize> = std.json.objectFieldCount(result)
+        let offset: Maybe<u32> = std.json.u32(result, "offset")
+        let next: Maybe<u32> = std.json.u32(result, "next_offset")
+        let total: Maybe<u32> = std.json.u32(result, "total_bytes")
+        let truncated: Span<u8> = field(result, "truncated")
+        if fields.has && offset.has && next.has && total.has {
+            let explicitRange: Bool = !std.mem.eql(field(bytes(app.arguments), "offset"), "null") || !std.mem.eql(field(bytes(app.arguments), "limit"), "null")
+            if fields.value == 5 && next.value >= offset.value && total.value >= next.value && (explicitRange || total.value as usize > capacity(app.result)) && (std.mem.eql(truncated, "true") || std.mem.eql(truncated, "false")) {
+                var contentStorage: [12016]u8 = [0_u8; 12016]
+                let content: MutSpan<u8> = buffer(contentStorage)
+                if decode(content, field(result, "content")) && bufLen(content) == (next.value - offset.value) as usize {
+                    var viewStorage: [16400]u8 = [0_u8; 16400]
+                    let view: MutSpan<u8> = buffer(viewStorage)
+                    append(view, "[File bytes ")
+                    number(view, offset.value as usize)
+                    append(view, "–")
+                    number(view, next.value as usize)
+                    append(view, " of ")
+                    number(view, total.value as usize)
+                    if std.mem.eql(truncated, "true") { append(view, "; more available") }
+                    append(view, "]\n\n")
+                    append(view, bytes(content))
+                    displayEntry(app, "  TOOL RESULT", bytes(view))
+                    return
+                }
+            }
+        }
+    }
+    displayEntry(app, "  TOOL RESULT", result)
 }
 
 fn paint(app: mutref<App>, row: usize, col: usize, color: String, text: Span<u8>) -> Void {
@@ -245,6 +286,7 @@ fn handleKey(app: mutref<App>, key: u32) -> Void {
         }
         if key == std.term.keyCtrlL() {
             if app.phase == 0 {
+                sessionLogText(app, "reset", "CLEAR", "Conversation cleared; session log retained.", false)
                 clear(historyData)
                 clear(transcriptData)
                 eraseInput(app)
@@ -571,7 +613,7 @@ fn render(world: World, app: mutref<App>) -> Void raises {
         paint(app, 10_usize, 7_usize, "\x1b[38;5;250m", "/key          Enter a key without saving it")
         paint(app, 11_usize, 7_usize, "\x1b[38;5;250m", "/tools on|off Enable tools or use a chat-only model")
         paint(app, 12_usize, 7_usize, "\x1b[38;5;250m", "/clear        Start a fresh conversation  ·  Ctrl-L")
-        paint(app, 13_usize, 7_usize, "\x1b[38;5;250m", "/status       Show connection and workspace details")
+        paint(app, 13_usize, 7_usize, "\x1b[38;5;250m", "/status /logs  Connection details / session log path")
         paint(app, 14_usize, 7_usize, "\x1b[38;5;250m", "/quit         Exit  ·  Ctrl-D")
         paint(app, 15_usize, 7_usize, "\x1b[38;5;250m", "/mcp          Connect and manage MCP tool servers")
         paint(app, 16_usize, 7_usize, "\x1b[38;5;250m", "/skills       List skills  ·  /skill NAME selects one")

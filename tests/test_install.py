@@ -178,7 +178,7 @@ exit 1
         result = self.install("--ref", "v0.1.0", binary=None,
                               input=(ROOT / "install.sh").read_text())
         self.assert_ok(result)
-        self.assertIn("https://codeload.github.com/Protocol-Lattice/zero-coding-tui/tar.gz/v0.1.0",
+        self.assertIn("https://codeload.github.com/Protocol-Lattice/zero-coding/tar.gz/v0.1.0",
                       download_log.read_text())
         self.assertTrue(setup_log.exists())
         self.assert_ok(self.run_installed("--version"))
