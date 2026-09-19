@@ -22,7 +22,7 @@ A terminal user interface (TUI) framework built with **Zero** — a custom progr
 ## Project Structure
 
 ```
-zero-coding-tui/
+zero-coding/
 ├── src/main.0          # Main Zero source (TUI framework)
 ├── tests/test_agent.py # Unit tests for the Zero binary
 ├── zero.c              # Compiled entry point (generated)
@@ -47,7 +47,7 @@ make install
 Or download and run the installer without cloning the repository:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Protocol-Lattice/zero-coding-tui/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Protocol-Lattice/zero-coding/main/install.sh | sh
 ```
 
 The installer builds for your machine, installs into `~/.local`, and adds
