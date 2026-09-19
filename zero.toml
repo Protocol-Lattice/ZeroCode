@@ -1,0 +1,23 @@
+[package]
+name = "zero-coding-tui"
+version = "0.1.0"
+license = "MIT"
+
+[targets.cli]
+kind = "exe"
+main = "src/main.0"
+defaultTarget = "linux-musl-x64"
+devTarget = "host"
+releaseProfile = "release-small"
+
+[deps]
+
+[c.libs.process]
+headers = ["native/exit.h"]
+link = ["c"]
+
+[profiles.dev]
+inherits = "dev"
+
+[profiles.release-small]
+inherits = "release-small"
