@@ -1,4 +1,4 @@
-# zero-coding
+# ZeroCode
 
 A terminal coding assistant built with **Zero**, with native file tools, streaming model responses, MCP servers, and project skills.
 
