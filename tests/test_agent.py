@@ -22,6 +22,12 @@ EXE = Path(os.environ.get("ZERO_TEST_EXE", ROOT / "dist" / "zero-coding"))
 KEYS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
 
 
+class StreamReply:
+    """Chunks may be a generator gated by a test to prove incremental output."""
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+
 def reply(provider, text="Done.", calls=None):
     if provider == "claude":
         content = [{"type": "text", "text": text}] if text else []
@@ -59,6 +65,15 @@ class MockAPI:
                     status = 200
                     if isinstance(payload, tuple):
                         status, payload = payload
+                    if isinstance(payload, StreamReply):
+                        self.send_response(status)
+                        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        for chunk in payload.chunks:
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                        return
                     data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
                     self.send_response(status)
                     self.send_header("Content-Type", "application/json")
@@ -222,7 +237,7 @@ class AgentTests(unittest.TestCase):
                 result = self.run_agent(api, directory=folder, extra=("--approve",))
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(Path(folder, "README.md").read_text(), "# Project\n")
-                self.assertIn("larger", json.dumps(api.requests[2][1]))
+                self.assertIn("next_offset", json.dumps(api.requests[2][1]))
 
     def test_file_read_boundaries_and_failed_large_overwrite(self):
         for size in (16368, 16384, 16385, 3500000):
@@ -238,7 +253,10 @@ class AgentTests(unittest.TestCase):
                     if size <= 16384:
                         self.assertEqual(tool_message, contents.decode())
                     else:
-                        self.assertIn("larger", tool_message)
+                        page = json.loads(tool_message)
+                        self.assertTrue(page["truncated"])
+                        self.assertEqual(page["total_bytes"], size)
+                        self.assertEqual(page["content"], "a" * page["next_offset"])
                 if size > 16384:
                     with MockAPI([
                         reply("openrouter", calls=[("write_file", {"path": "file.txt", "content": "replacement"})]),

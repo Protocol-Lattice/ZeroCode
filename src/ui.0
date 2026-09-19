@@ -1,0 +1,626 @@
+fn position(output: MutSpan<u8>, row: usize, col: usize) -> Void {
+    var storage: [32]u8 = [0_u8; 32]
+    let sequence: Maybe<Span<u8>> = std.term.cursorTo(storage, row, col)
+    if sequence.has {
+        append(output, sequence.value)
+    }
+}
+
+fn glyphWidth(cp: u32) -> usize {
+    if cp >= 768 && cp <= 879 {
+        return 0
+    }
+    if cp >= 65024 && cp <= 65039 {
+        return 0
+    }
+    if cp == 8205 {
+        return 0
+    }
+    if cp >= 4352 && cp <= 4447 {
+        return 2
+    }
+    if cp >= 11904 && cp <= 42191 {
+        return 2
+    }
+    if cp >= 44032 && cp <= 55203 {
+        return 2
+    }
+    if cp >= 65281 && cp <= 65376 {
+        return 2
+    }
+    if cp >= 127744 && cp <= 129791 {
+        return 2
+    }
+    return 1
+}
+
+fn lineEnd(text: Span<u8>, start: usize, columns: usize) -> usize {
+    var index: usize = start
+    var cells: usize = 0
+    while index < std.mem.len(text) {
+        if text[index] == 10 {
+            return index
+        }
+        let width: Maybe<usize> = std.unicode.widthAt(text, index)
+        let cp: Maybe<u32> = std.unicode.decodeAt(text, index)
+        if width.has && cp.has {
+            let size: usize = glyphWidth(cp.value)
+            if cells + size > columns {
+                return index
+            }
+            cells = cells + size
+            index = index + width.value
+        } else {
+            index = index + 1
+            cells = cells + 1
+        }
+    }
+    return index
+}
+
+fn followingLine(text: Span<u8>, end: usize) -> usize {
+    if end < std.mem.len(text) {
+        if text[end] == 10 {
+            return end + 1
+        }
+    }
+    return end
+}
+
+fn openDialog(app: mutref<App>, view: usize) -> Void {
+    if app.phase != 0 {
+        logEntry(app, "  !", "Press Esc to stop the current task first.")
+        return
+    }
+    eraseInput(app)
+    app.view = view
+    if view == 1 {
+        app.selection = app.provider
+    }
+}
+
+fn demoSession(app: mutref<App>) -> Void {
+    logEntry(app, "  DEMO · SIMULATED SESSION", "No API calls or workspace changes are made in demo mode.")
+    logEntry(app, "  YOU", "Add a health endpoint and verify it works.")
+    logEntry(app, "  ZERO", "I'll inspect the routes, add GET /health, and run the tests.")
+    logEntry(app, "  TOOL", "read_file  src/routes.0")
+    logEntry(app, "  + PROPOSED CHANGE", "+ GET /health  →  { \"status\": \"ok\" }\n+ health endpoint returns 200")
+    logEntry(app, "  ZERO", "The health endpoint is ready. Both checks pass.\n\nThis is a preview of the agent workflow. Start without --demo to build with your own provider.")
+}
+
+fn runInteractive(world: World, app: mutref<App>) -> Bool raises {
+    check eventLoop(world, app)
+    return true
+}
+
+fn logEntry(app: mutref<App>, title: Span<u8>, text: Span<u8>) -> Void {
+    let transcriptData: MutSpan<u8> = app.transcript
+    if bufLen(transcriptData) + std.mem.len(text) + 256 > capacity(transcriptData) {
+        clear(transcriptData)
+        append(transcriptData, "  Earlier display history cleared. Conversation context is retained.\n\n")
+    }
+    append(transcriptData, title)
+    put(transcriptData, 10_u8)
+    cleanText(transcriptData, text)
+    append(transcriptData, "\n\n")
+    app.scroll = 0
+}
+
+fn paint(app: mutref<App>, row: usize, col: usize, color: String, text: Span<u8>) -> Void {
+    let frameData: MutSpan<u8> = app.frame
+    position(frameData, row, col)
+    append(frameData, color)
+    append(frameData, text)
+}
+
+fn eraseInput(app: mutref<App>) -> Void {
+    let inputData: MutSpan<u8> = app.input
+    let erased: usize = std.mem.fill(inputData, 0_u8)
+    clear(inputData)
+    app.selection = 0
+}
+
+fn forgetKey(app: mutref<App>) -> Void {
+    let keyData: MutSpan<u8> = app.key
+    let erased: usize = std.mem.fill(keyData, 0_u8)
+}
+
+fn insertInput(app: mutref<App>, text: Span<u8>) -> Void {
+    let inputData: MutSpan<u8> = app.input
+    if app.selection > bufLen(inputData) {
+        app.selection = bufLen(inputData)
+    }
+    let count: usize = std.mem.len(text)
+    if bufLen(inputData) + count > capacity(inputData) {
+        return
+    }
+    var index: usize = bufLen(inputData)
+    while index > app.selection {
+        inputData[index + count - 1] = inputData[index - 1]
+        index = index - 1
+    }
+    index = 0
+    while index < count {
+        inputData[app.selection + index] = text[index]
+        index = index + 1
+    }
+    setLen(inputData, bufLen(inputData) + count)
+    app.selection = app.selection + count
+}
+
+fn inputLeft(app: ref<App>) -> usize {
+    let inputData: MutSpan<u8> = app.input
+    if app.selection == 0 {
+        return 0
+    }
+    var index: usize = app.selection - 1
+    while index > 0 && inputData[index] >= 128 && inputData[index] < 192 {
+        index = index - 1
+    }
+    return index
+}
+
+fn handleKey(app: mutref<App>, key: u32) -> Void {
+    let historyData: MutSpan<u8> = app.history
+    let transcriptData: MutSpan<u8> = app.transcript
+    let inputData: MutSpan<u8> = app.input
+    let keyData: MutSpan<u8> = app.key
+    if key == std.term.keyPasteStart() {
+        app.paste = true
+        return
+    }
+    if key == std.term.keyPasteEnd() {
+        app.paste = false
+        return
+    }
+    if app.paste {
+        if key == std.term.keyEnter() {
+            insertInput(app, "\n")
+            return
+        }
+        if key < 32 || key > 1114111 {
+            return
+        }
+    } else {
+        if key == std.term.keyCtrlC() {
+            if app.phase != 0 {
+                failTurn(app, "Cancelled. Completed actions are retained in the workspace.")
+            } else {
+                app.alive = false
+            }
+            return
+        }
+        if key == std.term.keyCtrlD() {
+            stopChild(app)
+            app.alive = false
+            return
+        }
+        if key == std.term.keyEscape() {
+            if app.phase != 0 {
+                failTurn(app, "Cancelled. Completed actions are retained in the workspace.")
+            } else {
+                app.view = 0
+                eraseInput(app)
+            }
+            return
+        }
+        if key == std.term.keyPageUp() {
+            app.scroll = app.scroll + 10
+            return
+        }
+        if key == std.term.keyPageDown() {
+            if app.scroll >= 10 {
+                app.scroll = app.scroll - 10
+            } else {
+                app.scroll = 0
+            }
+            return
+        }
+        if app.phase == 4 {
+            if key == 121 || key == 89 {
+                approveTool(app)
+            }
+            if key == 110 || key == 78 {
+                toolResult(app, "Error: the user denied this action. Do not retry it without new instructions.")
+            }
+            return
+        }
+        if key == std.term.keyCtrlP() {
+            openDialog(app, 1_usize)
+            return
+        }
+        if key == std.term.keyCtrlL() {
+            if app.phase == 0 {
+                clear(historyData)
+                clear(transcriptData)
+                eraseInput(app)
+                app.view = 0
+            }
+            return
+        }
+        if app.view == 1 {
+            if key == std.term.keyArrowDown() || key == 106 {
+                app.selection = (app.selection + 1) % 4
+            }
+            if key == std.term.keyArrowUp() || key == 107 {
+                app.selection = (app.selection + 3) % 4
+            }
+            if key == std.term.keyEnter() {
+                configureProvider(app, app.selection)
+                app.view = 0
+                eraseInput(app)
+                logEntry(app, "  PROVIDER", providerName(app.provider))
+                if bufLen(keyData) == 0 {
+                    app.view = 3
+                }
+            }
+            return
+        }
+        if app.view == 5 {
+            if key == std.term.keyEnter() {
+                app.view = 0
+            }
+            return
+        }
+        if key == std.term.keyEnter() {
+            submit(app)
+            return
+        }
+        if key == std.term.keyCtrlU() {
+            eraseInput(app)
+            return
+        }
+        if key == std.term.keyCtrlA() || key == std.term.keyHome() {
+            app.selection = 0
+            return
+        }
+        if key == std.term.keyCtrlE() || key == std.term.keyEnd() {
+            app.selection = bufLen(inputData)
+            return
+        }
+        if key == std.term.keyArrowLeft() {
+            app.selection = inputLeft(app)
+            return
+        }
+        if key == std.term.keyArrowRight() {
+            if app.selection < bufLen(inputData) {
+                let width: Maybe<usize> = std.unicode.widthAt(bytes(inputData), app.selection)
+                if width.has {
+                    app.selection = app.selection + width.value
+                }
+            }
+            return
+        }
+        if key == std.term.keyBackspace() {
+            if app.selection == 0 {
+                return
+            }
+            let left: usize = inputLeft(app)
+            var i: usize = app.selection
+            while i < bufLen(inputData) {
+                inputData[i - (app.selection - left)] = inputData[i]
+                i = i + 1
+            }
+            setLen(inputData, bufLen(inputData) - (app.selection - left))
+            app.selection = left
+            return
+        }
+    }
+    if key >= 32 && key <= 1114111 && key != 127 {
+        var storage: [4]u8 = [0_u8; 4]
+        let encoded: Maybe<Span<u8>> = std.unicode.encode(storage, key)
+        if encoded.has {
+            insertInput(app, encoded.value)
+        }
+    }
+}
+
+fn readKeyboard(app: mutref<App>) -> Void {
+    let keyboardData: MutSpan<u8> = app.keyboard
+    var chunk: [4096]u8 = [0_u8; 4096]
+    let count: Maybe<usize> = std.term.readInput(chunk)
+    if count.has {
+        append(keyboardData, std.mem.prefix(chunk, count.value))
+    }
+    if !bufOk(keyboardData) {
+        clear(keyboardData)
+        return
+    }
+    var offset: usize = 0
+    while offset < bufLen(keyboardData) {
+        let rest: Span<u8> = std.mem.dropPrefix(bytes(keyboardData), offset)
+        let size: usize = std.term.keyByteLen(rest)
+        if size == 0 {
+            break
+        }
+        let key: u32 = std.term.keyCode(rest)
+        handleKey(app, key)
+        offset = offset + size
+    }
+    if offset > 0 {
+        var i: usize = offset
+        while i < bufLen(keyboardData) {
+            keyboardData[i - offset] = keyboardData[i]
+            i = i + 1
+        }
+        setLen(keyboardData, bufLen(keyboardData) - offset)
+    }
+    if bufLen(keyboardData) > 128 {
+        clear(keyboardData)
+    }
+}
+
+fn renderWelcome(app: mutref<App>, rows: usize, columns: usize) -> Void {
+    var left: usize = 7
+    if columns > 100 {
+        left = (columns - 72) / 2
+    }
+    paint(app, 6_usize, left, "\x1b[1;38;5;183m", "  ███████╗███████╗██████╗  ██████╗ ")
+    paint(app, 7_usize, left, "\x1b[1;38;5;183m", "  ╚══███╔╝██╔════╝██╔══██╗██╔═══██╗")
+    paint(app, 8_usize, left, "\x1b[1;38;5;147m", "    ███╔╝ █████╗  ██████╔╝██║   ██║")
+    paint(app, 9_usize, left, "\x1b[1;38;5;147m", "   ███╔╝  ██╔══╝  ██╔══██╗██║   ██║")
+    paint(app, 10_usize, left, "\x1b[1;38;5;111m", "  ███████╗███████╗██║  ██║╚██████╔╝")
+    paint(app, 11_usize, left, "\x1b[38;5;111m", "  ╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ")
+    paint(app, 13_usize, left + 2, "\x1b[22;38;5;255m", "Your terminal. Your model. Your code.")
+    paint(app, 15_usize, left + 2, "\x1b[38;5;245m", "Describe an outcome. Zero reads, edits, and tests.")
+    if rows >= 30 {
+        paint(app, 18_usize, left + 2, "\x1b[38;5;183m", "01  CHOOSE")
+        paint(app, 18_usize, left + 17, "\x1b[38;5;250m", "/provider  OpenRouter, OpenAI, Claude, Gemini")
+        paint(app, 20_usize, left + 2, "\x1b[38;5;147m", "02  CONNECT")
+        paint(app, 20_usize, left + 17, "\x1b[38;5;250m", "/key       Use your own API key")
+        paint(app, 22_usize, left + 2, "\x1b[38;5;111m", "03  BUILD")
+        paint(app, 22_usize, left + 17, "\x1b[38;5;250m", "Ask anything. Review edits before they run.")
+    }
+}
+
+fn renderPicker(app: mutref<App>, rows: usize, columns: usize) -> Void {
+    paint(app, 5_usize, 7_usize, "\x1b[1;38;5;255m", "Choose your provider")
+    paint(app, 6_usize, 7_usize, "\x1b[22;38;5;245m", "Bring your own key. Change providers whenever you like.")
+    var index: usize = 0
+    while index < 4 {
+        var color: String = "\x1b[38;5;250m"
+        if index == app.selection {
+            color = "\x1b[1;38;5;183m"
+        }
+        var row: usize = 10 + index * 3
+        if rows < 30 {
+            row = 8 + index * 2
+        }
+        if index == app.selection {
+            paint(app, row, 7_usize, color, "› ")
+        }
+        paint(app, row, 10_usize, color, providerName(index))
+        paint(app, row + 1, 10_usize, "\x1b[22;38;5;244m", defaultModel(index))
+        if std.env.has(keyVariable(index)) {
+            paint(app, row, columns - 20, "\x1b[38;5;114m", "key in environment")
+        }
+        index = index + 1
+    }
+    paint(app, rows - 8, 7_usize, "\x1b[38;5;245m", "↑ ↓ select     enter connect     esc back")
+}
+
+fn rule(app: mutref<App>, row: usize, width: usize) -> Void {
+    let frameData: MutSpan<u8> = app.frame
+    position(frameData, row, 3_usize)
+    append(frameData, "\x1b[38;5;239m")
+    var i: usize = 0
+    while i < width - 4 {
+        append(frameData, "─")
+        i = i + 1
+    }
+}
+
+fn renderTranscript(app: mutref<App>, rows: usize, columns: usize) -> Void {
+    let transcriptData: MutSpan<u8> = app.transcript
+    let frameData: MutSpan<u8> = app.frame
+    let text: Span<u8> = bytes(transcriptData)
+    let height: usize = rows - 12
+    let width: usize = columns - 8
+    var count: usize = 0
+    var index: usize = 0
+    while index < std.mem.len(text) {
+        let end: usize = lineEnd(text, index, width)
+        index = followingLine(text, end)
+        count = count + 1
+    }
+    var skip: usize = 0
+    if count > height {
+        if app.scroll > count - height {
+            app.scroll = count - height
+        }
+        skip = count - height - app.scroll
+    } else {
+        app.scroll = 0
+    }
+    index = 0
+    var line: usize = 0
+    var row: usize = 5
+    while index < std.mem.len(text) && row < rows - 7 {
+        let end: usize = lineEnd(text, index, width)
+        if line >= skip {
+            let part: Span<u8> = slice(text, index, end)
+            var color: String = "\x1b[38;5;252m"
+            if std.str.startsWith(part, "  YOU") {
+                color = "\x1b[1;38;5;117m"
+            }
+            if std.str.startsWith(part, "  ZERO") {
+                color = "\x1b[1;38;5;183m"
+            }
+            if std.str.startsWith(part, "  TOOL") {
+                color = "\x1b[38;5;109m"
+            }
+            if std.str.startsWith(part, "  !") || std.str.startsWith(part, "  REVIEW") {
+                color = "\x1b[38;5;222m"
+            }
+            if std.str.startsWith(part, "  +") {
+                color = "\x1b[38;5;114m"
+            }
+            if std.str.startsWith(part, "  -") {
+                color = "\x1b[38;5;174m"
+            }
+            paint(app, row, 4_usize, color, part)
+            append(frameData, "\x1b[22m")
+            row = row + 1
+        }
+        index = followingLine(text, end)
+        line = line + 1
+    }
+}
+
+fn renderInput(app: mutref<App>, row: usize, columns: usize) -> Void {
+    let inputData: MutSpan<u8> = app.input
+    let frameData: MutSpan<u8> = app.frame
+    paint(app, row, 4_usize, "\x1b[1;38;5;183m", "› ")
+    append(frameData, "\x1b[22;38;5;255m")
+    let text: Span<u8> = bytes(inputData)
+    if bufLen(inputData) == 0 {
+        append(frameData, "\x1b[38;5;242m")
+        if app.view == 3 {
+            append(frameData, "Paste your API key…")
+        } else if app.view == 2 {
+            append(frameData, "Type an exact model ID…")
+        } else {
+            append(frameData, "What would you like to build?  /help")
+        }
+    } else {
+        var start: usize = 0
+        var cursor: usize = app.selection
+        if cursor > bufLen(inputData) {
+            cursor = bufLen(inputData)
+        }
+        if cursor > columns - 12 {
+            start = cursor - (columns - 12)
+        }
+        while start > 0 && start < bufLen(inputData) && text[start] >= 128 && text[start] < 192 {
+            start = start - 1
+        }
+        let end: usize = lineEnd(text, start, columns - 10)
+        var index: usize = start
+        while index < end {
+            if app.view == 3 {
+                put(frameData, 42_u8)
+                index = index + 1
+            } else {
+                if text[index] == 10 {
+                    append(frameData, "↵")
+                } else {
+                    put(frameData, text[index])
+                }
+                index = index + 1
+            }
+        }
+    }
+}
+
+fn render(world: World, app: mutref<App>) -> Void raises {
+    let transcriptData: MutSpan<u8> = app.transcript
+    let modelData: MutSpan<u8> = app.model
+    let keyData: MutSpan<u8> = app.key
+    let frameData: MutSpan<u8> = app.frame
+    var columns: usize = std.term.widthOr(100_usize)
+    var rows: usize = std.term.heightOr(32_usize)
+    if columns > 220 {
+        columns = 220
+    }
+    if rows > 70 {
+        rows = 70
+    }
+    clear(frameData)
+    append(frameData, "\x1b[0m\x1b[48;5;234m\x1b[38;5;252m\x1b[2J\x1b[H")
+    if columns < 72 || rows < 24 {
+        append(frameData, "\n  ZERO · Expand your terminal to at least 72 × 24.\n\n  Ctrl-C to exit.")
+        check world.out.write(bytes(frameData))
+        return
+    }
+    paint(app, 2_usize, 4_usize, "\x1b[1;38;5;183m", "◇ ZERO")
+    paint(app, 2_usize, 13_usize, "\x1b[22;38;5;244m", "/ coding agent")
+    paint(app, 2_usize, columns - 21, "\x1b[38;5;244m", "NATIVE ZERO   v0.1")
+    rule(app, 3_usize, columns)
+    if app.view == 1 {
+        renderPicker(app, rows, columns)
+    } else if app.view == 2 || app.view == 3 {
+        if app.view == 2 {
+            paint(app, 6_usize, 7_usize, "\x1b[1;38;5;255m", "Use the model you want")
+            paint(app, 9_usize, 7_usize, "\x1b[22;38;5;245m", "Enter any model ID. Use /tools off for chat-only models.")
+            paint(app, 12_usize, 7_usize, "\x1b[38;5;183m", defaultModel(app.provider))
+        } else {
+            paint(app, 6_usize, 7_usize, "\x1b[1;38;5;255m", "Connect your provider")
+            paint(app, 9_usize, 7_usize, "\x1b[22;38;5;245m", "Your key stays in memory and is never saved to disk.")
+            paint(app, 12_usize, 7_usize, "\x1b[38;5;183m", keyVariable(app.provider))
+            paint(app, 14_usize, 7_usize, "\x1b[38;5;245m", "Export this variable, or paste the key below.")
+        }
+        paint(app, rows - 8, 7_usize, "\x1b[38;5;245m", "enter save     esc cancel")
+    } else if app.view == 5 {
+        paint(app, 5_usize, 7_usize, "\x1b[1;38;5;255m", "A little help")
+        paint(app, 8_usize, 7_usize, "\x1b[22;38;5;183m", "/provider     Choose a provider  ·  Ctrl-P")
+        paint(app, 9_usize, 7_usize, "\x1b[38;5;250m", "/model ID     Choose any compatible model")
+        paint(app, 10_usize, 7_usize, "\x1b[38;5;250m", "/key          Enter a key without saving it")
+        paint(app, 11_usize, 7_usize, "\x1b[38;5;250m", "/tools on|off Enable tools or use a chat-only model")
+        paint(app, 12_usize, 7_usize, "\x1b[38;5;250m", "/clear        Start a fresh conversation  ·  Ctrl-L")
+        paint(app, 13_usize, 7_usize, "\x1b[38;5;250m", "/status       Show connection and workspace details")
+        paint(app, 14_usize, 7_usize, "\x1b[38;5;250m", "/quit         Exit  ·  Ctrl-D")
+        paint(app, 15_usize, 7_usize, "\x1b[38;5;250m", "/mcp          Connect and manage MCP tool servers")
+        paint(app, 16_usize, 7_usize, "\x1b[38;5;250m", "/skills       List skills  ·  /skill NAME selects one")
+        paint(app, 17_usize, 7_usize, "\x1b[38;5;245m", "Esc cancels work. PgUp/PgDn scroll. Paste is supported.")
+    } else if bufLen(transcriptData) == 0 {
+        renderWelcome(app, rows, columns)
+    } else {
+        renderTranscript(app, rows, columns)
+    }
+    rule(app, rows - 6, columns)
+    if app.phase == 4 {
+        paint(app, rows - 5, 4_usize, "\x1b[1;38;5;222m", "Approve this action?")
+        paint(app, rows - 3, 4_usize, "\x1b[22;38;5;252m", "[y] approve once   [n] deny   [PgUp/PgDn] review")
+    } else {
+        renderInput(app, rows - 4, columns)
+        var status: String = "ready"
+        var color: String = "\x1b[38;5;114m"
+        if bufLen(keyData) == 0 {
+            status = "key required"
+            color = "\x1b[38;5;222m"
+        }
+        if app.phase == 1 {
+            status = "waiting for model"
+            color = "\x1b[38;5;183m"
+        }
+        if app.phase == 2 {
+            status = "using tools"
+            color = "\x1b[38;5;183m"
+        }
+        if app.phase == 3 {
+            status = "running command · esc to stop"
+            color = "\x1b[38;5;183m"
+        }
+        if app.phase == 5 {
+            status = "MCP request · esc to stop"
+            color = "\x1b[38;5;183m"
+        }
+        if app.demo {
+            status = "demo · simulated session"
+            color = "\x1b[38;5;222m"
+        }
+        paint(app, rows - 2, 4_usize, color, "● ")
+        append(frameData, status)
+        if app.phase == 1 || app.phase == 3 || app.phase == 5 {
+            append(frameData, " · ")
+            number(frameData, std.time.asSecondsFloor(std.time.between(app.started, std.time.monotonic())) as usize)
+            append(frameData, "s")
+        }
+        paint(app, rows - 2, columns - 29, "\x1b[38;5;244m", "enter send  /help  ctrl-p")
+    }
+    rule(app, rows - 1, columns)
+    paint(app, rows, 4_usize, "\x1b[38;5;183m", providerName(app.provider))
+    append(frameData, "\x1b[38;5;244m  /  ")
+    let model: Span<u8> = bytes(modelData)
+    append(frameData, slice(model, 0_usize, lineEnd(model, 0_usize, columns - 49)))
+    position(frameData, rows, columns - 28)
+    append(frameData, "\x1b[38;5;244m")
+    number(frameData, app.toolCount)
+    append(frameData, " tools · ")
+    number(frameData, app.tokens)
+    append(frameData, " tokens")
+    append(frameData, "\x1b[0m\x1b[?25l")
+    if bufOk(frameData) {
+        check world.out.write(bytes(frameData))
+    }
+}

@@ -1,0 +1,639 @@
+fn safeRelative(path: Span<u8>) -> Bool {
+    if std.mem.len(path) == 0 || std.mem.len(path) > 2000 {
+        return false
+    }
+    if path[0] == 47 || path[0] == 45 || path[0] == 126 {
+        return false
+    }
+    if !headerSafe(path) || std.str.contains(path, "\\") {
+        return false
+    }
+    var start: usize = 0
+    var i: usize = 0
+    while i <= std.mem.len(path) {
+        if i == std.mem.len(path) || path[i] == 47 {
+            let part: Span<u8> = slice(path, start, i)
+            if std.mem.eql(part, "..") || std.mem.eql(part, ".") || std.mem.len(part) == 0 {
+                return false
+            }
+            if std.mem.eql(part, ".git") || std.mem.eql(part, ".ssh") || std.mem.eql(part, ".zero-agent") {
+                return false
+            }
+            if std.mem.eql(part, ".env") || std.str.startsWith(part, ".env.") || std.str.endsWith(part, ".pem") || std.str.endsWith(part, ".key") {
+                return false
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn createParent(path: Span<u8>) -> Bool {
+    var argsStorage: [9216]u8 = [0_u8; 9216]
+    let args: MutSpan<u8> = buffer(argsStorage)
+    append(args, "-c\nparent=${1%/*}; mkdir -p -- \"$parent\" && printf ok\nzero-create-parent\n")
+    append(args, path)
+    var answer: [16]u8 = [0_u8; 16]
+    let created: Maybe<usize> = std.proc.captureArgs("/bin/sh", bytes(args), answer)
+    if !created.has {
+        return false
+    }
+    return created.value == 2 && std.mem.eql(std.mem.prefix(answer, 2_usize), "ok")
+}
+
+fn preservePermissions(source: Span<u8>, temporary: Span<u8>) -> Bool {
+    var argsStorage: [18432]u8 = [0_u8; 18432]
+    let args: MutSpan<u8> = buffer(argsStorage)
+    append(args, "-c\nmode=$(stat -f %Lp \"$1\" 2>/dev/null) || mode=$(stat -c %a \"$1\") || exit 1; case $mode in ''|*[!0-7]*) exit 1;; esac; chmod \"$mode\" \"$2\" && printf ok\nzero-preserve-mode\n")
+    append(args, source)
+    put(args, 10_u8)
+    append(args, temporary)
+    var answer: [16]u8 = [0_u8; 16]
+    let changed: Maybe<usize> = std.proc.captureArgs("/bin/sh", bytes(args), answer)
+    if !changed.has {
+        return false
+    }
+    return changed.value == 2 && std.mem.eql(std.mem.prefix(answer, 2_usize), "ok")
+}
+
+fn gitIgnoreSetup() -> String {
+    return "command -v git >/dev/null 2>&1 || { printf 'Error: Git is required to respect .gitignore.\\n' >&2; exit 1; }; unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX; zero_ignore_tmp=$(mktemp -d \"${TMPDIR:-/tmp}/zero-ignore.XXXXXX\") || exit 1; trap 'rm -rf -- \"$zero_ignore_tmp\"' 0; trap 'exit 1' 1 2 15; if [ \"$(git rev-parse --is-inside-work-tree 2>/dev/null)\" != true ]; then git -c init.templateDir= init --bare --quiet \"$zero_ignore_tmp/repository\" || exit 1; export GIT_DIR=\"$zero_ignore_tmp/repository\" GIT_WORK_TREE=\"$PWD\"; fi; export GIT_INDEX_FILE=\"$zero_ignore_tmp/index\"; "
+}
+
+fn resolveInRoot(root: Span<u8>, relative: Span<u8>, output: MutSpan<u8>) -> Maybe<String> {
+    if !safeRelative(relative) {
+        return null
+    }
+    let joined: Maybe<String> = std.path.join(output, root, relative)
+    if !joined.has {
+        return null
+    }
+    var argumentStorage: [16384]u8 = [0_u8; 16384]
+    var arguments: MutSpan<u8> = buffer(argumentStorage)
+    append(arguments, "-c\ncd -- \"$1\" || exit 1; p=\"$1/$2\"; while [ -n \"$p\" ] && [ \"$p\" != / ]; do [ ! -L \"$p\" ] || exit 1; p=${p%/*}; done; ")
+    append(arguments, gitIgnoreSetup())
+    append(arguments, "git check-ignore --no-index --quiet -- \"$2\"; checked=$?; [ \"$checked\" -eq 1 ] && printf ok\nzero-path-check\n")
+    append(arguments, root)
+    put(arguments, 10_u8)
+    append(arguments, relative)
+    if !bufOk(arguments) {
+        return null
+    }
+    var answer: [16]u8 = [0_u8; 16]
+    let checked: Maybe<usize> = std.proc.captureArgs("/bin/sh", bytes(arguments), answer)
+    if checked.has {
+        if checked.value == 2 && std.mem.eql(std.mem.prefix(answer, 2_usize), "ok") {
+            return joined.value
+        }
+    }
+    return null
+}
+
+fn resolvedPath(app: ref<App>, relative: Span<u8>, output: MutSpan<u8>) -> Maybe<String> {
+    let workspace: MutSpan<u8> = app.workspace
+    return resolveInRoot(bytes(workspace), relative, output)
+}
+
+fn readTool(app: mutref<App>) -> Void {
+    var pathStorage: [2048]u8 = [0_u8; 2048]
+    var absolute: [8192]u8 = [0_u8; 8192]
+    let path: MutSpan<u8> = buffer(pathStorage)
+    let args: Span<u8> = bytes(app.arguments)
+    if !decode(path, field(args, "path")) {
+        toolResult(app, "Error: path must be a string.")
+        return
+    }
+    let fullPath: Maybe<String> = resolvedPath(app, bytes(path), absolute)
+    if !fullPath.has {
+        toolResult(app, "Error: path is outside the workspace, ignored by .gitignore, a secret file, or contains a symlink. Git is required for ignore checks.")
+        return
+    }
+    var offset: usize = 0
+    var limit: usize = 8192
+    let offsetRaw: Span<u8> = field(args, "offset")
+    let limitRaw: Span<u8> = field(args, "limit")
+    if !std.mem.eql(offsetRaw, "null") {
+        let parsed: Maybe<u32> = std.parse.parseU32(offsetRaw)
+        if !parsed.has {
+            toolResult(app, "Error: offset must be a nonnegative byte offset.")
+            return
+        }
+        offset = parsed.value as usize
+    }
+    if !std.mem.eql(limitRaw, "null") {
+        let parsed: Maybe<u32> = std.parse.parseU32(limitRaw)
+        if !parsed.has {
+            toolResult(app, "Error: limit must be an integer from 4 to 12000 bytes.")
+            return
+        }
+        limit = parsed.value as usize
+        if limit < 4 || limit > 12000 {
+            toolResult(app, "Error: limit must be an integer from 4 to 12000 bytes.")
+            return
+        }
+    }
+    if std.mem.eql(offsetRaw, "null") && std.mem.eql(limitRaw, "null") && readBounded(app.result, fullPath.value) {
+        if !std.text.utf8Valid(bytes(app.result)) || containsNul(bytes(app.result)) {
+            toolResult(app, "Error: file is binary or invalid UTF-8.")
+            return
+        }
+        toolResult(app, bytes(app.result))
+        return
+    }
+    var data: [12004]u8 = [0_u8; 12004]
+    let total: Maybe<usize> = std.fs.readBytesAt(fullPath.value, offset, data[..limit])
+    if !total.has {
+        toolResult(app, "Error: file is missing or unreadable.")
+        return
+    }
+    if offset > total.value {
+        toolResult(app, "Error: offset is past the end of the file.")
+        return
+    }
+    var count: usize = total.value - offset
+    if count > limit {
+        count = limit
+    }
+    var start: usize = 0
+    while start < count && start < 3 && data[start] >= 128 && data[start] < 192 {
+        start = start + 1
+    }
+    var end: usize = count
+    if offset + count < total.value {
+        while end > start && !std.text.utf8Valid(slice(data, start, end)) && count - end < 3 {
+            end = end - 1
+        }
+    }
+    let content: Span<u8> = slice(data, start, end)
+    if !std.text.utf8Valid(content) || containsNul(content) || count > 0 && end == start {
+        toolResult(app, "Error: range contains binary data or invalid UTF-8.")
+        return
+    }
+    clear(app.result)
+    append(app.result, "{\"offset\":")
+    number(app.result, offset + start)
+    append(app.result, ",\"next_offset\":")
+    number(app.result, offset + end)
+    append(app.result, ",\"total_bytes\":")
+    number(app.result, total.value)
+    append(app.result, ",\"truncated\":")
+    if offset + end < total.value {
+        append(app.result, "true")
+    } else {
+        append(app.result, "false")
+    }
+    append(app.result, ",\"content\":")
+    quoted(app.result, content)
+    put(app.result, 125_u8)
+    if !bufOk(app.result) {
+        toolResult(app, "Error: escaped range is too large. Retry with a smaller limit.")
+        return
+    }
+    toolResult(app, bytes(app.result))
+}
+
+fn fileByteSize(path: String) -> Maybe<usize> {
+    // readBytesAt returns the total size and is supported by the direct backend.
+    var probe: [1]u8 = [0_u8; 1]
+    return std.fs.readBytesAt(path, 0_usize, probe)
+}
+
+fn fileFingerprint(path: String, output: MutSpan<u8>) -> Bool {
+    var data: [32768]u8 = [0_u8; 32768]
+    var chain: [32832]u8 = [0_u8; 32832]
+    var digest: [64]u8 = [0_u8; 64]
+    let size: Maybe<usize> = fileByteSize(path)
+    if !size.has {
+        return false
+    }
+    if size.value > 67108864 || std.fs.isDir(path) {
+        return false
+    }
+    var offset: usize = 0
+    var prefix: usize = 0
+    while offset < size.value {
+        let total: Maybe<usize> = std.fs.readBytesAt(path, offset, data)
+        if !total.has {
+            return false
+        }
+        if total.value != size.value {
+            return false
+        }
+        var count: usize = size.value - offset
+        if count > std.mem.len(data) {
+            count = std.mem.len(data)
+        }
+        let copied: usize = std.mem.copy(chain[prefix..], std.mem.prefix(data, count))
+        let hashed: Maybe<Span<u8>> = std.crypto.sha256Hex(digest, std.mem.prefix(chain, prefix + count))
+        if !hashed.has {
+            return false
+        }
+        let saved: usize = std.mem.copy(chain, hashed.value)
+        prefix = 64
+        offset = offset + count
+    }
+    clear(output)
+    append(output, std.mem.prefix(chain, prefix))
+    put(output, 58_u8)
+    number(output, size.value)
+    return bufOk(output)
+}
+
+fn fileUtf8(path: String) -> Bool {
+    var data: [32768]u8 = [0_u8; 32768]
+    var offset: usize = 0
+    while true {
+        let total: Maybe<usize> = std.fs.readBytesAt(path, offset, data)
+        if !total.has {
+            return false
+        }
+        if total.value > 67108864 || offset > total.value {
+            return false
+        }
+        var count: usize = total.value - offset
+        if count > std.mem.len(data) {
+            count = std.mem.len(data)
+        }
+        var end: usize = count
+        if offset + count < total.value {
+            while end > 0 && !std.text.utf8Valid(std.mem.prefix(data, end)) && count - end < 3 {
+                end = end - 1
+            }
+        }
+        if !std.text.utf8Valid(std.mem.prefix(data, end)) || containsNul(std.mem.prefix(data, end)) {
+            return false
+        }
+        if offset + end == total.value {
+            return true
+        }
+        if end == 0 {
+            return false
+        }
+        offset = offset + end
+    }
+    return false
+}
+
+fn prepareLargeFile(app: mutref<App>, path: String) -> Bool {
+    var oldStorage: [16384]u8 = [0_u8; 16384]
+    var newStorage: [16384]u8 = [0_u8; 16384]
+    let old: MutSpan<u8> = buffer(oldStorage)
+    let replacement: MutSpan<u8> = buffer(newStorage)
+    if !decode(old, field(bytes(app.arguments), "old_text")) || bufLen(old) == 0 || !decode(replacement, field(bytes(app.arguments), "new_text")) {
+        toolResult(app, "Error: edit text is missing or exceeds 16 KiB.")
+        return false
+    }
+    if !fileUtf8(path) || !fileFingerprint(path, app.result) {
+        toolResult(app, "Error: file is not UTF-8, is unreadable, or exceeds 64 MiB.")
+        return false
+    }
+    let found: Maybe<usize> = findFileText(path, bytes(old))
+    if !found.has {
+        toolResult(app, "Error: old_text must occur exactly once. Read the required range and retry.")
+        return false
+    }
+    app.sent = 2
+    logEntry(app, "  REVIEW FILE CHANGE", path)
+    logEntry(app, "  - REMOVE", bytes(old))
+    logEntry(app, "  + INSERT", bytes(replacement))
+    return true
+}
+
+fn copyFileRange(source: String, destination: String, start: usize, end: usize) -> Bool {
+    var data: [32768]u8 = [0_u8; 32768]
+    var offset: usize = start
+    while offset < end {
+        var count: usize = end - offset
+        if count > std.mem.len(data) {
+            count = std.mem.len(data)
+        }
+        let read: Maybe<usize> = std.fs.readBytesAt(source, offset, data[..count])
+        if !read.has {
+            return false
+        }
+        if read.value < end {
+            return false
+        }
+        let written: Maybe<usize> = std.fs.appendBytes(destination, std.mem.prefix(data, count))
+        if !written.has {
+            return false
+        }
+        if written.value != count {
+            return false
+        }
+        offset = offset + count
+    }
+    return true
+}
+
+fn writeLargeEdit(app: mutref<App>, source: String, temporary: String) -> Bool {
+    var oldStorage: [16384]u8 = [0_u8; 16384]
+    var newStorage: [16384]u8 = [0_u8; 16384]
+    var fingerprintStorage: [128]u8 = [0_u8; 128]
+    let old: MutSpan<u8> = buffer(oldStorage)
+    let replacement: MutSpan<u8> = buffer(newStorage)
+    let fingerprint: MutSpan<u8> = buffer(fingerprintStorage)
+    if !decode(old, field(bytes(app.arguments), "old_text")) || !decode(replacement, field(bytes(app.arguments), "new_text")) {
+        return false
+    }
+    let found: Maybe<usize> = findFileText(source, bytes(old))
+    let size: Maybe<usize> = fileByteSize(source)
+    if !found.has || !size.has {
+        return false
+    }
+    if size.value + bufLen(replacement) > 67108864 + bufLen(old) {
+        return false
+    }
+    if !fileFingerprint(source, fingerprint) || !std.mem.eql(bytes(fingerprint), bytes(app.result)) {
+        return false
+    }
+    if !copyFileRange(source, temporary, 0_usize, found.value) {
+        return false
+    }
+    let written: Maybe<usize> = std.fs.appendBytes(temporary, bytes(replacement))
+    if !written.has {
+        return false
+    }
+    if written.value != bufLen(replacement) {
+        return false
+    }
+    if !copyFileRange(source, temporary, found.value + bufLen(old), size.value) {
+        return false
+    }
+    if !fileFingerprint(source, fingerprint) || !std.mem.eql(bytes(fingerprint), bytes(app.result)) {
+        return false
+    }
+    return preservePermissions(source, temporary)
+}
+
+fn applyLargeFile(app: mutref<App>, path: String) -> Void {
+    var templateStorage: [8192]u8 = [0_u8; 8192]
+    var temporary: [8192]u8 = [0_u8; 8192]
+    let template: MutSpan<u8> = buffer(templateStorage)
+    append(template, path)
+    append(template, ".zero-edit.XXXXXX")
+    let created: Maybe<usize> = std.proc.captureArgs("/usr/bin/mktemp", bytes(template), temporary)
+    if !created.has {
+        toolResult(app, "Error: could not create an adjacent temporary file.")
+        return
+    }
+    let tempPath: Span<u8> = std.str.trimAscii(std.mem.prefix(temporary, created.value))
+    if !writeLargeEdit(app, path, tempPath) {
+        let removed: Bool = std.fs.remove(tempPath)
+        toolResult(app, "Error: file changed since the preview, edit is ambiguous, or write failed. Read and retry.")
+        return
+    }
+    var relativeStorage: [2048]u8 = [0_u8; 2048]
+    var absolute: [8192]u8 = [0_u8; 8192]
+    let relative: MutSpan<u8> = buffer(relativeStorage)
+    let decoded: Bool = decode(relative, field(bytes(app.arguments), "path"))
+    let checked: Maybe<String> = resolvedPath(app, bytes(relative), absolute)
+    if !decoded || !checked.has {
+        let removed: Bool = std.fs.remove(tempPath)
+        toolResult(app, "Error: path changed since the preview.")
+        return
+    }
+    if !std.fs.rename(tempPath, checked.value) {
+        let removed: Bool = std.fs.remove(tempPath)
+        toolResult(app, "Error: atomic file replacement failed.")
+        return
+    }
+    app.filesChanged = app.filesChanged + 1
+    clear(app.scratch)
+    append(app.scratch, "Saved ")
+    append(app.scratch, bytes(relative))
+    toolResult(app, bytes(app.scratch))
+}
+
+fn prepareFile(app: mutref<App>) -> Bool {
+    let argumentsData: MutSpan<u8> = app.arguments
+    let toolNameData: MutSpan<u8> = app.toolName
+    let resultData: MutSpan<u8> = app.result
+    let scratchData: MutSpan<u8> = app.scratch
+    var pathStorage: [2048]u8 = [0_u8; 2048]
+    var absolute: [8192]u8 = [0_u8; 8192]
+    var path: MutSpan<u8> = buffer(pathStorage)
+    if !decode(path, field(bytes(argumentsData), "path")) {
+        toolResult(app, "Error: path must be a string.")
+        return false
+    }
+    let fullPath: Maybe<String> = resolvedPath(app, bytes(path), absolute)
+    if !fullPath.has {
+        toolResult(app, "Error: unsafe path, ignored by .gitignore, secret file or symlink. Git is required for ignore checks.")
+        return false
+    }
+    clear(resultData)
+    app.sent = 0
+    if std.fs.exists(fullPath.value) {
+        app.sent = 1
+        let size: Maybe<usize> = fileByteSize(fullPath.value)
+        if size.has && std.mem.eql(bytes(toolNameData), "edit_file") {
+            if size.value > 16384 {
+                return prepareLargeFile(app, fullPath.value)
+            }
+        }
+        if !readBounded(resultData, fullPath.value) {
+            toolResult(app, "Error: existing file cannot be read or exceeds 16 KiB.")
+            return false
+        }
+        if !std.text.utf8Valid(bytes(resultData)) {
+            toolResult(app, "Error: cannot edit a binary file.")
+            return false
+        }
+    }
+    if std.mem.eql(bytes(toolNameData), "edit_file") {
+        if app.sent == 0 {
+            toolResult(app, "Error: cannot edit a missing file.")
+            return false
+        }
+        if !decode(scratchData, field(bytes(argumentsData), "old_text")) || bufLen(scratchData) == 0 {
+            toolResult(app, "Error: old_text must be a nonempty string.")
+            return false
+        }
+        if std.str.count(bytes(resultData), bytes(scratchData)) != 1 {
+            toolResult(app, "Error: old_text must occur exactly once. Read the file again.")
+            return false
+        }
+        if !decode(scratchData, field(bytes(argumentsData), "new_text")) {
+            toolResult(app, "Error: new_text must be a string.")
+            return false
+        }
+    } else {
+        if !decode(scratchData, field(bytes(argumentsData), "content")) {
+            toolResult(app, "Error: content must be a string.")
+            return false
+        }
+        if app.sent == 1 && std.mem.eql(bytes(resultData), bytes(scratchData)) {
+            toolResult(app, "The file already contains the requested content. No write is needed. If the task is satisfied, call finish_task now.")
+            return false
+        }
+        if bufLen(scratchData) > 12288 {
+            toolResult(app, "Error: file content exceeds 12 KiB. Make smaller edits.")
+            return false
+        }
+    }
+    logEntry(app, "  REVIEW FILE CHANGE", bytes(path))
+    clear(scratchData)
+    append(scratchData, "Before:\n")
+    append(scratchData, bytes(resultData))
+    logEntry(app, "  CURRENT CONTENT", bytes(scratchData))
+    if std.mem.eql(bytes(toolNameData), "edit_file") {
+        let found: Bool = decode(scratchData, field(bytes(argumentsData), "old_text"))
+        logEntry(app, "  - REMOVE", bytes(scratchData))
+        let changed: Bool = decode(scratchData, field(bytes(argumentsData), "new_text"))
+        logEntry(app, "  + INSERT", bytes(scratchData))
+    } else {
+        let changed: Bool = decode(scratchData, field(bytes(argumentsData), "content"))
+        logEntry(app, "  + PROPOSED CONTENT", bytes(scratchData))
+    }
+    return true
+}
+
+fn applyFile(app: mutref<App>) -> Void {
+    let argumentsData: MutSpan<u8> = app.arguments
+    let toolNameData: MutSpan<u8> = app.toolName
+    let resultData: MutSpan<u8> = app.result
+    let scratchData: MutSpan<u8> = app.scratch
+    var pathStorage: [2048]u8 = [0_u8; 2048]
+    var absolute: [8192]u8 = [0_u8; 8192]
+    var path: MutSpan<u8> = buffer(pathStorage)
+    let pathOk: Bool = decode(path, field(bytes(argumentsData), "path"))
+    let fullPath: Maybe<String> = resolvedPath(app, bytes(path), absolute)
+    if !pathOk || !fullPath.has {
+        toolResult(app, "Error: file path changed or is no longer safe.")
+        return
+    }
+    if app.sent == 2 {
+        applyLargeFile(app, fullPath.value)
+        return
+    }
+    var currentStorage: [16400]u8 = [0_u8; 16400]
+    let current: MutSpan<u8> = buffer(currentStorage)
+    if app.sent == 1 {
+        if !readBounded(current, fullPath.value) {
+            toolResult(app, "Error: file changed since the preview. Read and retry.")
+            return
+        }
+        if !std.mem.eql(bytes(current), bytes(resultData)) {
+            toolResult(app, "Error: file changed since the preview. Read and retry.")
+            return
+        }
+    } else if std.fs.exists(fullPath.value) {
+        toolResult(app, "Error: a file appeared since the preview. Read and retry.")
+        return
+    }
+    if std.mem.eql(bytes(toolNameData), "edit_file") {
+        var oldStorage: [16384]u8 = [0_u8; 16384]
+        var newStorage: [16384]u8 = [0_u8; 16384]
+        var old: MutSpan<u8> = buffer(oldStorage)
+        var replacement: MutSpan<u8> = buffer(newStorage)
+        let oldOk: Bool = decode(old, field(bytes(argumentsData), "old_text"))
+        let newOk: Bool = decode(replacement, field(bytes(argumentsData), "new_text"))
+        if !oldOk || !newOk {
+            toolResult(app, "Error: edit text exceeds the size limit.")
+            return
+        }
+        let position: usize = std.str.indexOf(bytes(resultData), bytes(old))
+        clear(scratchData)
+        append(scratchData, slice(bytes(resultData), 0_usize, position))
+        append(scratchData, bytes(replacement))
+        append(scratchData, slice(bytes(resultData), position + bufLen(old), bufLen(resultData)))
+    } else {
+        let valid: Bool = decode(scratchData, field(bytes(argumentsData), "content"))
+    }
+    if !bufOk(scratchData) || bufLen(scratchData) > 16384 {
+        toolResult(app, "Error: resulting file exceeds 16 KiB.")
+        return
+    }
+    if !createParent(fullPath.value) {
+        toolResult(app, "Error: could not create the parent directory. Check permissions.")
+        return
+    }
+    var checkedPath: [8192]u8 = [0_u8; 8192]
+    let rechecked: Maybe<String> = resolvedPath(app, bytes(path), checkedPath)
+    if !rechecked.has {
+        toolResult(app, "Error: path changed while creating the parent directory.")
+        return
+    }
+    var templateStorage: [8192]u8 = [0_u8; 8192]
+    var temporary: [8192]u8 = [0_u8; 8192]
+    let template: MutSpan<u8> = buffer(templateStorage)
+    append(template, fullPath.value)
+    append(template, ".zero-edit.XXXXXX")
+    let created: Maybe<usize> = std.proc.captureArgs("/usr/bin/mktemp", bytes(template), temporary)
+    if !created.has {
+        toolResult(app, "Error: could not create an adjacent temporary file.")
+        return
+    }
+    let tempPath: Span<u8> = std.str.trimAscii(std.mem.prefix(temporary, created.value))
+    if app.sent == 1 && !preservePermissions(fullPath.value, tempPath) {
+        let removed: Bool = std.fs.remove(tempPath)
+        toolResult(app, "Error: could not preserve the existing file permissions.")
+        return
+    }
+    if !std.fs.atomicWrite(fullPath.value, tempPath, bytes(scratchData)) {
+        let removed: Bool = std.fs.remove(tempPath)
+        toolResult(app, "Error: atomic write failed. Check the parent directory and permissions.")
+        return
+    }
+    app.filesChanged = app.filesChanged + 1
+    clear(scratchData)
+    append(scratchData, "Saved ")
+    append(scratchData, bytes(path))
+    toolResult(app, bytes(scratchData))
+}
+
+fn findFileText(path: String, needle: Span<u8>) -> Maybe<usize> {
+    if std.mem.len(needle) == 0 || std.mem.len(needle) > 16368 {
+        return null
+    }
+    var data: [32768]u8 = [0_u8; 32768]
+    var offset: usize = 0
+    var found: usize = 0
+    var matched: Bool = false
+    while true {
+        let total: Maybe<usize> = std.fs.readBytesAt(path, offset, data)
+        if !total.has {
+            return null
+        }
+        if total.value > 67108864 || offset > total.value {
+            return null
+        }
+        var count: usize = total.value - offset
+        if count > std.mem.len(data) {
+            count = std.mem.len(data)
+        }
+        if count < std.mem.len(needle) {
+            if matched {
+                return found
+            }
+            return null
+        }
+        let positions: usize = count - std.mem.len(needle) + 1
+        var cursor: usize = 0
+        while cursor < positions {
+            let relative: usize = std.str.indexOf(slice(data, cursor, count), needle)
+            if relative >= count - cursor {
+                break
+            }
+            if matched {
+                return null
+            }
+            found = offset + cursor + relative
+            matched = true
+            cursor = cursor + relative + 1
+        }
+        if offset + count == total.value {
+            if matched {
+                return found
+            }
+            return null
+        }
+        offset = offset + positions
+    }
+    if matched {
+        return found
+    }
+    return null
+}

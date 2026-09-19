@@ -14,7 +14,8 @@ releaseProfile = "release-small"
 
 [c.libs.process]
 headers = ["native/exit.h"]
-link = ["c"]
+lib = ["native/http_stream.c"]
+link = ["c", "curl"]
 
 [profiles.dev]
 inherits = "dev"

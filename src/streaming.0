@@ -1,0 +1,562 @@
+fn streamArrayItem(array: Span<u8>, index: usize) -> Span<u8> {
+    let count: Maybe<usize> = std.json.arrayCount(array)
+    if !count.has {
+        return "null"
+    }
+    var i: usize = 0
+    while i < count.value {
+        let item: Span<u8> = arrayItem(array, i)
+        let at: Maybe<u32> = std.json.u32(item, "index")
+        if at.has {
+            if at.value as usize == index {
+                return item
+            }
+        } else if i == index {
+            return item
+        }
+        i = i + 1
+    }
+    return "null"
+}
+
+fn streamArrayLength(array: Span<u8>) -> usize {
+    let count: Maybe<usize> = std.json.arrayCount(array)
+    if !count.has {
+        return 0
+    }
+    var length: usize = count.value
+    var i: usize = 0
+    while i < count.value && i < 128 {
+        let at: Maybe<u32> = std.json.u32(arrayItem(array, i), "index")
+        if at.has {
+            if at.value as usize >= length {
+                length = at.value as usize + 1
+            }
+        }
+        i = i + 1
+    }
+    return length
+}
+
+fn updateStreamMessage(app: mutref<App>, delta: Span<u8>) -> Void {
+    clear(app.scratch)
+    mergeStreamJson(app.scratch, bytes(app.streamMessage), delta, false, 0_usize)
+    if !bufOk(app.scratch) {
+        failTurn(app, "Streamed response exceeded the message limit or nesting limit.")
+        return
+    }
+    setText(app.streamMessage, bytes(app.scratch))
+    if !bufOk(app.streamMessage) {
+        failTurn(app, "Streamed response exceeded the 96 KiB message limit.")
+    }
+}
+
+fn streamText(app: mutref<App>, raw: Span<u8>) -> Void {
+    if std.mem.eql(raw, "null") {
+        return
+    }
+    var storage: [32768]u8 = [0_u8; 32768]
+    let text: MutSpan<u8> = buffer(storage)
+    if !decode(text, raw) {
+        failTurn(app, "Invalid or oversized streamed text.")
+        return
+    }
+    if bufLen(text) == 0 {
+        return
+    }
+    if bufLen(app.transcript) + bufLen(text) + 64 > capacity(app.transcript) {
+        clear(app.transcript)
+    }
+    if !app.streamVisible {
+        append(app.transcript, "  ZERO\n")
+        app.streamVisible = true
+    }
+    cleanText(app.transcript, bytes(text))
+    app.scroll = 0
+}
+
+fn handleStreamEvent(app: mutref<App>) -> Void {
+    let event: Span<u8> = bytes(app.streamEvent)
+    if std.mem.len(event) == 0 {
+        return
+    }
+    if app.streamDone {
+        failTurn(app, "Unexpected data after stream completion.")
+        return
+    }
+    if std.mem.eql(event, "[DONE]") && app.provider != 2 {
+        if std.mem.eql(field(bytes(app.streamMessage), "_finish_reason"), "null") {
+            failTurn(app, "Stream ended without a finish reason.")
+            return
+        }
+        app.streamDone = true
+        return
+    }
+    if !std.json.validateBytes(event) {
+        failTurn(app, "Provider returned invalid streaming JSON.")
+        return
+    }
+    if !std.mem.eql(field(event, "error"), "null") {
+        let decoded: Bool = decode(app.scratch, field(field(event, "error"), "message"))
+        if decoded {
+            failTurn(app, bytes(app.scratch))
+        } else {
+            failTurn(app, "Provider reported a streaming error.")
+        }
+        return
+    }
+    if app.provider == 2 {
+        claudeStreamEvent(app, event)
+        return
+    }
+    let firstChoice: Span<u8> = arrayItem(field(event, "choices"), 0_usize)
+    if !std.mem.eql(firstChoice, "null") {
+        let index: Maybe<u32> = std.json.u32(firstChoice, "index")
+        if index.has && index.value != 0 {
+            return
+        }
+        let delta: Span<u8> = field(firstChoice, "delta")
+        streamText(app, field(delta, "content"))
+        if app.phase != 1 {
+            return
+        }
+        updateStreamMessage(app, delta)
+    }
+    var updateStorage: [4096]u8 = [0_u8; 4096]
+    let update: MutSpan<u8> = buffer(updateStorage)
+    append(update, "{\"_finish_reason\":")
+    append(update, field(firstChoice, "finish_reason"))
+    append(update, ",\"usage\":")
+    append(update, field(event, "usage"))
+    put(update, 125_u8)
+    if app.phase == 1 {
+        updateStreamMessage(app, bytes(update))
+    }
+}
+
+fn streamLine(app: mutref<App>) -> Void {
+    var line: Span<u8> = bytes(app.streamLine)
+    if std.str.endsWith(line, "\r") {
+        line = slice(line, 0_usize, std.mem.len(line) - 1)
+    }
+    if std.mem.len(line) == 0 {
+        handleStreamEvent(app)
+        clear(app.streamEvent)
+    } else if std.str.startsWith(line, "data:") {
+        var data: Span<u8> = std.mem.dropPrefix(line, 5_usize)
+        if std.str.startsWith(data, " ") {
+            data = std.mem.dropPrefix(data, 1_usize)
+        }
+        if bufLen(app.streamEvent) > 0 {
+            put(app.streamEvent, 10_u8)
+        }
+        append(app.streamEvent, data)
+        if !bufOk(app.streamEvent) {
+            failTurn(app, "SSE event exceeds 64 KiB.")
+        }
+    }
+    clear(app.streamLine)
+}
+
+fn consumeHttp(app: mutref<App>, data: Span<u8>) -> Void {
+    var i: usize = 0
+    while i < std.mem.len(data) && app.phase == 1 {
+        if app.streamMode == 2 {
+            append(app.response, std.mem.dropPrefix(data, i))
+            return
+        }
+        if app.streamMode < 2 {
+            if data[i] == 10 {
+                if app.streamMode == 0 {
+                    let status: Maybe<u32> = std.parse.parseU32(bytes(app.streamLine))
+                    if !status.has {
+                        failTurn(app, "Invalid HTTP worker status.")
+                        return
+                    }
+                    app.httpStatus = status.value as usize
+                    app.streamMode = 1
+                } else if std.mem.eql(bytes(app.streamLine), "SSE") && app.httpStatus >= 200 && app.httpStatus < 300 {
+                    app.streamMode = 3
+                } else {
+                    app.streamMode = 2
+                    number(app.response, app.httpStatus)
+                    put(app.response, 10_u8)
+                }
+                clear(app.streamLine)
+            } else {
+                put(app.streamLine, data[i])
+            }
+        } else if data[i] == 10 {
+            streamLine(app)
+        } else {
+            put(app.streamLine, data[i])
+        }
+        if !bufOk(app.streamLine) {
+            failTurn(app, "SSE line exceeds 64 KiB.")
+            return
+        }
+        i = i + 1
+    }
+}
+
+fn streamBlockObject(output: MutSpan<u8>, object: Span<u8>, block: Bool) -> Void {
+    let count: Maybe<usize> = std.json.objectFieldCount(object)
+    if !count.has {
+        setOk(output, false)
+        return
+    }
+    put(output, 123_u8)
+    var written: usize = 0
+    var i: usize = 0
+    while i < count.value {
+        var keyStorage: [256]u8 = [0_u8; 256]
+        let key: Maybe<Span<u8>> = std.json.objectKey(keyStorage, object, i)
+        if !key.has {
+            setOk(output, false)
+            return
+        }
+        if !std.mem.eql(key.value, "_finish_reason") && !std.mem.eql(key.value, "_input_json") && !(block && std.mem.eql(key.value, "index")) && !(!block && std.mem.eql(key.value, "usage")) {
+            if written > 0 {
+                put(output, 44_u8)
+            }
+            quoted(output, key.value)
+            put(output, 58_u8)
+            let value: Span<u8> = field(object, key.value)
+            if std.mem.eql(key.value, "input") && !std.mem.eql(field(object, "_input_json"), "null") {
+                var storage: [32768]u8 = [0_u8; 32768]
+                let input: MutSpan<u8> = buffer(storage)
+                if !decode(input, field(object, "_input_json")) || !std.json.validateBytes(bytes(input)) || !std.str.startsWith(bytes(input), "{") {
+                    setOk(output, false)
+                    return
+                }
+                append(output, bytes(input))
+            } else {
+                append(output, value)
+            }
+            written = written + 1
+        }
+        i = i + 1
+    }
+    put(output, 125_u8)
+}
+
+fn streamObject(output: MutSpan<u8>, object: Span<u8>, block: Bool) -> Void {
+    let count: Maybe<usize> = std.json.objectFieldCount(object)
+    if !count.has {
+        setOk(output, false)
+        return
+    }
+    put(output, 123_u8)
+    var written: usize = 0
+    var i: usize = 0
+    while i < count.value {
+        var keyStorage: [256]u8 = [0_u8; 256]
+        let key: Maybe<Span<u8>> = std.json.objectKey(keyStorage, object, i)
+        if !key.has {
+            setOk(output, false)
+            return
+        }
+        if !std.mem.eql(key.value, "_finish_reason") && !std.mem.eql(key.value, "_input_json") && !(block && std.mem.eql(key.value, "index")) && !(!block && std.mem.eql(key.value, "usage")) {
+            if written > 0 {
+                put(output, 44_u8)
+            }
+            quoted(output, key.value)
+            put(output, 58_u8)
+            let value: Span<u8> = field(object, key.value)
+            if std.mem.eql(key.value, "input") && !std.mem.eql(field(object, "_input_json"), "null") {
+                var storage: [32768]u8 = [0_u8; 32768]
+                let input: MutSpan<u8> = buffer(storage)
+                if !decode(input, field(object, "_input_json")) || !std.json.validateBytes(bytes(input)) || !std.str.startsWith(bytes(input), "{") {
+                    setOk(output, false)
+                    return
+                }
+                append(output, bytes(input))
+            } else if std.mem.eql(key.value, "tool_calls") || std.mem.eql(key.value, "content") && std.str.startsWith(value, "[") {
+                put(output, 91_u8)
+                let length: usize = streamArrayLength(value)
+                var index: usize = 0
+                while index < length {
+                    if index > 0 {
+                        put(output, 44_u8)
+                    }
+                    streamBlockObject(output, arrayItem(value, index), true)
+                    index = index + 1
+                }
+                put(output, 93_u8)
+            } else {
+                append(output, value)
+            }
+            written = written + 1
+        }
+        i = i + 1
+    }
+    put(output, 125_u8)
+}
+
+fn finishHttp(app: mutref<App>) -> Void {
+    if app.streamMode != 3 {
+        receiveResponse(app)
+        return
+    }
+    if !app.streamDone {
+        failTurn(app, "Provider stream was interrupted before completion. No partial tool calls were executed.")
+        return
+    }
+    clear(app.response)
+    append(app.response, "200\n")
+    let message: Span<u8> = bytes(app.streamMessage)
+    if app.provider == 2 {
+        streamObject(app.response, message, false)
+    } else {
+        append(app.response, "{\"choices\":[{\"message\":")
+        streamObject(app.response, message, false)
+        append(app.response, ",\"finish_reason\":")
+        append(app.response, field(message, "_finish_reason"))
+        append(app.response, "}],\"usage\":")
+        append(app.response, field(message, "usage"))
+        put(app.response, 125_u8)
+    }
+    if !bufOk(app.response) {
+        failTurn(app, "Streamed message is invalid or exceeds the response limit.")
+        return
+    }
+    if app.provider == 2 {
+        usageCount(app, message)
+    }
+    if app.streamVisible {
+        append(app.transcript, "\n\n")
+    }
+    receiveResponse(app)
+}
+
+fn httpWorker(world: World) -> Void {
+    let expected: Maybe<u32> = std.args.parseU32(2_usize)
+    if !expected.has {
+        return
+    }
+    let status: i32 = process.zero_http_stream(expected.value)
+    process.exit(status)
+}
+
+fn claudeStreamEvent(app: mutref<App>, event: Span<u8>) -> Void {
+    let kind: Span<u8> = field(event, "type")
+    if std.mem.eql(kind, "\"message_start\"") {
+        if !std.mem.eql(field(bytes(app.streamMessage), "content"), "null") {
+            failTurn(app, "Duplicate stream message start.")
+            return
+        }
+        setText(app.streamMessage, field(event, "message"))
+    } else if std.mem.eql(kind, "\"content_block_start\"") || std.mem.eql(kind, "\"content_block_delta\"") {
+        let index: Maybe<u32> = std.json.u32(event, "index")
+        if !index.has {
+            failTurn(app, "Stream block has no index.")
+            return
+        }
+        if index.value >= 128 {
+            failTurn(app, "Stream block index exceeds the limit.")
+            return
+        }
+        var updateStorage: [65536]u8 = [0_u8; 65536]
+        let update: MutSpan<u8> = buffer(updateStorage)
+        append(update, "{\"content\":[{\"index\":")
+        number(update, index.value as usize)
+        if std.mem.eql(kind, "\"content_block_start\"") {
+            if app.streamActive != 0 || index.value as usize != streamArrayLength(field(bytes(app.streamMessage), "content")) {
+                failTurn(app, "Stream content blocks arrived out of order.")
+                return
+            }
+            let block: Span<u8> = field(event, "content_block")
+            if !std.str.startsWith(block, "{") {
+                failTurn(app, "Invalid stream content block.")
+                return
+            }
+            app.streamActive = index.value as usize + 1
+            if std.mem.len(block) > 2 {
+                put(update, 44_u8)
+                append(update, slice(block, 1_usize, std.mem.len(block) - 1))
+            }
+            streamText(app, field(block, "text"))
+        } else {
+            if app.streamActive != index.value as usize + 1 {
+                failTurn(app, "Stream delta has no matching block.")
+                return
+            }
+            let delta: Span<u8> = field(event, "delta")
+            let deltaType: Span<u8> = field(delta, "type")
+            if std.mem.eql(deltaType, "\"text_delta\"") {
+                append(update, ",\"text\":")
+                append(update, field(delta, "text"))
+                streamText(app, field(delta, "text"))
+            } else if std.mem.eql(deltaType, "\"input_json_delta\"") {
+                append(update, ",\"_input_json\":")
+                append(update, field(delta, "partial_json"))
+            } else if std.mem.eql(deltaType, "\"thinking_delta\"") {
+                append(update, ",\"thinking\":")
+                append(update, field(delta, "thinking"))
+            } else if std.mem.eql(deltaType, "\"signature_delta\"") {
+                append(update, ",\"signature\":")
+                append(update, field(delta, "signature"))
+            }
+        }
+        append(update, "}]}")
+        if !bufOk(update) {
+            failTurn(app, "Stream event exceeded the buffer limit.")
+            return
+        }
+        if app.phase == 1 {
+            updateStreamMessage(app, bytes(update))
+        }
+    } else if std.mem.eql(kind, "\"content_block_stop\"") {
+        let index: Maybe<u32> = std.json.u32(event, "index")
+        if !index.has {
+            failTurn(app, "Stream block stop has no index.")
+            return
+        }
+        if app.streamActive != index.value as usize + 1 {
+            failTurn(app, "Unmatched stream block stop.")
+            return
+        }
+        app.streamActive = 0
+    } else if std.mem.eql(kind, "\"message_delta\"") {
+        updateStreamMessage(app, field(event, "delta"))
+        var usageStorage: [4096]u8 = [0_u8; 4096]
+        let usageUpdate: MutSpan<u8> = buffer(usageStorage)
+        append(usageUpdate, "{\"usage\":")
+        append(usageUpdate, field(event, "usage"))
+        put(usageUpdate, 125_u8)
+        if app.phase == 1 {
+            updateStreamMessage(app, bytes(usageUpdate))
+        }
+    } else if std.mem.eql(kind, "\"message_stop\"") {
+        if app.streamActive != 0 || std.mem.eql(field(bytes(app.streamMessage), "stop_reason"), "null") {
+            failTurn(app, "Stream ended with an incomplete message.")
+            return
+        }
+        app.streamDone = true
+    }
+}
+
+fn streamConcatKey(key: Span<u8>) -> Bool {
+    return std.mem.eql(key, "content") || std.mem.eql(key, "text") || std.mem.eql(key, "arguments") || std.mem.eql(key, "name") || std.mem.eql(key, "thinking") || std.mem.eql(key, "signature") || std.mem.eql(key, "reasoning") || std.mem.eql(key, "reasoning_content") || std.mem.eql(key, "_input_json")
+}
+
+fn streamFrameValue(root: Span<u8>, start: usize, length: usize) -> Span<u8> {
+    if length == 0 { return "null" }
+    return slice(root, start, start + length)
+}
+
+fn mergeStreamJson(output: MutSpan<u8>, left: Span<u8>, right: Span<u8>, concatenate: Bool, initialDepth: usize) -> Void {
+    // Explicit frames avoid recursive mutable borrows and use a fixed 13-level
+    // budget. The direct ARM64 backend also limits this signature to eight slots.
+    var leftStart: [13]usize = [0_usize; 13]
+    var leftLength: [13]usize = [0_usize; 13]
+    var rightStart: [13]usize = [0_usize; 13]
+    var rightLength: [13]usize = [0_usize; 13]
+    var states: [13]usize = [0_usize; 13]
+    var cursors: [13]usize = [0_usize; 13]
+    var written: [13]usize = [0_usize; 13]
+    var joins: [13]usize = [0_usize; 13]
+    var depth: usize = 0
+    leftLength[0] = std.mem.len(left)
+    rightLength[0] = std.mem.len(right)
+    if concatenate { joins[0] = 1 }
+    while true {
+        let previous: Span<u8> = streamFrameValue(left, leftStart[depth], leftLength[depth])
+        let incoming: Span<u8> = streamFrameValue(right, rightStart[depth], rightLength[depth])
+        var finished: Bool = false
+        var descend: Bool = false
+        var childLeft: Span<u8> = "null"
+        var childRight: Span<u8> = "null"
+        var childJoin: Bool = false
+        if states[depth] == 0 {
+            if std.mem.eql(incoming, "null") {
+                append(output, previous)
+                finished = true
+            } else if std.str.startsWith(incoming, "{") {
+                put(output, 123_u8)
+                states[depth] = 1
+            } else if std.str.startsWith(incoming, "[") {
+                put(output, 91_u8)
+                states[depth] = 2
+            } else {
+                if joins[depth] == 1 && std.str.startsWith(previous, "\"") && std.str.startsWith(incoming, "\"") {
+                    append(output, slice(previous, 0_usize, std.mem.len(previous) - 1))
+                    append(output, std.mem.dropPrefix(incoming, 1_usize))
+                } else { append(output, incoming) }
+                finished = true
+            }
+        }
+        if !finished && states[depth] == 1 {
+            let oldFields: Maybe<usize> = std.json.objectFieldCount(previous)
+            let newFields: Maybe<usize> = std.json.objectFieldCount(incoming)
+            if !newFields.has { setOk(output, false)
+ return }
+            var oldCount: usize = 0
+            if oldFields.has { oldCount = oldFields.value }
+            if oldCount > 128 || newFields.value > 128 { setOk(output, false)
+ return }
+            if cursors[depth] >= oldCount + newFields.value {
+                put(output, 125_u8)
+                finished = true
+            } else {
+                var object: Span<u8> = previous
+                var index: usize = cursors[depth]
+                if index >= oldCount { object = incoming
+ index = index - oldCount }
+                var keyStorage: [256]u8 = [0_u8; 256]
+                let key: Maybe<Span<u8>> = std.json.objectKey(keyStorage, object, index)
+                if !key.has { setOk(output, false)
+ return }
+                let existing: Maybe<Span<u8>> = std.json.field(previous, key.value)
+                if cursors[depth] < oldCount || !existing.has {
+                    if written[depth] > 0 { put(output, 44_u8) }
+                    quoted(output, key.value)
+                    put(output, 58_u8)
+                    written[depth] = written[depth] + 1
+                    childLeft = field(previous, key.value)
+                    childRight = field(incoming, key.value)
+                    childJoin = streamConcatKey(key.value)
+                    descend = true
+                }
+                cursors[depth] = cursors[depth] + 1
+            }
+        } else if !finished && states[depth] == 2 {
+            var length: usize = streamArrayLength(previous)
+            let newLength: usize = streamArrayLength(incoming)
+            if newLength > length { length = newLength }
+            if length > 128 { setOk(output, false)
+ return }
+            if cursors[depth] >= length {
+                put(output, 93_u8)
+                finished = true
+            } else {
+                if cursors[depth] > 0 { put(output, 44_u8) }
+                childLeft = streamArrayItem(previous, cursors[depth])
+                childRight = streamArrayItem(incoming, cursors[depth])
+                childJoin = joins[depth] == 1
+                descend = true
+                cursors[depth] = cursors[depth] + 1
+            }
+        }
+        if !bufOk(output) { return }
+        if descend {
+            if depth + initialDepth >= 12 { setOk(output, false)
+ return }
+            depth = depth + 1
+            leftStart[depth] = std.str.indexOf(left, childLeft)
+            leftLength[depth] = std.mem.len(childLeft)
+            if leftStart[depth] >= std.mem.len(left) { leftLength[depth] = 0 }
+            rightStart[depth] = std.str.indexOf(right, childRight)
+            rightLength[depth] = std.mem.len(childRight)
+            if rightStart[depth] >= std.mem.len(right) { rightLength[depth] = 0 }
+            states[depth] = 0
+            cursors[depth] = 0
+            written[depth] = 0
+            joins[depth] = 0
+            if childJoin { joins[depth] = 1 }
+        } else if finished {
+            if depth == 0 { return }
+            depth = depth - 1
+        }
+    }
+}

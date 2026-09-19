@@ -1,0 +1,924 @@
+fn mcpServer(app: ref<App>, index: usize) -> Span<u8> {
+    let config: MutSpan<u8> = app.mcpConfig
+    return arrayItem(bytes(config), index)
+}
+
+fn expandedConfig(output: MutSpan<u8>, raw: Span<u8>) -> Bool {
+    var storage: [8192]u8 = [0_u8; 8192]
+    let decoded: MutSpan<u8> = buffer(storage)
+    if !decode(decoded, raw) {
+        return false
+    }
+    clear(output)
+    let text: Span<u8> = bytes(decoded)
+    var index: usize = 0
+    while index < std.mem.len(text) {
+        if text[index] == 36 && index + 1 < std.mem.len(text) && text[index + 1] == 123 {
+            var end: usize = index + 2
+            while end < std.mem.len(text) && text[end] != 125 {
+                end = end + 1
+            }
+            if end >= std.mem.len(text) || end == index + 2 {
+                return false
+            }
+            let variable: Span<u8> = slice(text, index + 2, end)
+            if !extensionName(variable) {
+                return false
+            }
+            let value: Maybe<String> = std.env.get(variable)
+            if !value.has {
+                return false
+            }
+            append(output, value.value)
+            index = end + 1
+        } else {
+            put(output, text[index])
+            index = index + 1
+        }
+    }
+    return bufOk(output) && headerSafe(bytes(output)) && !containsNul(bytes(output))
+}
+
+fn loadMcpConfig(app: mutref<App>) -> Bool {
+    let config: MutSpan<u8> = app.mcpConfig
+    let workspace: MutSpan<u8> = app.workspace
+    setText(config, "[]")
+    app.mcpCount = 0
+    var contentStorage: [32784]u8 = [0_u8; 32784]
+    var pathStorage: [8192]u8 = [0_u8; 8192]
+    var keyStorage: [80]u8 = [0_u8; 80]
+    let content: MutSpan<u8> = buffer(contentStorage)
+    let path: MutSpan<u8> = buffer(pathStorage)
+    let custom: Maybe<String> = std.args.valueAfter("--mcp-config")
+    if custom.has {
+        if !std.path.isAbs(custom.value) {
+            append(path, bytes(workspace))
+            put(path, 47_u8)
+        }
+        append(path, custom.value)
+    } else {
+        append(path, bytes(workspace))
+        append(path, "/.mcp.json")
+    }
+    if !std.fs.exists(bytes(path)) {
+        if custom.has {
+            logEntry(app, "  MCP", "MCP configuration file was not found.")
+            return false
+        }
+        return true
+    }
+    if !bufOk(path) || !readBounded(content, bytes(path)) || !std.json.validateBytes(bytes(content)) {
+        logEntry(app, "  MCP", "MCP configuration must be valid JSON no larger than 32 KiB.")
+        return false
+    }
+    let servers: Span<u8> = field(bytes(content), "mcpServers")
+    let count: Maybe<usize> = std.json.objectFieldCount(servers)
+    if !count.has {
+        logEntry(app, "  MCP", "Expected an mcpServers object in the MCP configuration.")
+        return false
+    }
+    if count.value > 4 {
+        logEntry(app, "  MCP", "At most four MCP servers can be configured per session.")
+        return false
+    }
+    var index: usize = 0
+    while index < count.value {
+        let key: Maybe<Span<u8>> = std.json.objectKey(keyStorage, servers, index)
+        let value: Maybe<Span<u8>> = std.json.objectValue(servers, index)
+        if !key.has || !value.has {
+            return false
+        }
+        if !extensionName(key.value) || std.mem.len(key.value) > 20 {
+            logEntry(app, "  MCP", "Server names must contain 1–20 letters, numbers, hyphens or underscores.")
+            setText(config, "[]")
+            app.mcpCount = 0
+            return false
+        }
+        let object: Maybe<usize> = std.json.objectFieldCount(value.value)
+        if !object.has {
+            logEntry(app, "  MCP", "Each server configuration must be an object.")
+            return false
+        }
+        setLen(config, bufLen(config) - 1)
+        if index > 0 {
+            put(config, 44_u8)
+        }
+        append(config, "{\"name\":")
+        quoted(config, key.value)
+        append(config, ",\"config\":")
+        compactJson(config, value.value)
+        append(config, "}]")
+        if !bufOk(config) {
+            setText(config, "[]")
+            app.mcpCount = 0
+            logEntry(app, "  MCP", "MCP configuration exceeds the storage limit.")
+            return false
+        }
+        index = index + 1
+    }
+    app.mcpCount = count.value
+    return true
+}
+
+fn mcpTool(app: ref<App>, name: Span<u8>) -> Span<u8> {
+    let tools: MutSpan<u8> = app.mcpTools
+    var nameStorage: [96]u8 = [0_u8; 96]
+    let decoded: MutSpan<u8> = buffer(nameStorage)
+    var index: usize = 0
+    while index < 128 {
+        let entry: Span<u8> = arrayItem(bytes(tools), index)
+        if std.mem.eql(entry, "null") {
+            break
+        }
+        if decode(decoded, field(entry, "name")) && std.mem.eql(bytes(decoded), name) {
+            return entry
+        }
+        index = index + 1
+    }
+    return "null"
+}
+
+fn removeMcpTools(app: mutref<App>, server: usize) -> Void {
+    let tools: MutSpan<u8> = app.mcpTools
+    var storage: [65552]u8 = [0_u8; 65552]
+    let remaining: MutSpan<u8> = buffer(storage)
+    append(remaining, "[")
+    var index: usize = 0
+    while index < 128 {
+        let entry: Span<u8> = arrayItem(bytes(tools), index)
+        if std.mem.eql(entry, "null") {
+            break
+        }
+        let owner: Maybe<u32> = std.parse.parseU32(field(entry, "server"))
+        if owner.has && owner.value as usize != server {
+            if bufLen(remaining) > 1 {
+                put(remaining, 44_u8)
+            }
+            append(remaining, entry)
+        }
+        index = index + 1
+    }
+    put(remaining, 93_u8)
+    setText(tools, bytes(remaining))
+}
+
+fn disconnectMcp(app: mutref<App>, index: usize) -> Void {
+    let child: ProcChild = mcpChild(app, index)
+    if std.proc.childValid(child) {
+        let closedInput: Bool = std.proc.closeStdin(child)
+        let killed: Bool = std.proc.killGroupPid(std.proc.pid(child))
+        let closed: Bool = std.proc.close(child)
+    }
+    setMcpChild(app, index, std.proc.spawnChild(""))
+    removeMcpTools(app, index)
+    clear(mcpBuffer(app, index))
+}
+
+fn disconnectAllMcp(app: mutref<App>) -> Void {
+    var index: usize = 0
+    while index < 4 {
+        disconnectMcp(app, index)
+        index = index + 1
+    }
+    app.mcpStage = 0
+    app.mcpConnectAll = false
+}
+
+fn mcpFailure(app: mutref<App>, message: Span<u8>) -> Void {
+    let wasCall: Bool = app.mcpStage == 3
+    disconnectMcp(app, app.mcpIndex)
+    app.mcpStage = 0
+    app.mcpConnectAll = false
+    app.phase = 0
+    app.exitCode = 1
+    if wasCall {
+        toolResult(app, message)
+    } else {
+        logEntry(app, "  MCP ERROR", message)
+    }
+}
+
+fn sendMcp(app: mutref<App>, method: Span<u8>, params: Span<u8>) -> Void {
+    let output: MutSpan<u8> = app.mcpTx
+    clear(output)
+    app.mcpRequest = app.mcpRequest + 1
+    append(output, "{\"jsonrpc\":\"2.0\",\"id\":")
+    number(output, app.mcpRequest)
+    append(output, ",\"method\":")
+    quoted(output, method)
+    append(output, ",\"params\":")
+    compactJson(output, params)
+    append(output, "}\n")
+    app.mcpSent = 0
+    app.started = std.time.monotonic()
+    if !bufOk(output) {
+        mcpFailure(app, "Error: MCP request exceeds 64 KiB.")
+    }
+}
+
+fn connectMcp(app: mutref<App>, index: usize) -> Void {
+    let workspace: MutSpan<u8> = app.workspace
+    let config: Span<u8> = field(mcpServer(app, index), "config")
+    app.mcpIndex = index
+    app.mcpStage = 1
+    app.phase = 5
+    app.view = 0
+    disconnectMcp(app, index)
+    if std.mem.eql(field(config, "disabled"), "true") {
+        mcpFailure(app, "Error: this MCP server is disabled in the configuration.")
+        return
+    }
+    let transport: Span<u8> = field(config, "type")
+    if !std.mem.eql(transport, "null") && !std.mem.eql(transport, "\"stdio\"") || !std.mem.eql(field(config, "url"), "null") {
+        mcpFailure(app, "Error: this client supports stdio MCP servers. Configure a command and args; remote servers require a stdio bridge.")
+        return
+    }
+    var programStorage: [8192]u8 = [0_u8; 8192]
+    var argumentStorage: [16384]u8 = [0_u8; 16384]
+    var environmentStorage: [16384]u8 = [0_u8; 16384]
+    var decodedStorage: [8192]u8 = [0_u8; 8192]
+    var cwdStorage: [8192]u8 = [0_u8; 8192]
+    var keyStorage: [256]u8 = [0_u8; 256]
+    let program: MutSpan<u8> = buffer(programStorage)
+    let arguments: MutSpan<u8> = buffer(argumentStorage)
+    let environment: MutSpan<u8> = buffer(environmentStorage)
+    let decoded: MutSpan<u8> = buffer(decodedStorage)
+    let cwd: MutSpan<u8> = buffer(cwdStorage)
+    if !expandedConfig(program, field(config, "command")) || bufLen(program) == 0 {
+        mcpFailure(app, "Error: MCP command is missing or invalid, or a referenced environment variable is unset.")
+        return
+    }
+    setText(cwd, bytes(workspace))
+    if !std.mem.eql(field(config, "cwd"), "null") {
+        if !expandedConfig(decoded, field(config, "cwd")) {
+            mcpFailure(app, "Error: invalid MCP working directory.")
+            return
+        }
+        if std.path.isAbs(bytes(decoded)) {
+            setText(cwd, bytes(decoded))
+        } else {
+            put(cwd, 47_u8)
+            append(cwd, bytes(decoded))
+        }
+    }
+    let args: Span<u8> = field(config, "args")
+    if !std.mem.eql(args, "null") {
+        let count: Maybe<usize> = std.json.arrayCount(args)
+        if !count.has {
+            mcpFailure(app, "Error: MCP args must be a JSON array of strings.")
+            return
+        }
+        if count.value > 64 {
+            mcpFailure(app, "Error: MCP server has more than 64 arguments.")
+            return
+        }
+        var at: usize = 0
+        while at < count.value {
+            if !expandedConfig(decoded, arrayItem(args, at)) || bufLen(decoded) == 0 {
+                mcpFailure(app, "Error: MCP arguments must be nonempty single-line strings with valid environment variables.")
+                return
+            }
+            if at > 0 {
+                put(arguments, 10_u8)
+            }
+            append(arguments, bytes(decoded))
+            at = at + 1
+        }
+    }
+    let env: Span<u8> = field(config, "env")
+    if !std.mem.eql(env, "null") {
+        let count: Maybe<usize> = std.json.objectFieldCount(env)
+        if !count.has {
+            mcpFailure(app, "Error: MCP env must be an object of string values.")
+            return
+        }
+        var at: usize = 0
+        while at < count.value {
+            let key: Maybe<Span<u8>> = std.json.objectKey(keyStorage, env, at)
+            let value: Maybe<Span<u8>> = std.json.objectValue(env, at)
+            if !key.has || !value.has {
+                mcpFailure(app, "Error: invalid MCP environment.")
+                return
+            }
+            if !extensionName(key.value) || !expandedConfig(decoded, value.value) {
+                mcpFailure(app, "Error: invalid MCP environment or missing variable.")
+                return
+            }
+            append(environment, key.value)
+            put(environment, 61_u8)
+            append(environment, bytes(decoded))
+            put(environment, 10_u8)
+            at = at + 1
+        }
+    }
+    if !bufOk(arguments) || !bufOk(environment) || !bufOk(cwd) {
+        mcpFailure(app, "Error: MCP process configuration exceeds the size limit.")
+        return
+    }
+    let child: ProcChild = std.proc.spawnChildArgs(bytes(program), bytes(arguments), bytes(cwd), bytes(environment))
+    setMcpChild(app, index, child)
+    if !std.proc.childValid(child) {
+        mcpFailure(app, "Error: could not start the MCP server. Check its command and working directory.")
+        return
+    }
+    if decode(decoded, field(mcpServer(app, index), "name")) {
+        logEntry(app, "  MCP CONNECTING", bytes(decoded))
+    }
+    app.mcpPage = 0
+    clear(app.mcpCursor)
+    sendMcp(app, "initialize", "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"zero-coding\",\"version\":\"0.1.0\"}}")
+}
+
+fn beginMcp(app: mutref<App>, name: Span<u8>) -> Void {
+    if app.mcpCount == 0 {
+        logEntry(app, "  MCP", "No servers configured. Add an mcpServers object to .mcp.json, then use /mcp reload.")
+        app.exitCode = 1
+        return
+    }
+    var storage: [80]u8 = [0_u8; 80]
+    let decoded: MutSpan<u8> = buffer(storage)
+    app.exitCode = 0
+    app.turnStart = bufLen(app.history)
+    if std.mem.eql(name, "all") {
+        app.mcpConnectAll = true
+        connectMcp(app, 0_usize)
+        return
+    }
+    var index: usize = 0
+    while index < app.mcpCount {
+        if decode(decoded, field(mcpServer(app, index), "name")) && std.mem.eql(bytes(decoded), name) {
+            app.mcpConnectAll = false
+            connectMcp(app, index)
+            return
+        }
+        index = index + 1
+    }
+    logEntry(app, "  MCP", "Unknown server name. Use /mcp to list configured servers.")
+    app.exitCode = 1
+}
+
+fn addMcpTools(app: mutref<App>, tools: Span<u8>) -> Bool {
+    let registry: MutSpan<u8> = app.mcpTools
+    let count: Maybe<usize> = std.json.arrayCount(tools)
+    let existing: Maybe<usize> = std.json.arrayCount(bytes(registry))
+    if !count.has || !existing.has {
+        return false
+    }
+    if count.value + existing.value > 128 {
+        return false
+    }
+    var nameStorage: [256]u8 = [0_u8; 256]
+    var serverStorage: [80]u8 = [0_u8; 80]
+    var aliasStorage: [96]u8 = [0_u8; 96]
+    var descriptionStorage: [4096]u8 = [0_u8; 4096]
+    var entryStorage: [65552]u8 = [0_u8; 65552]
+    let name: MutSpan<u8> = buffer(nameStorage)
+    let server: MutSpan<u8> = buffer(serverStorage)
+    let toolAlias: MutSpan<u8> = buffer(aliasStorage)
+    let description: MutSpan<u8> = buffer(descriptionStorage)
+    let encoded: MutSpan<u8> = buffer(entryStorage)
+    if !decode(server, field(mcpServer(app, app.mcpIndex), "name")) {
+        return false
+    }
+    var index: usize = 0
+    while index < count.value {
+        let tool: Span<u8> = arrayItem(tools, index)
+        if !decode(name, field(tool, "name")) || bufLen(name) == 0 || !headerSafe(bytes(name)) {
+            return false
+        }
+        let schema: Span<u8> = field(tool, "inputSchema")
+        if !std.mem.eql(field(schema, "type"), "\"object\"") {
+            return false
+        }
+        clear(toolAlias)
+        append(toolAlias, "mcp__")
+        append(toolAlias, bytes(server))
+        append(toolAlias, "__")
+        number(toolAlias, existing.value + index)
+        put(toolAlias, 95_u8)
+        var letter: usize = 0
+        while letter < bufLen(name) && letter < 24 {
+            let c: u8 = name[letter]
+            if c >= 97 && c <= 122 || c >= 65 && c <= 90 || c >= 48 && c <= 57 || c == 45 || c == 95 {
+                put(toolAlias, c)
+            } else {
+                put(toolAlias, 95_u8)
+            }
+            letter = letter + 1
+        }
+        clear(description)
+        if !std.mem.eql(field(tool, "description"), "null") {
+            if !decode(description, field(tool, "description")) {
+                return false
+            }
+        }
+        clear(encoded)
+        append(encoded, "{\"server\":")
+        number(encoded, app.mcpIndex)
+        append(encoded, ",\"name\":")
+        quoted(encoded, bytes(toolAlias))
+        append(encoded, ",\"remote\":")
+        quoted(encoded, bytes(name))
+        append(encoded, ",\"description\":")
+        quoted(encoded, bytes(description))
+        append(encoded, ",\"inputSchema\":")
+        compactJson(encoded, schema)
+        put(encoded, 125_u8)
+        if !bufOk(encoded) || bufLen(registry) + bufLen(encoded) + 2 > capacity(registry) {
+            return false
+        }
+        setLen(registry, bufLen(registry) - 1)
+        if bufLen(registry) > 1 {
+            put(registry, 44_u8)
+        }
+        append(registry, bytes(encoded))
+        put(registry, 93_u8)
+        index = index + 1
+    }
+    return bufOk(registry)
+}
+
+fn mcpCallResult(app: mutref<App>, result: Span<u8>) -> Void {
+    let output: MutSpan<u8> = app.result
+    var textStorage: [16400]u8 = [0_u8; 16400]
+    let decoded: MutSpan<u8> = buffer(textStorage)
+    clear(output)
+    if std.mem.eql(field(result, "isError"), "true") {
+        append(output, "Error: MCP tool reported a failure.\n")
+    }
+    let content: Span<u8> = field(result, "content")
+    let count: Maybe<usize> = std.json.arrayCount(content)
+    if count.has {
+        var index: usize = 0
+        while index < count.value {
+            let block: Span<u8> = arrayItem(content, index)
+            if std.mem.eql(field(block, "type"), "\"text\"") {
+                if decode(decoded, field(block, "text")) {
+                    append(output, bytes(decoded))
+                    put(output, 10_u8)
+                } else {
+                    setOk(output, false)
+                }
+            } else if std.mem.eql(field(block, "type"), "\"resource\"") {
+                let resource: Span<u8> = field(block, "resource")
+                if decode(decoded, field(resource, "text")) {
+                    append(output, bytes(decoded))
+                    put(output, 10_u8)
+                } else {
+                    append(output, "[Non-text MCP resource omitted.]\n")
+                }
+            } else {
+                append(output, "[Non-text MCP content omitted.]\n")
+            }
+            index = index + 1
+        }
+    }
+    let structured: Span<u8> = field(result, "structuredContent")
+    if !std.mem.eql(structured, "null") {
+        append(output, "\nStructured content:\n")
+        append(output, structured)
+    }
+    if !bufOk(output) {
+        setText(output, "Error: MCP tool result exceeds 16 KiB. The tool may have completed; use a narrower query, and do not repeat a mutation merely to reduce its output.")
+    }
+    if bufLen(output) == 0 {
+        append(output, "MCP tool completed with no text result.")
+    }
+    app.mcpStage = 0
+    toolResult(app, bytes(output))
+}
+
+fn mcpReply(app: mutref<App>, message: Span<u8>) -> Void {
+    if !std.mem.eql(field(message, "jsonrpc"), "\"2.0\"") {
+        mcpFailure(app, "Error: invalid MCP JSON-RPC version.")
+        return
+    }
+    let method: Span<u8> = field(message, "method")
+    if !std.mem.eql(method, "null") {
+        let rawId: Span<u8> = field(message, "id")
+        if !std.mem.eql(rawId, "null") {
+            let tx: MutSpan<u8> = app.mcpTx
+            append(tx, "{\"jsonrpc\":\"2.0\",\"id\":")
+            append(tx, rawId)
+            if std.mem.eql(method, "\"ping\"") {
+                append(tx, ",\"result\":{}}\n")
+            } else {
+                append(tx, ",\"error\":{\"code\":-32601,\"message\":\"Client capability not supported\"}}\n")
+            }
+            if !bufOk(tx) {
+                mcpFailure(app, "Error: MCP server sent too many requests.")
+            }
+        }
+        return
+    }
+    let id: Maybe<u32> = std.parse.parseU32(field(message, "id"))
+    if !id.has {
+        return
+    }
+    if id.value as usize != app.mcpRequest {
+        return
+    }
+    if !std.mem.eql(field(message, "error"), "null") {
+        if app.mcpStage == 3 {
+            app.mcpStage = 0
+            toolResult(app, "Error: MCP server returned a JSON-RPC error for the tool call. Check the tool arguments.")
+        } else {
+            mcpFailure(app, "Error: MCP server rejected initialization or tool discovery.")
+        }
+        return
+    }
+    let result: Span<u8> = field(message, "result")
+    if std.mem.eql(result, "null") {
+        mcpFailure(app, "Error: MCP reply is missing its result.")
+        return
+    }
+    if app.mcpStage == 1 {
+        let version: Span<u8> = field(result, "protocolVersion")
+        if !std.mem.eql(version, "\"2025-11-25\"") && !std.mem.eql(version, "\"2025-06-18\"") && !std.mem.eql(version, "\"2025-03-26\"") && !std.mem.eql(version, "\"2024-11-05\"") {
+            mcpFailure(app, "Error: MCP server negotiated an unsupported protocol version.")
+            return
+        }
+        if std.mem.eql(field(field(result, "capabilities"), "tools"), "null") {
+            mcpFailure(app, "Error: MCP server does not advertise tools.")
+            return
+        }
+        app.mcpStage = 2
+        sendMcp(app, "tools/list", "{}")
+        let tx: MutSpan<u8> = app.mcpTx
+        var storage: [1024]u8 = [0_u8; 1024]
+        let request: MutSpan<u8> = buffer(storage)
+        setText(request, bytes(tx))
+        setText(tx, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        append(tx, bytes(request))
+        return
+    }
+    if app.mcpStage == 2 {
+        if !addMcpTools(app, field(result, "tools")) {
+            mcpFailure(app, "Error: MCP tool catalog is invalid or exceeds 128 tools / 64 KiB.")
+            return
+        }
+        let cursor: Span<u8> = field(result, "nextCursor")
+        if !std.mem.eql(cursor, "null") {
+            let saved: MutSpan<u8> = app.mcpCursor
+            if app.mcpPage >= 31 || std.mem.eql(bytes(saved), cursor) {
+                mcpFailure(app, "Error: MCP pagination did not finish.")
+                return
+            }
+            setText(saved, cursor)
+            if !bufOk(saved) {
+                mcpFailure(app, "Error: MCP pagination cursor is too large.")
+                return
+            }
+            var paramsStorage: [4096]u8 = [0_u8; 4096]
+            let params: MutSpan<u8> = buffer(paramsStorage)
+            append(params, "{\"cursor\":")
+            append(params, cursor)
+            put(params, 125_u8)
+            app.mcpPage = app.mcpPage + 1
+            sendMcp(app, "tools/list", bytes(params))
+            return
+        }
+        var nameStorage: [80]u8 = [0_u8; 80]
+        let name: MutSpan<u8> = buffer(nameStorage)
+        if decode(name, field(mcpServer(app, app.mcpIndex), "name")) {
+            logEntry(app, "  MCP CONNECTED", bytes(name))
+        }
+        app.mcpStage = 0
+        if app.mcpConnectAll && app.mcpIndex + 1 < app.mcpCount {
+            connectMcp(app, app.mcpIndex + 1)
+        } else {
+            app.phase = 0
+            app.mcpConnectAll = false
+        }
+        return
+    }
+    if app.mcpStage == 3 {
+        mcpCallResult(app, result)
+    }
+}
+
+fn pollIdleMcp(app: mutref<App>, index: usize) -> Void {
+    let child: ProcChild = mcpChild(app, index)
+    let incoming: MutSpan<u8> = mcpBuffer(app, index)
+    var chunk: [4096]u8 = [0_u8; 4096]
+    let room: usize = capacity(incoming) - bufLen(incoming)
+    var size: usize = 4096
+    if room < size {
+        size = room
+    }
+    if size > 0 {
+        let count: Maybe<usize> = std.proc.readStdout(child, chunk[..size])
+        if count.has {
+            append(incoming, std.mem.prefix(chunk, count.value))
+        }
+    }
+    var replyStorage: [2048]u8 = [0_u8; 2048]
+    let response: MutSpan<u8> = buffer(replyStorage)
+    var messages: usize = 0
+    while messages < 16 {
+        let end: usize = lineStop(bytes(incoming), 0_usize)
+        if end >= bufLen(incoming) {
+            break
+        }
+        let message: Span<u8> = std.str.trimAscii(slice(bytes(incoming), 0_usize, end))
+        if std.mem.len(message) > 0 && !std.json.validateBytes(message) {
+            disconnectMcp(app, index)
+            logEntry(app, "  MCP", "Disconnected an MCP server that sent invalid JSON.")
+            return
+        }
+        let method: Span<u8> = field(message, "method")
+        let id: Span<u8> = field(message, "id")
+        if !std.mem.eql(method, "null") && !std.mem.eql(id, "null") {
+            clear(response)
+            append(response, "{\"jsonrpc\":\"2.0\",\"id\":")
+            append(response, id)
+            if std.mem.eql(method, "\"ping\"") {
+                append(response, ",\"result\":{}}\n")
+            } else {
+                append(response, ",\"error\":{\"code\":-32601,\"message\":\"Client capability not supported\"}}\n")
+            }
+            if !bufOk(response) {
+                disconnectMcp(app, index)
+                return
+            }
+            let sent: Maybe<usize> = std.proc.writeStdin(child, bytes(response))
+            if !sent.has {
+                disconnectMcp(app, index)
+                return
+            }
+            if sent.value != bufLen(response) {
+                disconnectMcp(app, index)
+                return
+            }
+        }
+        if std.mem.eql(method, "\"notifications/tools/list_changed\"") {
+            logEntry(app, "  MCP", "A server's tools changed. Use /mcp connect NAME to refresh its catalog.")
+        }
+        var at: usize = end + 1
+        let length: usize = bufLen(incoming)
+        while at < length {
+            incoming[at - end - 1] = incoming[at]
+            at = at + 1
+        }
+        setLen(incoming, length - end - 1)
+        messages = messages + 1
+    }
+    if bufLen(incoming) == capacity(incoming) || !std.proc.running(child) {
+        disconnectMcp(app, index)
+        logEntry(app, "  MCP", "An MCP server disconnected. Use /mcp to inspect connections.")
+    }
+}
+
+fn pollMcp(app: mutref<App>) -> Void {
+    var chunk: [4096]u8 = [0_u8; 4096]
+    var index: usize = 0
+    while index < app.mcpCount {
+        let child: ProcChild = mcpChild(app, index)
+        if std.proc.childValid(child) {
+            var drain: usize = 0
+            while drain < 8 {
+                let count: Maybe<usize> = std.proc.readStderr(child, chunk)
+                if count.has {
+                    if count.value == 0 {
+                        break
+                    }
+                    drain = drain + 1
+                } else {
+                    break
+                }
+            }
+            if app.mcpStage == 0 || app.mcpIndex != index {
+                pollIdleMcp(app, index)
+            }
+        }
+        index = index + 1
+    }
+    if app.mcpStage == 0 {
+        return
+    }
+    let child: ProcChild = mcpChild(app, app.mcpIndex)
+    let tx: MutSpan<u8> = app.mcpTx
+    let incoming: MutSpan<u8> = mcpBuffer(app, app.mcpIndex)
+    if app.mcpSent < bufLen(tx) {
+        let count: Maybe<usize> = std.proc.writeStdin(child, std.mem.dropPrefix(bytes(tx), app.mcpSent))
+        if count.has {
+            app.mcpSent = app.mcpSent + count.value
+        }
+    }
+    var drain: usize = 0
+    while drain < 16 {
+        let room: usize = capacity(incoming) - bufLen(incoming)
+        if room == 0 {
+            break
+        }
+        var size: usize = 4096
+        if room < size {
+            size = room
+        }
+        let count: Maybe<usize> = std.proc.readStdout(child, chunk[..size])
+        if count.has {
+            if count.value == 0 {
+                break
+            }
+            append(incoming, std.mem.prefix(chunk, count.value))
+            drain = drain + 1
+        } else {
+            break
+        }
+    }
+    if !bufOk(incoming) {
+        mcpFailure(app, "Error: MCP response exceeds the 64 KiB message limit.")
+        return
+    }
+    var lineStorage: [65552]u8 = [0_u8; 65552]
+    let line: MutSpan<u8> = buffer(lineStorage)
+    var messages: usize = 0
+    let pendingId: usize = app.mcpRequest
+    while messages < 32 {
+        let end: usize = lineStop(bytes(incoming), 0_usize)
+        if end >= bufLen(incoming) {
+            if bufLen(incoming) == capacity(incoming) {
+                mcpFailure(app, "Error: MCP message exceeds 64 KiB.")
+                return
+            }
+            break
+        }
+        setText(line, std.str.trimAscii(slice(bytes(incoming), 0_usize, end)))
+        var at: usize = end + 1
+        let length: usize = bufLen(incoming)
+        while at < length {
+            incoming[at - end - 1] = incoming[at]
+            at = at + 1
+        }
+        setLen(incoming, length - end - 1)
+        if bufLen(line) > 0 {
+            if !std.json.validateBytes(bytes(line)) {
+                mcpFailure(app, "Error: MCP stdout contains invalid JSON. Server logs must use stderr.")
+                return
+            }
+            mcpReply(app, bytes(line))
+        }
+        if app.mcpSent < bufLen(tx) {
+            return
+        }
+        if app.mcpStage == 0 || pendingId != app.mcpRequest {
+            return
+        }
+        messages = messages + 1
+    }
+    if !std.proc.running(child) {
+        mcpFailure(app, "Error: MCP server exited before returning a complete response.")
+        return
+    }
+    if std.time.hasElapsed(app.started, std.time.monotonic(), std.time.seconds(60)) {
+        mcpFailure(app, "Error: MCP request timed out after 60 seconds.")
+    }
+}
+
+fn callMcpTool(app: mutref<App>) -> Void {
+    let name: MutSpan<u8> = app.toolName
+    let arguments: MutSpan<u8> = app.arguments
+    let entry: Span<u8> = mcpTool(app, bytes(name))
+    let server: Maybe<u32> = std.parse.parseU32(field(entry, "server"))
+    if !server.has {
+        toolResult(app, "Error: MCP tool is no longer available. Reconnect the server with /mcp connect.")
+        return
+    }
+    if !std.proc.childValid(mcpChild(app, server.value as usize)) || !std.proc.running(mcpChild(app, server.value as usize)) {
+        disconnectMcp(app, server.value as usize)
+        toolResult(app, "Error: MCP server disconnected. Reconnect it before retrying.")
+        return
+    }
+    var paramsStorage: [18432]u8 = [0_u8; 18432]
+    let params: MutSpan<u8> = buffer(paramsStorage)
+    append(params, "{\"name\":")
+    append(params, field(entry, "remote"))
+    append(params, ",\"arguments\":")
+    append(params, bytes(arguments))
+    put(params, 125_u8)
+    if !bufOk(params) {
+        toolResult(app, "Error: MCP tool arguments exceed the size limit.")
+        return
+    }
+    app.mcpIndex = server.value as usize
+    app.mcpStage = 3
+    app.phase = 5
+    app.view = 0
+    sendMcp(app, "tools/call", bytes(params))
+}
+
+fn showMcp(app: mutref<App>) -> Void {
+    let output: MutSpan<u8> = app.scratch
+    let tools: MutSpan<u8> = app.mcpTools
+    var nameStorage: [96]u8 = [0_u8; 96]
+    let name: MutSpan<u8> = buffer(nameStorage)
+    clear(output)
+    var index: usize = 0
+    while index < app.mcpCount {
+        if decode(name, field(mcpServer(app, index), "name")) {
+            append(output, bytes(name))
+        }
+        if std.proc.childValid(mcpChild(app, index)) && std.proc.running(mcpChild(app, index)) {
+            append(output, " — connected\n")
+        } else {
+            append(output, " — disconnected\n")
+        }
+        index = index + 1
+    }
+    if app.mcpCount == 0 {
+        append(output, "No servers configured. Add mcpServers to .mcp.json.\n")
+    }
+    index = 0
+    while index < 128 {
+        let entry: Span<u8> = arrayItem(bytes(tools), index)
+        if std.mem.eql(entry, "null") {
+            break
+        }
+        if decode(name, field(entry, "name")) {
+            append(output, "  ")
+            append(output, bytes(name))
+            put(output, 10_u8)
+        }
+        index = index + 1
+    }
+    append(output, "\n/mcp connect NAME|all  /mcp disconnect NAME|all\n/mcp reload rereads configuration. MCP tools require approval.")
+    logEntry(app, "  MCP SERVERS", bytes(output))
+}
+
+fn mcpCommand(app: mutref<App>, command: Span<u8>) -> Void {
+    if std.mem.eql(command, "/mcp") || std.mem.eql(command, "/mcp list") {
+        showMcp(app)
+        return
+    }
+    if std.mem.eql(command, "/mcp reload") {
+        disconnectAllMcp(app)
+        let loaded: Bool = loadMcpConfig(app)
+        showMcp(app)
+        return
+    }
+    if std.str.startsWith(command, "/mcp connect ") {
+        beginMcp(app, std.str.trimAscii(std.mem.dropPrefix(command, 13_usize)))
+        return
+    }
+    if std.str.startsWith(command, "/mcp disconnect ") {
+        let selected: Span<u8> = std.str.trimAscii(std.mem.dropPrefix(command, 16_usize))
+        if std.mem.eql(selected, "all") {
+            disconnectAllMcp(app)
+            logEntry(app, "  MCP", "All MCP servers disconnected.")
+            return
+        }
+        var storage: [80]u8 = [0_u8; 80]
+        let name: MutSpan<u8> = buffer(storage)
+        var index: usize = 0
+        while index < app.mcpCount {
+            if decode(name, field(mcpServer(app, index), "name")) && std.mem.eql(bytes(name), selected) {
+                disconnectMcp(app, index)
+                logEntry(app, "  MCP DISCONNECTED", bytes(name))
+                return
+            }
+            index = index + 1
+        }
+    }
+    logEntry(app, "  MCP", "Use /mcp connect NAME|all, /mcp disconnect NAME|all, or /mcp reload.")
+}
+
+fn mcpChild(app: ref<App>, index: usize) -> ProcChild {
+    if index == 0 {
+        return app.mcpChild0
+    }
+    if index == 1 {
+        return app.mcpChild1
+    }
+    if index == 2 {
+        return app.mcpChild2
+    }
+    return app.mcpChild3
+}
+
+fn mcpBuffer(app: ref<App>, index: usize) -> MutSpan<u8> {
+    if index == 0 {
+        return app.mcpRx0
+    }
+    if index == 1 {
+        return app.mcpRx1
+    }
+    if index == 2 {
+        return app.mcpRx2
+    }
+    return app.mcpRx3
+}
+
+fn setMcpChild(app: mutref<App>, index: usize, child: ProcChild) -> Void {
+    if index == 0 {
+        app.mcpChild0 = child
+    }
+    if index == 1 {
+        app.mcpChild1 = child
+    }
+    if index == 2 {
+        app.mcpChild2 = child
+    }
+    if index == 3 {
+        app.mcpChild3 = child
+    }
+}

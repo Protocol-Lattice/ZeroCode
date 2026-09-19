@@ -1,33 +1,43 @@
 # zero-coding
 
-A terminal user interface (TUI) framework built with **Zero** — a custom programming language designed for creating high-performance terminal applications.
+A terminal coding assistant built with **Zero**, with native file tools, streaming model responses, MCP servers, and project skills.
 
 ## Overview
 
-`zero-coding` is a minimalistic TUI toolkit written in the **Zero** language. It provides a lightweight foundation for building interactive command-line interfaces, chat agents, and other terminal-based applications. The project includes:
+`zero-coding` runs coding tasks in your current workspace. The project includes:
 
 - **Zero compiler** – compiles Zero source into a standalone binary (`zero-coding`)
-- **Native backend** – uses `native/exit.h` for low-level terminal operations
+- **Native transport** – a small C worker uses system libcurl; Zero parses responses and controls tool execution
 - **Test suite** – black-box tests for the compiled Zero executable
 - **Build system** – `Makefile` for cross-compilation targets
 
 ## Features
 
 - **Lightweight** – native executable using the system libcurl for HTTP/TLS
-- **Zero runtime** – compiled directly to native code via the Zero compiler
+- **Native execution** – compiled directly to native code via the Zero compiler
 - **Agent integration** – supports multiple LLM providers (OpenAI, Claude, Gemini, OpenRouter)
-- **Cross-compilation** – targets Linux musl x64, host development, etc.
-- **Self-contained** – produces a single distributable binary
+- **Streaming** – incremental text and tool-call deltas for all four providers, with cancellation
+- **Large files** – UTF-8 range reads and approved edits of files up to 64 MiB
+- **Bounded context** – automatic shortening of old tool output and a digest of older exchanges
+- **Host builds** – Linux and macOS builds using the pinned Zero compiler and system libcurl
 
 ## Project Structure
 
 ```
 zero-coding/
-├── src/main.0          # Main Zero source (TUI framework)
-├── tests/test_agent.py # Unit tests for the Zero binary
-├── zero.c              # Compiled entry point (generated)
+├── src/main.0          # Application state, task loop, approvals, startup
+├── src/buffers.0       # Bounded buffers, JSON and UTF-8 helpers
+├── src/workspace.0     # Path checks, range reads and atomic file edits
+├── src/providers.0     # Provider configuration and request/response mapping
+├── src/streaming.0     # SSE parsing and incremental message assembly
+├── src/context.0       # History, tool results and automatic compaction
+├── src/mcp.0           # Persistent MCP stdio connections
+├── src/skills.0        # Skill discovery and loading
+├── src/ui.0            # Terminal rendering and keyboard input
+├── native/http_stream.c # HTTP transport worker
+├── tests/              # Black-box tests of the compiled binary
 ├── zero.toml           # Package manifest
-├── zero.graph          # Dependency graph
+├── zero.graph          # Canonical Zero program graph
 ├── Makefile            # Build automation
 ├── install.sh          # Linux/macOS installer for the zero-coding command
 ├── scripts/
@@ -183,7 +193,7 @@ CI runs the build, tests, and an installation smoke test on Linux and macOS.
 
 ### Providers
 
-The Zero compiler supports four LLM providers out of the box:
+The application supports four LLM providers:
 
 | Provider | Model | Endpoint |
 |----------|-------|----------|
@@ -214,6 +224,42 @@ The Zero compiler supports four LLM providers out of the box:
 # Connect to OpenRouter (free tier)
 ./dist/zero-coding --provider openrouter --model any/custom-model-id
 ```
+
+## Streaming, files, and conversation limits
+
+Requests enable streaming. Text appears while the model responds, in both the
+TUI and `--prompt` mode. Tool arguments and provider metadata are assembled across
+SSE events; tools run only after the response completes successfully. `Esc`
+cancels the worker and restores the conversation to the beginning of the task.
+Providers that return ordinary JSON are also supported. An incomplete stream,
+invalid JSON, or an HTTP/transport error ends the task without executing partial
+tool calls. The transport allows 8 MiB of incoming data, with 64 KiB per SSE event
+and a 96 KiB assembled response buffer.
+
+`read_file` accepts optional byte `offset` and `limit` arguments. Small files keep
+the original plain-text result when these arguments are omitted. Large files or
+explicit ranges return an object containing `content`, `offset`, `next_offset`,
+`total_bytes`, and `truncated`. Follow `next_offset` to continue reading. Range
+boundaries preserve UTF-8 characters. The default range is 8,192 bytes; `limit`
+accepts 4–12,000 bytes. Heavily escaped content may require a smaller range.
+
+`edit_file` can replace one unique text fragment in a UTF-8 file up to 64 MiB.
+It previews the old and new fragment, checks a fingerprint of the entire file
+again after approval, and writes through an adjacent temporary file before an
+atomic rename. Existing permissions are preserved. Changes elsewhere in the file
+invalidate the preview. `write_file` still accepts at most 12 KiB of complete file
+content; existing per-call argument and result limits apply. Workspace path,
+symlink, secret-file, and ignore checks apply to both small and large files.
+
+Before history fills its buffer, the client shortens older tool results. If that
+is insufficient, it replaces older exchanges with a local digest and retains the
+current user request and recent complete tool exchanges. Tool-call IDs remain
+paired with their results, including during multi-tool batches. A
+`CONTEXT COMPACTED` notice marks this operation. This is deterministic, lossy
+compaction based on byte budgets, without an extra model request: omitted details
+may need to be read again. It does not calculate a provider-specific token window.
+If the active request, tool batch, or tool catalog alone exceeds the available
+space, the client reports an error and asks for a smaller task or catalog.
 
 ## MCP servers
 
@@ -308,14 +354,28 @@ path checks, and symlink restrictions also apply to skills. Loading a skill does
 not run its scripts or grant approvals: scripts use the existing approved
 `run_command` flow. Skill instructions remain subordinate to the user's task.
 
-Both MCP and skills are implemented in Zero and exported into `src/main.0` from
-the canonical `zero.graph` program graph.
+Both MCP and skills are implemented in Zero, in `src/mcp.0` and `src/skills.0`.
 
 ## Development
 
-- **Source**: `src/main.0` – The core TUI framework written in Zero
-- **Tests**: `tests/test_agent.py` – Black-box tests exercising the compiled binary
+- **Source**: `src/main.0` is the entry point; modules group code by responsibility
+- **Tests**: `tests/` covers providers, file operations, streaming, context compaction, extensions, and installation
 - **Build**: `Makefile` – Handles compilation and distribution
+
+After editing the source projection, synchronize and validate the program graph:
+
+```sh
+.tools/bin/zero import .
+make test
+.tools/bin/zero verify-projection .
+```
+
+Keep both `src/` and `zero.graph` in version control. Zero's package modules share
+the package namespace. The startup buffer frames restore caller-owned spans
+before returning, and are ordered from their dependencies outward for the pinned
+compiler's bounded provenance analysis. The streaming JSON merger uses an
+explicit stack to avoid recursive mutable borrows and stays within the direct
+ARM64 backend's eight ABI argument slots.
 
 ## License
 

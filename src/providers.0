@@ -1,0 +1,348 @@
+fn providerName(provider: usize) -> String {
+    if provider == 1 {
+        return "OpenAI"
+    }
+    if provider == 2 {
+        return "Claude"
+    }
+    if provider == 3 {
+        return "Gemini"
+    }
+    return "OpenRouter"
+}
+
+fn providerSlug(provider: usize) -> String {
+    if provider == 1 {
+        return "openai"
+    }
+    if provider == 2 {
+        return "claude"
+    }
+    if provider == 3 {
+        return "gemini"
+    }
+    return "openrouter"
+}
+
+fn keyVariable(provider: usize) -> String {
+    if provider == 1 {
+        return "OPENAI_API_KEY"
+    }
+    if provider == 2 {
+        return "ANTHROPIC_API_KEY"
+    }
+    if provider == 3 {
+        return "GEMINI_API_KEY"
+    }
+    return "OPENROUTER_API_KEY"
+}
+
+fn defaultModel(provider: usize) -> String {
+    if provider == 1 {
+        return "gpt-5.4"
+    }
+    if provider == 2 {
+        return "claude-sonnet-4-6"
+    }
+    if provider == 3 {
+        return "gemini-3.8-flash"
+    }
+    return "openrouter/free"
+}
+
+fn defaultEndpoint(provider: usize) -> String {
+    if provider == 1 {
+        return "https://api.openai.com/v1/chat/completions"
+    }
+    if provider == 2 {
+        return "https://api.anthropic.com/v1/messages"
+    }
+    if provider == 3 {
+        return "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+    }
+    return "https://openrouter.ai/api/v1/chat/completions"
+}
+
+fn usageCount(app: mutref<App>, payload: Span<u8>) -> Void {
+    let usage: Span<u8> = field(payload, "usage")
+    let total: Maybe<u32> = std.json.u32(usage, "total_tokens")
+    if total.has {
+        app.tokens = app.tokens + total.value as usize
+    } else {
+        let input: Maybe<u32> = std.json.u32(usage, "input_tokens")
+        let output: Maybe<u32> = std.json.u32(usage, "output_tokens")
+        if input.has {
+            app.tokens = app.tokens + input.value as usize
+        }
+        if output.has {
+            app.tokens = app.tokens + output.value as usize
+        }
+    }
+}
+
+fn configureProvider(app: mutref<App>, provider: usize) -> Void {
+    let historyData: MutSpan<u8> = app.history
+    let modelData: MutSpan<u8> = app.model
+    let keyData: MutSpan<u8> = app.key
+    let endpointData: MutSpan<u8> = app.endpoint
+    app.provider = provider
+    setText(modelData, defaultModel(provider))
+    setText(endpointData, std.env.getOr("ZERO_API_URL", defaultEndpoint(provider)))
+    let erased: usize = std.mem.fill(keyData, 0_u8)
+    setText(keyData, std.env.getOr(keyVariable(provider), ""))
+    if provider == 3 && bufLen(keyData) == 0 {
+        setText(keyData, std.env.getOr("GOOGLE_API_KEY", ""))
+    }
+    clear(historyData)
+    app.turn = 0
+}
+
+fn selectedSystem(enabled: Bool) -> String {
+    if enabled {
+        return systemPrompt()
+    }
+    return "You are Zero, a concise coding assistant in a terminal. Tool use is disabled. Answer in text and never claim to have read files, edited the workspace or run commands."
+}
+
+fn requestBody(app: mutref<App>) -> Void {
+    let historyData: MutSpan<u8> = app.history
+    let modelData: MutSpan<u8> = app.model
+    let scratchData: MutSpan<u8> = app.scratch
+    buildSystemContext(app)
+    let system: MutSpan<u8> = app.systemContext
+    clear(scratchData)
+    append(scratchData, "{\"model\":")
+    quoted(scratchData, bytes(modelData))
+    if app.provider == 2 {
+        append(scratchData, ",\"max_tokens\":4096,\"system\":")
+        quoted(scratchData, bytes(system))
+        append(scratchData, ",\"messages\":[")
+    } else {
+        if app.provider == 1 {
+            append(scratchData, ",\"max_completion_tokens\":8192")
+        } else {
+            append(scratchData, ",\"max_tokens\":8192")
+        }
+        append(scratchData, ",\"messages\":[{\"role\":\"system\",\"content\":")
+        quoted(scratchData, bytes(system))
+        append(scratchData, "},")
+    }
+    append(scratchData, bytes(historyData))
+    put(scratchData, 93_u8)
+    if app.toolsEnabled {
+        append(scratchData, ",\"tools\":")
+        appendTools(scratchData, app.provider, app)
+    }
+    append(scratchData, ",\"stream\":true}")
+}
+
+fn receiveResponse(app: mutref<App>) -> Void {
+    let historyData: MutSpan<u8> = app.history
+    let pendingData: MutSpan<u8> = app.pending
+    let responseData: MutSpan<u8> = app.response
+    let scratchData: MutSpan<u8> = app.scratch
+    let response: Span<u8> = bytes(responseData)
+    let newline: usize = std.str.indexOf(response, "\n")
+    if newline >= std.mem.len(response) {
+        failTurn(app, "The HTTP worker returned an invalid response.")
+        return
+    }
+    let status: Maybe<u32> = std.parse.parseU32(slice(response, 0_usize, newline))
+    let payload: Span<u8> = slice(response, newline + 1, std.mem.len(response))
+    if !std.json.validateBytes(payload) {
+        failTurn(app, "Provider returned invalid JSON or an oversized response.")
+        return
+    }
+    if !status.has {
+        failTurn(app, "No HTTP status was returned.")
+        return
+    }
+    if status.value < 200 || status.value >= 300 {
+        let found: Bool = decode(scratchData, field(field(payload, "error"), "message"))
+        if found {
+            failTurn(app, bytes(scratchData))
+        } else {
+            failTurn(app, "Provider request failed. Check the API key, model ID, endpoint and account limits.")
+        }
+        return
+    }
+    if !ensureHistorySpace(app, std.mem.len(payload) + 512) {
+        failTurn(app, "The current model response is too large to retain safely. Retry with a smaller output.")
+        return
+    }
+    usageCount(app, payload)
+    clear(pendingData)
+    clear(scratchData)
+    if app.provider == 2 {
+        let content: Span<u8> = field(payload, "content")
+        if std.mem.eql(content, "null") {
+            failTurn(app, "Claude response did not contain content.")
+            return
+        }
+        if bufLen(historyData) > 0 {
+            put(historyData, 44_u8)
+        }
+        append(historyData, "{\"role\":\"assistant\",\"content\":")
+        append(historyData, content)
+        put(historyData, 125_u8)
+        put(pendingData, 91_u8)
+        var index: usize = 0
+        var tools: usize = 0
+        while index < 128 {
+            let item: Span<u8> = arrayItem(content, index)
+            if std.mem.eql(item, "null") {
+                break
+            }
+            if std.mem.eql(field(item, "type"), "\"text\"") {
+                var textStorage: [98304]u8 = [0_u8; 98304]
+                var text: MutSpan<u8> = buffer(textStorage)
+                if decode(text, field(item, "text")) {
+                    append(scratchData, bytes(text))
+                    put(scratchData, 10_u8)
+                }
+            }
+            if std.mem.eql(field(item, "type"), "\"tool_use\"") {
+                if tools > 0 {
+                    put(pendingData, 44_u8)
+                }
+                append(pendingData, item)
+                tools = tools + 1
+            }
+            index = index + 1
+        }
+        put(pendingData, 93_u8)
+        if std.mem.eql(field(payload, "stop_reason"), "\"max_tokens\"") {
+            failTurn(app, "Claude hit its output limit. Retry with a smaller task.")
+            return
+        }
+    } else {
+        let firstChoice: Span<u8> = arrayItem(field(payload, "choices"), 0_usize)
+        let message: Span<u8> = field(firstChoice, "message")
+        if std.mem.eql(message, "null") {
+            failTurn(app, "Provider response did not contain an assistant message.")
+            return
+        }
+        if std.mem.eql(field(firstChoice, "finish_reason"), "\"length\"") {
+            failTurn(app, "Model reached its output limit. Retry with a smaller task or another model.")
+            return
+        }
+        if bufLen(historyData) > 0 {
+            put(historyData, 44_u8)
+        }
+        append(historyData, message)
+        let decoded: Bool = decode(scratchData, field(message, "content"))
+        let calls: Span<u8> = field(message, "tool_calls")
+        if std.mem.eql(calls, "null") {
+            append(pendingData, "[]")
+        } else {
+            append(pendingData, calls)
+        }
+    }
+    if bufLen(scratchData) > 0 && !app.streamVisible {
+        logEntry(app, "  ZERO", bytes(scratchData))
+    }
+    if !bufOk(historyData) || !bufOk(pendingData) {
+        failTurn(app, "Conversation or tool batch exceeded the memory limit. Use /clear.")
+        return
+    }
+    app.toolIndex = 0
+    if std.mem.eql(arrayItem(bytes(pendingData), 0_usize), "null") {
+        if bufLen(scratchData) == 0 {
+            logEntry(app, "  !  Empty response", "The model returned no text or tool calls. Try another model or a smaller prompt.")
+        }
+        app.phase = 0
+        app.exitCode = 0
+    } else {
+        app.phase = 2
+    }
+}
+
+fn startRequest(app: mutref<App>) -> Void {
+    let historyData: MutSpan<u8> = app.history
+    let keyData: MutSpan<u8> = app.key
+    let endpointData: MutSpan<u8> = app.endpoint
+    let workspaceData: MutSpan<u8> = app.workspace
+    let executableData: MutSpan<u8> = app.executable
+    let packetData: MutSpan<u8> = app.packet
+    let responseData: MutSpan<u8> = app.response
+    let errorsData: MutSpan<u8> = app.errors
+    let scratchData: MutSpan<u8> = app.scratch
+    if app.turn >= app.maxTurns {
+        failTurn(app, "Reached the request limit for this turn. Start a new task to continue.")
+        return
+    }
+    if bufLen(keyData) == 0 {
+        failTurn(app, "No API key. Use /key or export the selected provider's API key variable.")
+        return
+    }
+    if !headerSafe(bytes(keyData)) || !headerSafe(bytes(endpointData)) {
+        failTurn(app, "The API key or endpoint contains invalid control characters.")
+        return
+    }
+    if !std.str.startsWith(bytes(endpointData), "https://") && !std.str.startsWith(bytes(endpointData), "http://127.0.0.1:") && !std.str.startsWith(bytes(endpointData), "http://localhost:") {
+        failTurn(app, "Endpoints must use HTTPS. Plain HTTP is supported only on localhost for testing.")
+        return
+    }
+    requestBody(app)
+    if !bufOk(scratchData) && ensureHistorySpace(app, 65536_usize) {
+        requestBody(app)
+    }
+    if !bufOk(scratchData) || !bufOk(historyData) || !bufOk(app.systemContext) {
+        failTurn(app, "Current instructions and tool definitions exceed the request limit even after context compaction. Use fewer MCP tools or a shorter task.")
+        return
+    }
+    var headerStorage: [4096]u8 = [0_u8; 4096]
+    var targetStorage: [2304]u8 = [0_u8; 2304]
+    var headers: MutSpan<u8> = buffer(headerStorage)
+    var target: MutSpan<u8> = buffer(targetStorage)
+    append(target, "POST ")
+    append(target, bytes(endpointData))
+    if app.provider == 2 {
+        append(headers, "x-api-key: ")
+        append(headers, bytes(keyData))
+        append(headers, "\nanthropic-version: 2023-06-01")
+    } else {
+        append(headers, "Authorization: Bearer ")
+        append(headers, bytes(keyData))
+        if app.provider == 0 {
+            append(headers, "\nHTTP-Referer: https://zerolang.ai\nX-Title: Zero Coding TUI")
+        }
+    }
+    clear(packetData)
+    let envelope: Maybe<Span<u8>> = std.http.writeJsonRequestWithHeaders(packetData, bytes(target), bytes(headers), bytes(scratchData))
+    if !envelope.has {
+        failTurn(app, "Request is too large for the transport buffer.")
+        return
+    }
+    setLen(packetData, std.mem.len(envelope.value))
+    clear(scratchData)
+    append(scratchData, "--http-worker\n")
+    number(scratchData, bufLen(packetData))
+    app.child = std.proc.spawnChildArgs(bytes(executableData), bytes(scratchData), bytes(workspaceData), "")
+    if !std.proc.childValid(app.child) {
+        failTurn(app, "Unable to start the native HTTP worker.")
+        return
+    }
+    if app.turn > 0 && !app.headless {
+        logEntry(app, "  WAITING FOR MODEL", "Continuing after tool results…")
+    }
+    app.sent = 0
+    app.phase = 1
+    app.started = std.time.monotonic()
+    app.turn = app.turn + 1
+    app.streamMode = 0
+    app.httpStatus = 0
+    app.streamActive = 0
+    app.streamDone = false
+    app.streamVisible = false
+    clear(app.streamLine)
+    clear(app.streamEvent)
+    if app.provider == 2 {
+        setText(app.streamMessage, "{}")
+    } else {
+        setText(app.streamMessage, "{\"role\":\"assistant\"}")
+    }
+    clear(responseData)
+    clear(app.result)
+    clear(errorsData)
+}
