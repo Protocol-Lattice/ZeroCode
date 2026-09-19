@@ -147,7 +147,6 @@ class SessionLogTests(unittest.TestCase):
                 terminal.wait_for("Your terminal.")
                 terminal.send("Original user task\r")
                 terminal.wait_for("First completed reply.")
-                terminal.wait_for("ready", after=len(terminal.output))
                 terminal.send("/clear\r/logs\r")
                 terminal.wait_for("events.jsonl")
                 path = journals(folder)[0]
@@ -214,7 +213,6 @@ class SessionLogTests(unittest.TestCase):
                 terminal.wait_for("CONNECTED")
                 terminal.send("Reply once\r")
                 terminal.wait_for("Echo:")
-                terminal.wait_for("ready", after=len(terminal.output))
             finally:
                 terminal.close()
             path = journals(folder)[0]

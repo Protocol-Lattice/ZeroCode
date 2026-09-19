@@ -47,7 +47,8 @@ class ScalingTests(unittest.TestCase):
             with MockAPI([reply("openrouter", calls=calls), reply("openrouter", "Read ranges.")]) as api:
                 result = self.run_agent(api, directory=folder)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn("line: żółw 🐢\n", result.stdout)
+                self.assertNotIn("line: żółw 🐢\n", result.stdout)
+                self.assertIn("PARALLEL WORKERS", result.stdout)
                 self.assertNotIn(r"\u000a", result.stdout)
                 pages = [msg["content"] for msg in api.requests[1][1]["messages"] if msg["role"] == "tool"]
                 for raw in pages[:-1]:
@@ -57,7 +58,7 @@ class ScalingTests(unittest.TestCase):
                     self.assertEqual(page["truncated"], page["next_offset"] < len(content))
                 self.assertIn("past the end", pages[-1])
 
-    def test_paged_read_displays_text_without_changing_provider_payload(self):
+    def test_paged_read_displays_summary_without_changing_provider_payload(self):
         content = 'First line\nSecond line with "quotes" and żółw 🐢\nTabbed\tvalue\n'
         for provider in ("openrouter", "openai", "claude", "gemini"):
             with self.subTest(provider=provider), tempfile.TemporaryDirectory() as folder:
@@ -66,8 +67,8 @@ class ScalingTests(unittest.TestCase):
                               reply(provider, "Read finished.")]) as api:
                     result = self.run_agent(api, provider, folder)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertIn('First line\nSecond line with "quotes" and żółw 🐢\nTabbed  value\n', result.stdout)
-                    self.assertIn("[File bytes 0–", result.stdout)
+                    self.assertNotIn("First line", result.stdout)
+                    self.assertIn(f"✓ notes.txt · {len(content.encode())} B · 3 lines", result.stdout)
                     for escape in (r"\u000a", r"\u0009", r'\"', '"next_offset":'):
                         self.assertNotIn(escape, result.stdout)
                     if provider == "claude":
@@ -88,9 +89,11 @@ class ScalingTests(unittest.TestCase):
                               reply("openrouter", "Done.")]) as api:
                     result = self.run_agent(api, directory=folder)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertIn(content, result.stdout)
+                    self.assertNotIn(content, result.stdout)
+                    raw = next(msg["content"] for msg in api.requests[1][1]["messages"] if msg["role"] == "tool")
+                    self.assertEqual(json.loads(raw)["content"] if extra_args else raw, content)
 
-    def test_tui_large_file_read_renders_real_line_breaks(self):
+    def test_tui_large_file_read_renders_compact_range_metadata(self):
         content = 'First readable line\nSecond readable line\n' + 'More documentation.\n' * 2000
         with tempfile.TemporaryDirectory() as folder:
             Path(folder, "large.md").write_text(content)
@@ -101,8 +104,9 @@ class ScalingTests(unittest.TestCase):
                     terminal.wait_for("Your terminal.")
                     terminal.send("Read the file\r")
                     terminal.wait_for("Read finished.")
-                    self.assertIn(b"First readable line", terminal.output)
-                    self.assertIn(b"Second readable line", terminal.output)
+                    self.assertNotIn(b"First readable line", terminal.output)
+                    self.assertIn("✓ large.md · 40.0 KB · 5 lines in range (bytes 0–90)".encode(), terminal.output)
+                    self.assertNotIn(b"Second readable line", terminal.output)
                     self.assertNotIn(b"\\u000a", terminal.output)
                 finally:
                     terminal.close()

@@ -111,45 +111,30 @@ fn logEntry(app: mutref<App>, title: Span<u8>, text: Span<u8>) -> Void {
     displayEntry(app, title, text)
 }
 
-// Paged file reads carry JSON metadata for the model. Render their decoded
-// content for people without unescaping arbitrary source text or tool output.
+// The journal and worker transport retain raw results. Only the coordinator's
+// normal transcript uses summaries; model history receives the original bytes.
 fn logToolResult(app: mutref<App>, result: Span<u8>) -> Void {
     sessionLogEntry(app, "  TOOL RESULT", result)
-    if std.mem.eql(bytes(app.toolName), "read_file") && std.json.validateBytes(result) {
-        let fields: Maybe<usize> = std.json.objectFieldCount(result)
-        let offset: Maybe<u32> = std.json.u32(result, "offset")
-        let next: Maybe<u32> = std.json.u32(result, "next_offset")
-        let total: Maybe<u32> = std.json.u32(result, "total_bytes")
-        let truncated: Span<u8> = field(result, "truncated")
-        if fields.has && offset.has && next.has && total.has {
-            let explicitRange: Bool = !std.mem.eql(field(bytes(app.arguments), "offset"), "null") || !std.mem.eql(field(bytes(app.arguments), "limit"), "null")
-            if fields.value == 5 && next.value >= offset.value && total.value >= next.value && (explicitRange || total.value as usize > capacity(app.result)) && (std.mem.eql(truncated, "true") || std.mem.eql(truncated, "false")) {
-                var contentStorage: [12016]u8 = [0_u8; 12016]
-                let content: MutSpan<u8> = buffer(contentStorage)
-                if decode(content, field(result, "content")) && bufLen(content) == (next.value - offset.value) as usize {
-                    var viewStorage: [16400]u8 = [0_u8; 16400]
-                    let view: MutSpan<u8> = buffer(viewStorage)
-                    append(view, "[File bytes ")
-                    number(view, offset.value as usize)
-                    append(view, "–")
-                    number(view, next.value as usize)
-                    append(view, " of ")
-                    number(view, total.value as usize)
-                    if std.mem.eql(truncated, "true") { append(view, "; more available") }
-                    append(view, "]\n\n")
-                    append(view, bytes(content))
-                    displayEntry(app, "  TOOL RESULT", bytes(view))
-                    return
-                }
-            }
-        }
+    if app.workerMode > 0 {
+        // Workers write JSON to their private pipe, never to the terminal. Keep
+        // raw bytes here so the coordinator's journal also retains controls.
+        if bufLen(app.transcript) + std.mem.len(result) + 32 > capacity(app.transcript) { clear(app.transcript) }
+        append(app.transcript, "  TOOL RESULT\n")
+        append(app.transcript, result)
+        append(app.transcript, "\n\n")
+        return
     }
-    displayEntry(app, "  TOOL RESULT", result)
+    if app.jobsMode > 0 { return }
+    var storage: [4112]u8 = [0_u8; 4112]
+    let summary: MutSpan<u8> = buffer(storage)
+    if app.commandResult { commandResultSummary(summary, app, result) }
+    else { toolResultSummary(summary, bytes(app.toolName), bytes(app.arguments), result) }
+    displayEntry(app, "  TOOL RESULT", bytes(summary))
 }
 
 fn paint(app: mutref<App>, row: usize, col: usize, color: String, text: Span<u8>) -> Void {
     let frameData: MutSpan<u8> = app.frame
-    position(frameData, row, col)
+    framePosition(app, row, col)
     append(frameData, color)
     append(frameData, text)
 }
@@ -457,7 +442,7 @@ fn renderPicker(app: mutref<App>, rows: usize, columns: usize) -> Void {
 
 fn rule(app: mutref<App>, row: usize, width: usize) -> Void {
     let frameData: MutSpan<u8> = app.frame
-    position(frameData, row, 3_usize)
+    framePosition(app, row, 3_usize)
     append(frameData, "\x1b[38;5;239m")
     var i: usize = 0
     while i < width - 4 {
@@ -469,7 +454,24 @@ fn rule(app: mutref<App>, row: usize, width: usize) -> Void {
 fn renderTranscript(app: mutref<App>, rows: usize, columns: usize) -> Void {
     let transcriptData: MutSpan<u8> = app.transcript
     let frameData: MutSpan<u8> = app.frame
-    let text: Span<u8> = bytes(transcriptData)
+    var storage: [69648]u8 = [0_u8; 69648]
+    let conversation: MutSpan<u8> = buffer(storage)
+    append(conversation, bytes(transcriptData))
+    if app.workersVisible {
+        workerView(conversation, app, columns - 8)
+        var statusLines: usize = app.jobsCount + 3
+        var worker: usize = 0
+        while worker < app.jobsCount {
+            if workerState(app, worker) == workerError { statusLines = statusLines + 1 }
+            worker = worker + 1
+        }
+        // Preserve the historical viewport when an error adds a detail line.
+        if app.scroll > 0 && statusLines > app.workerDisplayLines {
+            app.scroll = app.scroll + statusLines - app.workerDisplayLines
+        }
+        app.workerDisplayLines = statusLines
+    }
+    let text: Span<u8> = bytes(conversation)
     let height: usize = rows - 12
     let width: usize = columns - 8
     var count: usize = 0
@@ -582,10 +584,11 @@ fn render(world: World, app: mutref<App>) -> Void raises {
         rows = 70
     }
     clear(frameData)
+    clear(app.frameIndex)
     append(frameData, "\x1b[0m\x1b[48;5;234m\x1b[38;5;252m\x1b[2J\x1b[H")
     if columns < 72 || rows < 24 {
         append(frameData, "\n  ZERO · Expand your terminal to at least 72 × 24.\n\n  Ctrl-C to exit.")
-        check world.out.write(bytes(frameData))
+        check writeFrame(world, app, rows, columns)
         return
     }
     paint(app, 2_usize, 4_usize, "\x1b[1;38;5;183m", "◇ ZERO")
@@ -619,7 +622,7 @@ fn render(world: World, app: mutref<App>) -> Void raises {
         paint(app, 16_usize, 7_usize, "\x1b[38;5;250m", "/skills       List skills  ·  /skill NAME selects one")
         paint(app, 17_usize, 7_usize, "\x1b[38;5;250m", "/memory       View, set or forget saved project facts")
         paint(app, 7_usize, 7_usize, "\x1b[38;5;245m", "↑/↓ scroll · PgUp/PgDn page · Esc cancel · Paste supported")
-    } else if bufLen(transcriptData) == 0 {
+    } else if bufLen(transcriptData) == 0 && !app.workersVisible {
         renderWelcome(app, rows, columns)
     } else {
         renderTranscript(app, rows, columns)
@@ -674,7 +677,7 @@ fn render(world: World, app: mutref<App>) -> Void raises {
     append(frameData, "\x1b[38;5;244m  /  ")
     let model: Span<u8> = bytes(modelData)
     append(frameData, slice(model, 0_usize, lineEnd(model, 0_usize, columns - 49)))
-    position(frameData, rows, columns - 28)
+    framePosition(app, rows, columns - 28)
     append(frameData, "\x1b[38;5;244m")
     number(frameData, app.toolCount)
     append(frameData, " tools · ")
@@ -682,6 +685,63 @@ fn render(world: World, app: mutref<App>) -> Void raises {
     append(frameData, " tokens")
     append(frameData, "\x1b[0m\x1b[?25l")
     if bufOk(frameData) {
-        check world.out.write(bytes(frameData))
+        check writeFrame(world, app, rows, columns)
     }
+}
+
+// Record row boundaries while composing the frame. Rendering never needs to
+// inspect transcript text or infer worker state from terminal escape sequences.
+fn framePosition(app: mutref<App>, row: usize, col: usize) -> Void {
+    let offset: usize = bufLen(app.frame)
+    put(app.frameIndex, row as u8)
+    put(app.frameIndex, (offset % 256) as u8)
+    put(app.frameIndex, (offset / 256) as u8)
+    position(app.frame, row, col)
+}
+
+fn frameRow(output: MutSpan<u8>, frame: Span<u8>, index: Span<u8>, row: usize) -> Void {
+    clear(output)
+    var at: usize = 0
+    while at + 2 < std.mem.len(index) {
+        if index[at] as usize == row {
+            let start: usize = index[at + 1] as usize + index[at + 2] as usize * 256
+            var end: usize = std.mem.len(frame)
+            if at + 5 < std.mem.len(index) { end = index[at + 4] as usize + index[at + 5] as usize * 256 }
+            append(output, slice(frame, start, end))
+        }
+        at = at + 3
+    }
+}
+
+fn writeFrame(world: World, app: mutref<App>, rows: usize, columns: usize) -> Void raises {
+    if !bufOk(app.frameIndex) { return }
+    if bufLen(app.previousFrame) == 0 || rows != app.frameRows || columns != app.frameColumns {
+        check world.out.write(bytes(app.frame))
+    } else if !std.mem.eql(bytes(app.frame), bytes(app.previousFrame)) {
+        var storage: [49152]u8 = [0_u8; 49152]
+        var currentStorage: [4096]u8 = [0_u8; 4096]
+        var previousStorage: [4096]u8 = [0_u8; 4096]
+        let changes: MutSpan<u8> = buffer(storage)
+        let current: MutSpan<u8> = buffer(currentStorage)
+        let previous: MutSpan<u8> = buffer(previousStorage)
+        var row: usize = 1
+        while row <= rows {
+            frameRow(current, bytes(app.frame), bytes(app.frameIndex), row)
+            frameRow(previous, bytes(app.previousFrame), bytes(app.previousFrameIndex), row)
+            if !std.mem.eql(bytes(current), bytes(previous)) {
+                position(changes, row, 1_usize)
+                append(changes, "\x1b[0m\x1b[48;5;234m\x1b[38;5;252m\x1b[2K")
+                append(changes, bytes(current))
+            }
+            row = row + 1
+        }
+        if bufLen(changes) > 0 && bufOk(changes) {
+            append(changes, "\x1b[0m\x1b[?25l")
+            check world.out.write(bytes(changes))
+        }
+    }
+    setText(app.previousFrame, bytes(app.frame))
+    setText(app.previousFrameIndex, bytes(app.frameIndex))
+    app.frameRows = rows
+    app.frameColumns = columns
 }

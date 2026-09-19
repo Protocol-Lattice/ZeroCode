@@ -275,6 +275,19 @@ continue while one waits for a decision. Headless runs deny mutations unless
 changes already completed remain on disk. Existing workspace, symlink, ignore,
 and stale-preview checks apply in workers too.
 
+Parallel work appears in one **PARALLEL WORKERS** section with stable `worker-N`
+rows in task order. Rows show queued, running, waiting for approval, done, error,
+or cancelled states, the active tool and path, and elapsed time. Finished rows
+retain their tool count and completion time until the group ends, then remain as
+a compact conversation summary. Worker activity preserves the scroll position
+and input, and the terminal updates only changed rows.
+
+Tool results in the normal transcript are compact summaries. File reads show the
+path, byte size, and line count; paged reads label the line count as belonging to
+the returned range. Writes show bytes written, listings show file counts, and
+errors retain a short diagnostic. Full results still reach the model and the
+local session journal, including results from parallel workers.
+
 ## Streaming, files, and conversation limits
 
 Requests enable streaming. Text appears while the model responds, in both the

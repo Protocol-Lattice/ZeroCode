@@ -1,0 +1,430 @@
+// Presentation state is owned exclusively by the coordinator event loop. Pipe
+
+// slots are stable task identities, independent of scheduler/commit state.
+
+// Named scalar states match the pinned backend's flat shape ABI.
+
+const workerQueued: usize = 0
+
+const workerRunning: usize = 1
+
+const workerWaiting: usize = 2
+
+const workerDone: usize = 3
+
+const workerError: usize = 4
+
+const workerCancelled: usize = 5
+
+const eventWorkerQueued: usize = 0
+
+const eventWorkerStarted: usize = 1
+
+const eventWorkerToolStarted: usize = 2
+
+const eventWorkerToolFinished: usize = 3
+
+const eventWorkerWaiting: usize = 4
+
+const eventWorkerResumed: usize = 5
+
+const eventWorkerCompleted: usize = 6
+
+const eventWorkerFailed: usize = 7
+
+const eventWorkerCancelled: usize = 8
+
+type WorkerStatus {
+    id: usize,
+    state: usize,
+    currentTool: MutSpan<u8>,
+    currentTarget: MutSpan<u8>,
+    error: MutSpan<u8>,
+    toolCallCount: usize,
+    toolActive: Bool,
+    hasStarted: Bool,
+    startedAt: Duration,
+    finishedAt: Duration,
+}
+
+// The pinned native backend requires flat App fields and literal record
+
+// locals. Load a typed view for the reducer without changing scheduler state.
+
+fn workerData(app: ref<App>, index: usize) -> MutSpan<u8> {
+    if index == 0 {
+        return app.workerData0
+    }
+    if index == 1 {
+        return app.workerData1
+    }
+    if index == 2 {
+        return app.workerData2
+    }
+    return app.workerData3
+}
+
+fn workerState(app: ref<App>, index: usize) -> usize {
+    if index == 0 {
+        return app.workerState0
+    }
+    if index == 1 {
+        return app.workerState1
+    }
+    if index == 2 {
+        return app.workerState2
+    }
+    return app.workerState3
+}
+
+fn loadWorkerStatus(app: ref<App>, index: usize, status: mutref<WorkerStatus>) -> Void {
+    if index == 0 {
+        status.state = app.workerState0
+        status.toolCallCount = app.workerToolCount0
+        status.toolActive = app.workerToolActive0
+        status.hasStarted = app.workerHasStarted0
+        status.startedAt = app.workerStarted0
+        status.finishedAt = app.workerFinished0
+        return
+    }
+    if index == 1 {
+        status.state = app.workerState1
+        status.toolCallCount = app.workerToolCount1
+        status.toolActive = app.workerToolActive1
+        status.hasStarted = app.workerHasStarted1
+        status.startedAt = app.workerStarted1
+        status.finishedAt = app.workerFinished1
+        return
+    }
+    if index == 2 {
+        status.state = app.workerState2
+        status.toolCallCount = app.workerToolCount2
+        status.toolActive = app.workerToolActive2
+        status.hasStarted = app.workerHasStarted2
+        status.startedAt = app.workerStarted2
+        status.finishedAt = app.workerFinished2
+        return
+    }
+    status.state = app.workerState3
+    status.toolCallCount = app.workerToolCount3
+    status.toolActive = app.workerToolActive3
+    status.hasStarted = app.workerHasStarted3
+    status.startedAt = app.workerStarted3
+    status.finishedAt = app.workerFinished3
+}
+
+fn setWorkerStatus(app: mutref<App>, index: usize, status: ref<WorkerStatus>) -> Void {
+    if index == 0 {
+        app.workerState0 = status.state
+        app.workerToolCount0 = status.toolCallCount
+        app.workerToolActive0 = status.toolActive
+        app.workerHasStarted0 = status.hasStarted
+        app.workerStarted0 = status.startedAt
+        app.workerFinished0 = status.finishedAt
+        return
+    }
+    if index == 1 {
+        app.workerState1 = status.state
+        app.workerToolCount1 = status.toolCallCount
+        app.workerToolActive1 = status.toolActive
+        app.workerHasStarted1 = status.hasStarted
+        app.workerStarted1 = status.startedAt
+        app.workerFinished1 = status.finishedAt
+        return
+    }
+    if index == 2 {
+        app.workerState2 = status.state
+        app.workerToolCount2 = status.toolCallCount
+        app.workerToolActive2 = status.toolActive
+        app.workerHasStarted2 = status.hasStarted
+        app.workerStarted2 = status.startedAt
+        app.workerFinished2 = status.finishedAt
+        return
+    }
+    app.workerState3 = status.state
+    app.workerToolCount3 = status.toolCallCount
+    app.workerToolActive3 = status.toolActive
+    app.workerHasStarted3 = status.hasStarted
+    app.workerStarted3 = status.startedAt
+    app.workerFinished3 = status.finishedAt
+}
+
+fn workerTerminal(state: usize) -> Bool {
+    return state == workerDone || state == workerError || state == workerCancelled
+}
+
+fn workerStateName(state: usize) -> String {
+    if state == workerQueued {
+        return "queued"
+    }
+    if state == workerRunning {
+        return "running"
+    }
+    if state == workerWaiting {
+        return "waiting"
+    }
+    if state == workerDone {
+        return "done"
+    }
+    if state == workerError {
+        return "error"
+    }
+    return "cancelled"
+}
+
+fn workerEventName(event: usize) -> String {
+    if event == eventWorkerQueued {
+        return "WorkerQueued"
+    }
+    if event == eventWorkerStarted {
+        return "WorkerStarted"
+    }
+    if event == eventWorkerToolStarted {
+        return "WorkerToolStarted"
+    }
+    if event == eventWorkerToolFinished {
+        return "WorkerToolFinished"
+    }
+    if event == eventWorkerWaiting {
+        return "WorkerWaiting"
+    }
+    if event == eventWorkerResumed {
+        return "WorkerResumed"
+    }
+    if event == eventWorkerCompleted {
+        return "WorkerCompleted"
+    }
+    if event == eventWorkerFailed {
+        return "WorkerFailed"
+    }
+    return "WorkerCancelled"
+}
+
+// Tool completions carry a cumulative count: duplicates cannot double count.
+
+// Terminal state ignores late lifecycle updates, except a verified process error.
+
+fn reduceWorker(status: mutref<WorkerStatus>, event: usize, message: Span<u8>, now: Duration) -> Void {
+    if event == eventWorkerQueued {
+        status.state = workerQueued
+        status.toolCallCount = 0
+        status.toolActive = false
+        status.hasStarted = false
+        status.startedAt = std.time.zero()
+        status.finishedAt = std.time.zero()
+        clear(status.currentTool)
+        clear(status.currentTarget)
+        clear(status.error)
+        return
+    }
+    if workerTerminal(status.state) && event != eventWorkerFailed {
+        return
+    }
+    if event == eventWorkerStarted {
+        if !status.hasStarted {
+            status.startedAt = now
+            status.hasStarted = true
+        }
+        status.state = workerRunning
+    } else if event == eventWorkerToolStarted {
+        let tool: Bool = decode(status.currentTool, field(message, "tool"))
+        let target: Bool = decode(status.currentTarget, field(message, "target"))
+        status.toolActive = true
+        status.state = workerRunning
+        clear(status.error)
+    } else if event == eventWorkerToolFinished {
+        let count: Maybe<u32> = std.json.u32(message, "tool_count")
+        if count.has && count.value as usize > status.toolCallCount {
+            status.toolCallCount = count.value as usize
+            status.toolActive = false
+            status.state = workerRunning
+        }
+    } else if event == eventWorkerWaiting {
+        status.state = workerWaiting
+    } else if event == eventWorkerResumed {
+        status.state = workerRunning
+    } else {
+        if !workerTerminal(status.state) {
+            status.finishedAt = now
+        }
+        status.toolActive = false
+        if event == eventWorkerCompleted {
+            status.state = workerDone
+        } else if event == eventWorkerFailed {
+            status.state = workerError
+            setText(status.error, utf8Prefix(message, 512_usize))
+        } else {
+            status.state = workerCancelled
+        }
+    }
+}
+
+fn updateWorker(app: mutref<App>, index: usize, event: usize, message: Span<u8>) -> Void {
+    let data: MutSpan<u8> = workerData(app, index)
+    var status: WorkerStatus = WorkerStatus { id: index + 1, state: workerQueued, currentTool: data[..144], currentTarget: data[144..416], error: data[416..944], toolCallCount: 0, toolActive: false, hasStarted: false, startedAt: std.time.zero(), finishedAt: std.time.zero() }
+    loadWorkerStatus(app, index, &mut status)
+    reduceWorker(&mut status, event, message, std.time.monotonic())
+    setWorkerStatus(app, index, &status)
+    var storage: [48]u8 = [0_u8; 48]
+    let title: MutSpan<u8> = buffer(storage)
+    append(title, "worker-")
+    number(title, status.id)
+    sessionLogText(app, workerEventName(event), bytes(title), message, false)
+}
+
+fn workerElapsed(status: ref<WorkerStatus>, now: Duration) -> usize {
+    if !status.hasStarted {
+        return 0
+    }
+    var end: Duration = now
+    if workerTerminal(status.state) {
+        end = status.finishedAt
+    }
+    return std.time.asMsFloor(std.time.between(status.startedAt, end)) as usize
+}
+
+// Clip by terminal cells, remove controls and keep every field on one row.
+
+fn workerLabel(output: MutSpan<u8>, text: Span<u8>, width: usize) -> Void {
+    var storage: [2064]u8 = [0_u8; 2064]
+    let clean: MutSpan<u8> = buffer(storage)
+    cleanText(clean, utf8Prefix(text, 1024_usize))
+    var i: usize = 0
+    while i < bufLen(clean) {
+        if clean[i] == 10 {
+            clean[i] = 32_u8
+        }
+        i = i + 1
+    }
+    append(output, slice(bytes(clean), 0_usize, lineEnd(bytes(clean), 0_usize, width)))
+}
+
+fn appendWorkerRows(output: MutSpan<u8>, app: ref<App>, width: usize, now: Duration) -> Void {
+    var i: usize = 0
+    while i < app.jobsCount {
+        let data: MutSpan<u8> = workerData(app, i)
+        var status: WorkerStatus = WorkerStatus { id: i + 1, state: workerQueued, currentTool: data[..144], currentTarget: data[144..416], error: data[416..944], toolCallCount: 0, toolActive: false, hasStarted: false, startedAt: std.time.zero(), finishedAt: std.time.zero() }
+        loadWorkerStatus(app, i, &mut status)
+        var storage: [2064]u8 = [0_u8; 2064]
+        let row: MutSpan<u8> = buffer(storage)
+        if status.state == workerDone {
+            append(row, "✓ ")
+        } else if status.state == workerError {
+            append(row, "✗ ")
+        } else if status.state == workerCancelled {
+            append(row, "– ")
+        } else if status.state == workerQueued || status.state == workerWaiting {
+            append(row, "○ ")
+        } else {
+            append(row, "● ")
+        }
+        append(row, "worker-")
+        number(row, status.id)
+        append(row, "   ")
+        append(row, workerStateName(status.state))
+        if status.state == workerDone || status.state == workerCancelled {
+            append(row, "   ")
+            number(row, status.toolCallCount)
+            append(row, " tools")
+        } else if status.state != workerQueued {
+            append(row, "   ")
+            if (status.toolActive || status.state == workerError) && bufLen(status.currentTool) > 0 {
+                workerLabel(row, bytes(status.currentTool), 24_usize)
+            } else {
+                append(row, "model")
+            }
+        }
+        if status.toolActive {
+            append(row, " ")
+            workerLabel(row, bytes(status.currentTarget), width - 52)
+        }
+        if status.hasStarted {
+            append(row, " · ")
+            let elapsed: usize = workerElapsed(&status, now)
+            number(row, elapsed / 1000)
+            if workerTerminal(status.state) {
+                put(row, 46_u8)
+                number(row, elapsed % 1000 / 100)
+            }
+            append(row, "s")
+        }
+        workerLabel(output, bytes(row), width)
+        put(output, 10_u8)
+        if status.state == workerError {
+            append(output, "  ")
+            workerLabel(output, bytes(status.error), width - 2)
+            put(output, 10_u8)
+        }
+        i = i + 1
+    }
+}
+
+fn workerView(output: MutSpan<u8>, app: ref<App>, width: usize) -> Void {
+    append(output, "  PARALLEL WORKERS\n\n")
+    appendWorkerRows(output, app, width, std.time.monotonic())
+    put(output, 10_u8)
+}
+
+fn finishWorkerGroup(app: mutref<App>) -> Void {
+    if !app.workersVisible {
+        return
+    }
+    var storage: [4112]u8 = [0_u8; 4112]
+    let summary: MutSpan<u8> = buffer(storage)
+    var width: usize = std.term.widthOr(100_usize)
+    if width < 72 {
+        width = 72
+    }
+    if width > 220 {
+        width = 220
+    }
+    workerView(summary, app, width - 8)
+    sessionLogEntry(app, "PARALLEL WORKERS", bytes(summary))
+    if bufLen(app.transcript) + bufLen(summary) > capacity(app.transcript) {
+        clear(app.transcript)
+    }
+    append(app.transcript, bytes(summary))
+    app.workersVisible = false
+    app.workerDisplayLines = 0
+}
+
+fn workerStatusTests() -> Void raises {
+    var firstStorage: [944]u8 = [0_u8; 944]
+    var secondStorage: [944]u8 = [0_u8; 944]
+    let firstData: MutSpan<u8> = firstStorage
+    var first: WorkerStatus = WorkerStatus { id: 1, state: workerQueued, currentTool: firstData[..144], currentTarget: firstData[144..416], error: firstData[416..944], toolCallCount: 0, toolActive: false, hasStarted: false, startedAt: std.time.zero(), finishedAt: std.time.zero() }
+    let secondData: MutSpan<u8> = secondStorage
+    var second: WorkerStatus = WorkerStatus { id: 2, state: workerQueued, currentTool: secondData[..144], currentTarget: secondData[144..416], error: secondData[416..944], toolCallCount: 0, toolActive: false, hasStarted: false, startedAt: std.time.zero(), finishedAt: std.time.zero() }
+    reduceWorker(&mut second, eventWorkerQueued, "", std.time.zero())
+    reduceWorker(&mut first, eventWorkerQueued, "", std.time.zero())
+    check assertTrue(first.state == workerQueued && !first.hasStarted)
+    reduceWorker(&mut first, eventWorkerStarted, "", std.time.seconds(1))
+    reduceWorker(&mut second, eventWorkerStarted, "", std.time.seconds(1))
+    check assertTrue(first.state == workerRunning && second.state == workerRunning)
+    reduceWorker(&mut first, eventWorkerToolStarted, "{\"tool\":\"read_file\",\"target\":\"README.md\"}", std.time.seconds(1))
+    reduceWorker(&mut second, eventWorkerToolStarted, "{\"tool\":\"write_file\",\"target\":\"src/main.0\"}", std.time.seconds(1))
+    var count: usize = 0
+    while count < 40 {
+        reduceWorker(&mut first, eventWorkerToolFinished, "{\"tool_count\":1}", std.time.seconds(2))
+        reduceWorker(&mut second, eventWorkerWaiting, "", std.time.seconds(2))
+        count = count + 1
+    }
+    check assertTrue(first.toolCallCount == 1 && second.toolCallCount == 0)
+    check assertTrue(second.state == workerWaiting)
+    reduceWorker(&mut first, eventWorkerToolStarted, "{\"tool\":\"edit_file\",\"target\":\"README.md\"}", std.time.seconds(2))
+    check assertTrue(first.id == 1 && std.mem.eql(bytes(first.currentTool), "edit_file"))
+    reduceWorker(&mut first, eventWorkerToolFinished, "{\"tool_count\":2}", std.time.seconds(2))
+    reduceWorker(&mut first, eventWorkerCompleted, "", std.time.ms(2400))
+    reduceWorker(&mut second, eventWorkerResumed, "", std.time.seconds(3))
+    check assertTrue(workerElapsed(&second, std.time.seconds(3)) == 2000)
+    reduceWorker(&mut second, eventWorkerFailed, "permission denied", std.time.ms(3700))
+    check assertTrue(first.state == workerDone && first.toolCallCount == 2)
+    check assertTrue(second.state == workerError && std.mem.eql(bytes(second.error), "permission denied"))
+    check assertTrue(workerElapsed(&first, std.time.seconds(99)) == 1400)
+    check assertTrue(workerElapsed(&second, std.time.seconds(99)) == 2700)
+    reduceWorker(&mut first, eventWorkerToolFinished, "{\"tool_count\":99}", std.time.seconds(99))
+    check assertTrue(first.toolCallCount == 2 && first.state == workerDone)
+    reduceWorker(&mut second, eventWorkerQueued, "", std.time.seconds(99))
+    reduceWorker(&mut second, eventWorkerCancelled, "", std.time.seconds(99))
+    check assertTrue(second.state == workerCancelled && workerElapsed(&second, std.time.seconds(100)) == 0)
+}

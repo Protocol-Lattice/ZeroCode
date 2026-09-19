@@ -121,9 +121,10 @@ class StreamingTests(unittest.TestCase):
                         terminal.wait_for("Early żółw", timeout=6)
                         self.assertNotIn(b"finished.", terminal.output)
                         self.assertTrue(api.requests[0][1]["stream"])
+                        after = len(terminal.output)
                         release.set()
                         terminal.wait_for("Early żółw finished.")
-                        terminal.wait_for("ready", after=len(terminal.output))
+                        terminal.wait_for("ready", after=after)
                     finally:
                         release.set()
                         restored = terminal.close()

@@ -1,0 +1,200 @@
+// Raw results are never changed here. File ranges describe only the lines that
+
+// were returned; total_bytes is the full file size, not a full-file line count.
+
+fn textLineCount(text: Span<u8>) -> usize {
+    if std.mem.len(text) == 0 {
+        return 0
+    }
+    var lines: usize = 0
+    var i: usize = 0
+    while i < std.mem.len(text) {
+        if text[i] == 10 {
+            lines = lines + 1
+        }
+        i = i + 1
+    }
+    if text[std.mem.len(text) - 1] != 10 {
+        lines = lines + 1
+    }
+    return lines
+}
+
+fn displayBytes(output: MutSpan<u8>, size: usize) -> Void {
+    if size < 1000 {
+        number(output, size)
+        append(output, " B")
+        return
+    }
+    var unit: usize = 1000
+    if size >= 1000000 {
+        unit = 1000000
+    }
+    number(output, size / unit)
+    put(output, 46_u8)
+    number(output, size % unit * 10 / unit)
+    if unit == 1000 {
+        append(output, " KB")
+    } else {
+        append(output, " MB")
+    }
+}
+
+fn toolLabel(output: MutSpan<u8>, name: Span<u8>, args: Span<u8>) -> Void {
+    workerLabel(output, name, 100_usize)
+    var storage: [16384]u8 = [0_u8; 16384]
+    let target: MutSpan<u8> = buffer(storage)
+    if decode(target, field(args, "path")) {
+        append(output, " ")
+        workerLabel(output, bytes(target), 160_usize)
+    } else if decode(target, field(args, "query")) {
+        append(output, " \"")
+        workerLabel(output, bytes(target), 100_usize)
+        put(output, 34_u8)
+    }
+}
+
+fn readResultSummary(output: MutSpan<u8>, args: Span<u8>, result: Span<u8>) -> Void {
+    var pathStorage: [2048]u8 = [0_u8; 2048]
+    let path: MutSpan<u8> = buffer(pathStorage)
+    if decode(path, field(args, "path")) {
+        workerLabel(output, bytes(path), 160_usize)
+    } else {
+        append(output, "file")
+    }
+    append(output, " · ")
+    var contentStorage: [12016]u8 = [0_u8; 12016]
+    let content: MutSpan<u8> = buffer(contentStorage)
+    let fields: Maybe<usize> = std.json.objectFieldCount(result)
+    let offset: Maybe<u32> = std.json.u32(result, "offset")
+    let next: Maybe<u32> = std.json.u32(result, "next_offset")
+    let total: Maybe<u32> = std.json.u32(result, "total_bytes")
+    let truncated: Span<u8> = field(result, "truncated")
+    if fields.has && offset.has && next.has && total.has {
+        let explicitRange: Bool = !std.mem.eql(field(args, "offset"), "null") || !std.mem.eql(field(args, "limit"), "null")
+        if fields.value == 5 && next.value >= offset.value && total.value >= next.value && (explicitRange || total.value > 16384) && (std.mem.eql(truncated, "true") || std.mem.eql(truncated, "false")) {
+            if decode(content, field(result, "content")) && bufLen(content) == (next.value - offset.value) as usize {
+                displayBytes(output, total.value as usize)
+                append(output, " · ")
+                number(output, textLineCount(bytes(content)))
+                append(output, " lines")
+                if offset.value != 0 || next.value != total.value {
+                    append(output, " in range (bytes ")
+                    number(output, offset.value as usize)
+                    append(output, "–")
+                    number(output, next.value as usize)
+                    put(output, 41_u8)
+                }
+                return
+            }
+        }
+    }
+    displayBytes(output, std.mem.len(result))
+    append(output, " · ")
+    number(output, textLineCount(result))
+    append(output, " lines")
+}
+
+fn toolResultSummary(output: MutSpan<u8>, name: Span<u8>, args: Span<u8>, result: Span<u8>) -> Void {
+    if std.str.startsWith(result, "Skipped:") {
+        append(output, "– ")
+        workerLabel(output, result, 240_usize)
+        return
+    }
+    if std.str.startsWith(result, "Error:") {
+        append(output, "✗ ")
+        workerLabel(output, result, 240_usize)
+        return
+    }
+    append(output, "✓ ")
+    if std.mem.eql(name, "read_file") {
+        readResultSummary(output, args, result)
+    } else if std.mem.eql(name, "write_file") {
+        var writeStorage: [16400]u8 = [0_u8; 16400]
+        let content: MutSpan<u8> = buffer(writeStorage)
+        if decode(content, field(args, "content")) {
+            append(output, "wrote ")
+            displayBytes(output, bufLen(content))
+        } else {
+            append(output, "file written")
+        }
+    } else if std.mem.eql(name, "edit_file") {
+        append(output, "edited ")
+        var editStorage: [2048]u8 = [0_u8; 2048]
+        let path: MutSpan<u8> = buffer(editStorage)
+        if decode(path, field(args, "path")) {
+            workerLabel(output, bytes(path), 160_usize)
+        } else {
+            append(output, "file")
+        }
+    } else if std.mem.eql(name, "search") {
+        let count: Maybe<usize> = std.json.arrayCount(field(result, "matches"))
+        if count.has {
+            number(output, count.value)
+            append(output, " matches")
+            return
+        }
+        append(output, "result · ")
+        displayBytes(output, std.mem.len(result))
+    } else {
+        append(output, "result · ")
+        displayBytes(output, std.mem.len(result))
+    }
+}
+
+fn commandResultSummary(output: MutSpan<u8>, app: ref<App>, result: Span<u8>) -> Void {
+    if app.commandExitCode != 0 {
+        append(output, "✗ command · exit ")
+        var storage: [32]u8 = [0_u8; 32]
+        let code: Maybe<Span<u8>> = std.fmt.i32(storage, app.commandExitCode)
+        if code.has {
+            append(output, code.value)
+        }
+        append(output, " · ")
+        if bufLen(app.errors) > 0 {
+            workerLabel(output, bytes(app.errors), 200_usize)
+        } else {
+            workerLabel(output, slice(result, 0_usize, app.commandOutputBytes), 200_usize)
+        }
+    } else if std.mem.eql(bytes(app.toolName), "list_files") {
+        append(output, "✓ ")
+        number(output, textLineCount(slice(result, 0_usize, app.commandOutputBytes)))
+        append(output, " files")
+    } else {
+        append(output, "✓ result · ")
+        displayBytes(output, app.commandOutputBytes)
+    }
+    append(output, " · ")
+    number(output, app.commandElapsedMs / 1000)
+    put(output, 46_u8)
+    number(output, app.commandElapsedMs % 1000 / 100)
+    append(output, "s")
+}
+
+fn toolDisplayTests() -> Void raises {
+    var storage: [4112]u8 = [0_u8; 4112]
+    let summary: MutSpan<u8> = buffer(storage)
+    check assertTrue(textLineCount("") == 0)
+    check assertTrue(textLineCount("a\r\nb\n") == 2)
+    check assertTrue(textLineCount("żółw\nlast") == 2)
+    toolResultSummary(summary, "read_file", "{\"path\":\"notes.txt\"}", "żółw\nlast")
+    check assertTrue(std.mem.eql(bytes(summary), "✓ notes.txt · 12 B · 2 lines"))
+    clear(summary)
+    toolResultSummary(summary, "read_file", "{\"path\":\"empty\"}", "")
+    check assertTrue(std.mem.eql(bytes(summary), "✓ empty · 0 B · 0 lines"))
+    clear(summary)
+    toolResultSummary(summary, "read_file", "{\"path\":\"notes.txt\",\"offset\":0}", "{\"content\":\"abc\\n\",\"offset\":0,\"next_offset\":4,\"total_bytes\":29100,\"truncated\":true}")
+    check assertTrue(std.mem.eql(bytes(summary), "✓ notes.txt · 29.1 KB · 1 lines in range (bytes 0–4)"))
+    clear(summary)
+    toolResultSummary(summary, "write_file", "{\"content\":\"żółw\"}", "Saved file")
+    check assertTrue(std.mem.eql(bytes(summary), "✓ wrote 7 B"))
+    clear(summary)
+    toolResultSummary(summary, "search", "{}", "{\"matches\":[1,2,3]}")
+    check assertTrue(std.mem.eql(bytes(summary), "✓ 3 matches"))
+    clear(summary)
+    toolResultSummary(summary, "unknown", "{}", "opaque")
+    check assertTrue(std.mem.eql(bytes(summary), "✓ result · 6 B"))
+    clear(summary)
+    toolResultSummary(summary, "read_file", "{}", "Error: permission denied\nsecond line")
+    check assertTrue(std.mem.eql(bytes(summary), "✗ Error: permission denied second line"))
+}

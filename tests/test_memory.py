@@ -46,7 +46,8 @@ class MemoryTests(unittest.TestCase):
                     reply(provider, "Remembered.")]) as api:
                     result = self.run_agent(api, provider, folder, extra=("--approve",))
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertIn("Project memory saved", result.stdout)
+                    self.assertIn("Project memory saved", results(api.requests[1][1], provider)[-1][1])
+                    self.assertIn("✓ result ·", result.stdout)
                     self.assertIn("memory", advertised_tools(api.requests[0][1], provider))
                     self.assertIn("testing", system_text(api.requests[1][1], provider))
                 path = memory_file(folder)

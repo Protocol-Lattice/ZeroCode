@@ -369,9 +369,7 @@ fn workerQuoted(output: MutSpan<u8>, text: Span<u8>) -> Void {
     put(output, 34_u8)
 }
 
-fn workerEmit(world: World, app: mutref<App>, kind: String, text: Span<u8>) -> Void raises {
-    var storage: [114704]u8 = [0_u8; 114704]
-    let output: MutSpan<u8> = buffer(storage)
+fn workerMessage(output: MutSpan<u8>, app: ref<App>, kind: String, text: Span<u8>) -> Void {
     append(output, "{\"type\":")
     quoted(output, kind)
     append(output, ",\"text\":")
@@ -388,20 +386,59 @@ fn workerEmit(world: World, app: mutref<App>, kind: String, text: Span<u8>) -> V
     number(output, app.filesChanged)
     append(output, ",\"tokens\":")
     number(output, app.tokens)
+    append(output, ",\"tool_count\":")
+    number(output, app.workerCompletedTools)
+    append(output, ",\"tool\":")
+    quoted(output, bytes(app.toolName))
+    var targetStorage: [2048]u8 = [0_u8; 2048]
+    let target: MutSpan<u8> = buffer(targetStorage)
+    let decoded: Bool = decode(target, field(bytes(app.arguments), "path"))
+    append(output, ",\"target\":")
+    quoted(output, utf8Prefix(bytes(target), 256_usize))
     append(output, "}\n")
+}
+
+fn workerEmit(world: World, app: mutref<App>, kind: String, text: Span<u8>) -> Void raises {
+    var storage: [114704]u8 = [0_u8; 114704]
+    let output: MutSpan<u8> = buffer(storage)
+    workerMessage(output, app, kind, text)
     if !bufOk(output) {
         raise WorkerProtocolLimit
     }
     check world.out.write(bytes(output))
 }
 
+fn queueWorkerEvent(app: mutref<App>, kind: String, text: Span<u8>) -> Void {
+    workerMessage(app.workerEvents, app, kind, text)
+}
+
+fn finishWorkerTool(app: mutref<App>, result: Span<u8>) -> Void {
+    if app.workerMode == 0 || !app.workerToolActive { return }
+    app.workerToolActive = false
+    app.workerCompletedTools = app.workerCompletedTools + 1
+    queueWorkerEvent(app, "tool_finished", "")
+    // Single file workers do not append results to their own conversation.
+    // Preserve full detail in the same worker log stream as delegated tools.
+    if app.workerMode == 1 { logToolResult(app, result) }
+}
+
 fn workerFlush(world: World, app: mutref<App>) -> Void raises {
+    if !bufOk(app.workerEvents) { raise WorkerProtocolLimit }
+    if bufLen(app.workerEvents) > 0 {
+        check world.out.write(bytes(app.workerEvents))
+        clear(app.workerEvents)
+    }
     if app.phase == 4 && !app.workerApprovalSent {
         check workerEmit(world, app, "approval", bytes(app.transcript))
         app.workerApprovalSent = true
         clear(app.transcript)
     } else if bufLen(app.transcript) > 0 {
-        check workerEmit(world, app, "log", utf8Prefix(bytes(app.transcript), 12000_usize))
+        var sent: usize = 0
+        while sent < bufLen(app.transcript) {
+            let part: Span<u8> = utf8Prefix(std.mem.dropPrefix(bytes(app.transcript), sent), 12000_usize)
+            check workerEmit(world, app, "log", part)
+            sent = sent + std.mem.len(part)
+        }
         clear(app.transcript)
     }
 }
@@ -539,6 +576,9 @@ fn runWorker(world: World, app: mutref<App>) -> i32 raises {
 fn stopJobs(app: mutref<App>) -> Void {
     var i: usize = 0
     while i < 4 {
+        if app.workersVisible && i < app.jobsCount && !workerTerminal(workerState(app, i)) {
+            updateWorker(app, i, eventWorkerCancelled, "")
+        }
         sessionLogWorker(app, i, "", 2_usize)
         let child: ProcChild = jobChild(app, i)
         if std.proc.childValid(child) {
@@ -549,12 +589,14 @@ fn stopJobs(app: mutref<App>) -> Void {
         setJobState(app, i, 0_usize)
         i = i + 1
     }
+    finishWorkerGroup(app)
     app.jobsMode = 0
     app.jobsApproval = 0
     app.jobsRepeated = false
 }
 
 fn failJob(app: mutref<App>, index: usize, message: Span<u8>) -> Void {
+    updateWorker(app, index, eventWorkerFailed, message)
     sessionLogWorker(app, index, "", 2_usize)
     let child: ProcChild = jobChild(app, index)
     if std.proc.childValid(child) {
@@ -625,6 +667,7 @@ fn startJob(app: mutref<App>, index: usize) -> Void {
     setJobSent(app, index, 0_usize)
     setJobStarted(app, index, std.time.monotonic())
     setJobState(app, index, 1_usize)
+    updateWorker(app, index, eventWorkerStarted, "")
     clear(jobRx(app, index))
 }
 
@@ -638,8 +681,14 @@ fn jobEvent(app: mutref<App>, index: usize) -> Void {
     if std.mem.eql(kind, "\"log\"") {
         if decode(app.scratch, field(message, "text")) {
             sessionLogWorker(app, index, bytes(app.scratch), 0_usize)
-            if app.jobsApproval == 0 { displayEntry(app, "  PARALLEL WORKER", bytes(app.scratch)) }
         }
+    } else if std.mem.eql(kind, "\"tool_started\"") || std.mem.eql(kind, "\"tool_finished\"") {
+        if jobState(app, index) != 1 {
+            failJob(app, index, "Error: invalid worker tool state.")
+            return
+        }
+        if std.mem.eql(kind, "\"tool_started\"") { updateWorker(app, index, eventWorkerToolStarted, message) }
+        else { updateWorker(app, index, eventWorkerToolFinished, message) }
     } else if std.mem.eql(kind, "\"approval\"") {
         if jobState(app, index) != 1 || !std.str.startsWith(field(message, "id"), "\"") {
             failJob(app, index, "Error: invalid worker approval state.")
@@ -651,6 +700,7 @@ fn jobEvent(app: mutref<App>, index: usize) -> Void {
             return
         }
         setJobState(app, index, 2_usize)
+        updateWorker(app, index, eventWorkerWaiting, "")
     } else if std.mem.eql(kind, "\"result\"") {
         sessionLogWorker(app, index, "", 1_usize)
         if jobState(app, index) != 1 || !decode(jobTx(app, index), field(message, "text")) {
@@ -659,6 +709,8 @@ fn jobEvent(app: mutref<App>, index: usize) -> Void {
         }
         setJobState(app, index, 3_usize)
         setJobFailed(app, index, std.mem.eql(field(message, "failed"), "true"))
+        if jobFailed(app, index) { updateWorker(app, index, eventWorkerFailed, bytes(jobTx(app, index))) }
+        else { updateWorker(app, index, eventWorkerCompleted, "") }
         let files: Maybe<u32> = std.json.u32(message, "files_changed")
         let tokens: Maybe<u32> = std.json.u32(message, "tokens")
         if files.has {
@@ -769,6 +821,7 @@ fn answerJobApproval(app: mutref<App>, approved: Bool) -> Void {
     setJobSent(app, index, 0_usize)
     setJobState(app, index, 1_usize)
     setJobStarted(app, index, std.time.monotonic())
+    updateWorker(app, index, eventWorkerResumed, "")
     app.jobsApproval = 0
     app.phase = 6
     app.view = 0
@@ -824,6 +877,7 @@ fn commitJobs(app: mutref<App>) -> Void {
             }
         }
         if app.jobsCommitted == app.jobsCount {
+            finishWorkerGroup(app)
             app.jobsMode = 0
             app.phase = 2
             if app.jobsRepeated {
@@ -860,8 +914,9 @@ fn commitJobs(app: mutref<App>) -> Void {
         i = i + 1
     }
     append(app.scratch, "]}")
-    app.jobsMode = 0
+    finishWorkerGroup(app)
     toolResult(app, bytes(app.scratch))
+    app.jobsMode = 0
 }
 
 fn pollJobs(app: mutref<App>) -> Void {
@@ -907,17 +962,19 @@ fn beginJobs(app: mutref<App>, mode: usize, count: usize) -> Void {
     app.jobsCommitted = 0
     app.jobsRepeated = false
     app.jobsApproval = 0
+    app.workersVisible = true
+    app.workerDisplayLines = count + 3
     var i: usize = 0
     while i < 4 {
         setJobState(app, i, 0_usize)
         setJobFailed(app, i, false)
         clear(jobRx(app, i))
         clear(jobTx(app, i))
+        if i < count { updateWorker(app, i, eventWorkerQueued, "") }
         i = i + 1
     }
     app.phase = 6
     app.view = 0
-    logEntry(app, "  PARALLEL TASKS", "Independent work runs concurrently; file ownership and ordered results are coordinated here.")
 }
 
 fn startDelegation(app: mutref<App>) -> Void {

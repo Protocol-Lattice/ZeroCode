@@ -413,8 +413,10 @@ class AgentTests(unittest.TestCase):
             reply("claude", calls=[("run_command", {"command": "printf 'out\\n'\nprintf 'err\\n' >&2\nexit 7"})]), reply("claude", "Command failed as expected.")]) as api:
             result = self.run_agent(api, "claude", folder, extra=("--approve",))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("[exit 7]", result.stdout)
-            self.assertIn("[stderr]", result.stdout)
+            self.assertIn("✗ command · exit 7 · err", result.stdout)
+            history = json.dumps(api.requests[-1][1])
+            self.assertIn("[exit 7]", history)
+            self.assertIn("[stderr]", history)
 
     def test_api_errors(self):
         for response in ((401, {"error": {"message": "Invalid API key"}}), b"not json"):
@@ -497,7 +499,6 @@ class AgentTests(unittest.TestCase):
                     terminal.send("Write the README.\r")
                     terminal.wait_for("TASK COMPLETE")
                     terminal.wait_for("The README is complete.")
-                    terminal.wait_for("ready", after=len(terminal.output))
                     self.assertEqual(len(api.requests), 2)
                     self.assertEqual(Path(folder, "README.md").read_text(), "# Finished\n")
                     self.assertFalse(Path(folder, "unrequested.txt").exists())
@@ -551,7 +552,6 @@ class AgentTests(unittest.TestCase):
                 terminal.wait_for("Your terminal.")
                 terminal.send("Say the task is done.\r")
                 terminal.wait_for("The task is done.")
-                terminal.wait_for("ready", after=len(terminal.output))
                 self.assertEqual(len(api.requests), 1)
             finally:
                 terminal.close()

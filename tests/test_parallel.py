@@ -396,7 +396,8 @@ class ParallelTests(unittest.TestCase):
                     self.assertNotIn("Unexpected model continuation.", result.stdout)
                     self.assertFalse(Path(folder, "after-repeat.txt").exists())
                     self.assertEqual(Path(folder, "in-flight.txt").read_text(), "Already scheduled work.")
-                    self.assertIn("Saved in-flight.txt", result.stdout)
+                    self.assertIn("worker-4   done   1 tools", result.stdout)
+                    self.assertIn("Skipped: this turn has ended", result.stdout)
 
     def test_oversized_native_write_arguments_preserve_following_read_pairing(self):
         for provider in ("openrouter", "claude"):
@@ -481,7 +482,7 @@ class ParallelTests(unittest.TestCase):
                     self.assertFalse(Path(folder, "second.txt").exists())
                     after = len(terminal.output)
                     terminal.send("n")
-                    terminal.wait_for("Approve this action?", after=after)
+                    terminal.wait_for("second.txt", after=after)
                     terminal.send("y")
                     terminal.wait_for("Both decisions recorded.")
                     saved = [path for path in (Path(folder, "first.txt"), Path(folder, "second.txt")) if path.exists()]

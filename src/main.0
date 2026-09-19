@@ -9,6 +9,8 @@ use providers
 use streaming
 use ui
 use parallel
+use worker_status
+use tool_display
 
 extern c "native/exit.h" as process
 
@@ -41,12 +43,21 @@ type App {
     scratch: MutSpan<u8>,
     frame: MutSpan<u8>,
     keyboard: MutSpan<u8>,
+    previousFrame: MutSpan<u8>,
+    frameIndex: MutSpan<u8>,
+    previousFrameIndex: MutSpan<u8>,
+    frameRows: usize,
+    frameColumns: usize,
     child: ProcChild,
     sent: usize,
     toolIndex: usize,
     turn: usize,
     maxTurns: usize,
     toolCount: usize,
+    commandResult: Bool,
+    commandExitCode: i32,
+    commandOutputBytes: usize,
+    commandElapsedMs: usize,
     filesChanged: usize,
     tokens: usize,
     scroll: usize,
@@ -104,6 +115,39 @@ type App {
     streamMessage: MutSpan<u8>,
     workerMode: usize,
     workerApprovalSent: Bool,
+    workerEvents: MutSpan<u8>,
+    workerToolActive: Bool,
+    workerCompletedTools: usize,
+    workerData0: MutSpan<u8>,
+    workerState0: usize,
+    workerToolCount0: usize,
+    workerToolActive0: Bool,
+    workerHasStarted0: Bool,
+    workerStarted0: Duration,
+    workerFinished0: Duration,
+    workerData1: MutSpan<u8>,
+    workerState1: usize,
+    workerToolCount1: usize,
+    workerToolActive1: Bool,
+    workerHasStarted1: Bool,
+    workerStarted1: Duration,
+    workerFinished1: Duration,
+    workerData2: MutSpan<u8>,
+    workerState2: usize,
+    workerToolCount2: usize,
+    workerToolActive2: Bool,
+    workerHasStarted2: Bool,
+    workerStarted2: Duration,
+    workerFinished2: Duration,
+    workerData3: MutSpan<u8>,
+    workerState3: usize,
+    workerToolCount3: usize,
+    workerToolActive3: Bool,
+    workerHasStarted3: Bool,
+    workerStarted3: Duration,
+    workerFinished3: Duration,
+    workersVisible: Bool,
+    workerDisplayLines: usize,
     parallelLimit: usize,
     jobsMode: usize,
     jobsCount: usize,
@@ -289,6 +333,8 @@ fn parseOptions(app: mutref<App>) -> Bool {
 }
 
 fn nativeTests(world: World) -> Void raises {
+    check workerStatusTests()
+    check toolDisplayTests()
     check assertTrue(pathsOk(0, 0) == 1)
     check assertTrue(!safeRelative(""))
     check assertTrue(!safeRelative("a//b"))
@@ -323,6 +369,7 @@ fn nativeTests(world: World) -> Void raises {
 
 fn toolResult(app: mutref<App>, result: Span<u8>) -> Void {
     if app.workerMode == 1 {
+        finishWorkerTool(app, result)
         setText(app.response, result)
         app.exitCode = 0
         if std.str.startsWith(result, "Error:") { app.exitCode = 1 }
@@ -541,6 +588,7 @@ fn toolNameAt(index: usize) -> String {
 }
 
 fn loadCurrentTool(app: mutref<App>) -> Bool {
+    app.commandResult = false
     let pendingData: MutSpan<u8> = app.pending
     let argumentsData: MutSpan<u8> = app.arguments
     let toolIdData: MutSpan<u8> = app.toolId
@@ -590,6 +638,10 @@ fn nextTool(app: mutref<App>) -> Void {
     let toolIdData: MutSpan<u8> = app.toolId
     let toolNameData: MutSpan<u8> = app.toolName
     let scratchData: MutSpan<u8> = app.scratch
+    if app.workerMode > 0 {
+        app.workerToolActive = true
+        queueWorkerEvent(app, "tool_started", "")
+    }
     if app.workerMode > 0 && !workerToolAllowed(app) {
         toolResult(app, "Error: worker mode/path restriction. Only the coordinator may change zero.graph; workers cannot use commands, MCP or recursive delegation.")
         return
@@ -600,7 +652,10 @@ fn nextTool(app: mutref<App>) -> Void {
         finishTask(app)
         return
     }
-    logEntry(app, "  TOOL", bytes(toolNameData))
+    var labelStorage: [1024]u8 = [0_u8; 1024]
+    let label: MutSpan<u8> = buffer(labelStorage)
+    toolLabel(label, bytes(toolNameData), bytes(argumentsData))
+    logEntry(app, "  TOOL", bytes(label))
     if std.mem.eql(bytes(toolNameData), "load_skill") {
         loadSkillTool(app)
         return
@@ -848,6 +903,10 @@ fn pollProcess(app: mutref<App>) -> Void {
             toolResult(app, "Error: command output exceeded the limit. Use a narrower query.")
             return
         }
+        app.commandResult = true
+        app.commandExitCode = std.proc.exitCode(status)
+        app.commandOutputBytes = bufLen(resultData)
+        app.commandElapsedMs = std.time.asMsFloor(std.time.between(app.started, std.time.monotonic())) as usize
         if bufLen(errorsData) > 0 {
             append(resultData, "\n[stderr]\n")
             append(resultData, bytes(errorsData))
@@ -1202,7 +1261,27 @@ fn poolStorage4(world: World, app: mutref<App>) -> i32 {
     var jobsPlanStorage: [49152]u8 = [0_u8; 49152]
     let previousjobsPlan: MutSpan<u8> = app.jobsPlan
     app.jobsPlan = buffer(jobsPlanStorage)
+    var metadata0: [944]u8 = [0_u8; 944]
+    var metadata1: [944]u8 = [0_u8; 944]
+    var metadata2: [944]u8 = [0_u8; 944]
+    var metadata3: [944]u8 = [0_u8; 944]
+    var events: [16384]u8 = [0_u8; 16384]
+    let previous0: MutSpan<u8> = app.workerData0
+    let previous1: MutSpan<u8> = app.workerData1
+    let previous2: MutSpan<u8> = app.workerData2
+    let previous3: MutSpan<u8> = app.workerData3
+    let previousEvents: MutSpan<u8> = app.workerEvents
+    app.workerData0 = metadata0
+    app.workerData1 = metadata1
+    app.workerData2 = metadata2
+    app.workerData3 = metadata3
+    app.workerEvents = buffer(events)
     let code: i32 = memoryStorage(world, app)
+    app.workerEvents = previousEvents
+    app.workerData3 = previous3
+    app.workerData2 = previous2
+    app.workerData1 = previous1
+    app.workerData0 = previous0
     app.jobsPlan = previousjobsPlan
     return code
 }
@@ -1463,6 +1542,23 @@ fn toolGuardStorage(world: World, app: mutref<App>) -> i32 {
     return code
 }
 
+fn frameStorage(world: World, app: mutref<App>) -> i32 {
+    var previous: [49152]u8 = [0_u8; 49152]
+    var index: [1024]u8 = [0_u8; 1024]
+    var previousIndex: [1024]u8 = [0_u8; 1024]
+    let savedFrame: MutSpan<u8> = app.previousFrame
+    let savedIndex: MutSpan<u8> = app.frameIndex
+    let savedPreviousIndex: MutSpan<u8> = app.previousFrameIndex
+    app.previousFrame = buffer(previous)
+    app.frameIndex = buffer(index)
+    app.previousFrameIndex = buffer(previousIndex)
+    let code: i32 = toolGuardStorage(world, app)
+    app.previousFrame = savedFrame
+    app.frameIndex = savedIndex
+    app.previousFrameIndex = savedPreviousIndex
+    return code
+}
+
 fn runApplication(world: World) -> i32 {
     var input: [8192]u8 = [0_u8; 8192]
     var model: [256]u8 = [0_u8; 256]
@@ -1495,8 +1591,9 @@ fn runApplication(world: World) -> i32 {
     var mcpRx1Empty: [32]u8 = [0_u8; 32]
     var mcpRx2Empty: [32]u8 = [0_u8; 32]
     var mcpRx3Empty: [32]u8 = [0_u8; 32]
-    var app: App = App { provider: 0, view: 0, selection: 0, phase: 0, alive: true, headless: false, approve: false, demo: false, paste: false, history: buffer(historyEmpty), transcript: buffer(transcriptEmpty), input: buffer(input), model: buffer(model), key: buffer(key), endpoint: buffer(endpoint), workspace: buffer(workspace), executable: buffer(executable), pending: buffer(pendingEmpty), arguments: buffer(arguments), toolId: buffer(toolId), toolName: buffer(toolName), result: buffer(result), packet: buffer(packetEmpty), response: buffer(responseEmpty), errors: buffer(errors), scratch: buffer(scratchEmpty), frame: buffer(frame), keyboard: buffer(keyboard), child: std.proc.spawnChild(""), sent: 0, toolIndex: 0, turn: 0, maxTurns: 20, toolCount: 0, filesChanged: 0, tokens: 0, scroll: 0, turnStart: 0, started: std.time.monotonic(), tick: 0, exitCode: 0, toolsEnabled: true, lastToolSnapshot: buffer(snapshotEmpty), repeatCount: 0, mcpConfig: buffer(mcpConfigEmpty), mcpTools: buffer(mcpToolsEmpty), mcpTx: buffer(mcpTxEmpty), mcpCursor: buffer(mcpCursorEmpty), skills: buffer(skillsEmpty), activeSkill: buffer(activeSkillEmpty), systemContext: buffer(systemContextEmpty), memory: buffer(responseEmpty), memoryEnabled: true, memorySkipSave: false, logEnabled: false, logFailed: false, logStreaming: false, logSequence: 0, logPath: buffer(responseEmpty), logSecrets: buffer(responseEmpty), logTail: buffer(responseEmpty), logWorkerTail0: buffer(responseEmpty), logWorkerTail1: buffer(responseEmpty), logWorkerTail2: buffer(responseEmpty), logWorkerTail3: buffer(responseEmpty), mcpRx0: buffer(mcpRx0Empty), mcpRx1: buffer(mcpRx1Empty), mcpRx2: buffer(mcpRx2Empty), mcpRx3: buffer(mcpRx3Empty), mcpChild0: std.proc.spawnChild(""), mcpChild1: std.proc.spawnChild(""), mcpChild2: std.proc.spawnChild(""), mcpChild3: std.proc.spawnChild(""), mcpCount: 0, mcpIndex: 0, mcpStage: 0, mcpRequest: 0, mcpSent: 0, mcpPage: 0, mcpConnectAll: false, skillCount: 0, streamMode: 0, httpStatus: 0, streamActive: 0, streamDone: false, streamVisible: false, streamLine: buffer(responseEmpty), streamEvent: buffer(responseEmpty), streamMessage: buffer(responseEmpty), workerMode: 0, workerApprovalSent: false, parallelLimit: 4, jobsMode: 0, jobsCount: 0, jobsCommitted: 0, jobsRepeated: false, jobsApproval: 0, jobsPlan: buffer(responseEmpty), jobChild0: std.proc.spawnChild(""), jobTx0: buffer(responseEmpty), jobRx0: buffer(responseEmpty), jobState0: 0, jobSent0: 0, jobStarted0: std.time.monotonic(), jobFailed0: false, jobChild1: std.proc.spawnChild(""), jobTx1: buffer(responseEmpty), jobRx1: buffer(responseEmpty), jobState1: 0, jobSent1: 0, jobStarted1: std.time.monotonic(), jobFailed1: false, jobChild2: std.proc.spawnChild(""), jobTx2: buffer(responseEmpty), jobRx2: buffer(responseEmpty), jobState2: 0, jobSent2: 0, jobStarted2: std.time.monotonic(), jobFailed2: false, jobChild3: std.proc.spawnChild(""), jobTx3: buffer(responseEmpty), jobRx3: buffer(responseEmpty), jobState3: 0, jobSent3: 0, jobStarted3: std.time.monotonic(), jobFailed3: false }
-    return toolGuardStorage(world, &mut app)
+    var workerEmpty: [1024]u8 = [0_u8; 1024]
+    var app: App = App { provider: 0, view: 0, selection: 0, phase: 0, alive: true, headless: false, approve: false, demo: false, paste: false, history: buffer(historyEmpty), transcript: buffer(transcriptEmpty), input: buffer(input), model: buffer(model), key: buffer(key), endpoint: buffer(endpoint), workspace: buffer(workspace), executable: buffer(executable), pending: buffer(pendingEmpty), arguments: buffer(arguments), toolId: buffer(toolId), toolName: buffer(toolName), result: buffer(result), packet: buffer(packetEmpty), response: buffer(responseEmpty), errors: buffer(errors), scratch: buffer(scratchEmpty), frame: buffer(frame), keyboard: buffer(keyboard), previousFrame: buffer(responseEmpty), frameIndex: buffer(responseEmpty), previousFrameIndex: buffer(responseEmpty), frameRows: 0, frameColumns: 0, child: std.proc.spawnChild(""), sent: 0, toolIndex: 0, turn: 0, maxTurns: 20, toolCount: 0, commandResult: false, commandExitCode: 0, commandOutputBytes: 0, commandElapsedMs: 0, filesChanged: 0, tokens: 0, scroll: 0, turnStart: 0, started: std.time.monotonic(), tick: 0, exitCode: 0, toolsEnabled: true, lastToolSnapshot: buffer(snapshotEmpty), repeatCount: 0, mcpConfig: buffer(mcpConfigEmpty), mcpTools: buffer(mcpToolsEmpty), mcpTx: buffer(mcpTxEmpty), mcpCursor: buffer(mcpCursorEmpty), skills: buffer(skillsEmpty), activeSkill: buffer(activeSkillEmpty), systemContext: buffer(systemContextEmpty), memory: buffer(responseEmpty), memoryEnabled: true, memorySkipSave: false, logEnabled: false, logFailed: false, logStreaming: false, logSequence: 0, logPath: buffer(responseEmpty), logSecrets: buffer(responseEmpty), logTail: buffer(responseEmpty), logWorkerTail0: buffer(responseEmpty), logWorkerTail1: buffer(responseEmpty), logWorkerTail2: buffer(responseEmpty), logWorkerTail3: buffer(responseEmpty), mcpRx0: buffer(mcpRx0Empty), mcpRx1: buffer(mcpRx1Empty), mcpRx2: buffer(mcpRx2Empty), mcpRx3: buffer(mcpRx3Empty), mcpChild0: std.proc.spawnChild(""), mcpChild1: std.proc.spawnChild(""), mcpChild2: std.proc.spawnChild(""), mcpChild3: std.proc.spawnChild(""), mcpCount: 0, mcpIndex: 0, mcpStage: 0, mcpRequest: 0, mcpSent: 0, mcpPage: 0, mcpConnectAll: false, skillCount: 0, streamMode: 0, httpStatus: 0, streamActive: 0, streamDone: false, streamVisible: false, streamLine: buffer(responseEmpty), streamEvent: buffer(responseEmpty), streamMessage: buffer(responseEmpty), workerMode: 0, workerApprovalSent: false, workerEvents: buffer(responseEmpty), workerToolActive: false, workerCompletedTools: 0, workerData0: buffer(workerEmpty), workerState0: workerQueued, workerToolCount0: 0, workerToolActive0: false, workerHasStarted0: false, workerStarted0: std.time.zero(), workerFinished0: std.time.zero(), workerData1: buffer(workerEmpty), workerState1: workerQueued, workerToolCount1: 0, workerToolActive1: false, workerHasStarted1: false, workerStarted1: std.time.zero(), workerFinished1: std.time.zero(), workerData2: buffer(workerEmpty), workerState2: workerQueued, workerToolCount2: 0, workerToolActive2: false, workerHasStarted2: false, workerStarted2: std.time.zero(), workerFinished2: std.time.zero(), workerData3: buffer(workerEmpty), workerState3: workerQueued, workerToolCount3: 0, workerToolActive3: false, workerHasStarted3: false, workerStarted3: std.time.zero(), workerFinished3: std.time.zero(), workersVisible: false, workerDisplayLines: 0, parallelLimit: 4, jobsMode: 0, jobsCount: 0, jobsCommitted: 0, jobsRepeated: false, jobsApproval: 0, jobsPlan: buffer(responseEmpty), jobChild0: std.proc.spawnChild(""), jobTx0: buffer(responseEmpty), jobRx0: buffer(responseEmpty), jobState0: 0, jobSent0: 0, jobStarted0: std.time.monotonic(), jobFailed0: false, jobChild1: std.proc.spawnChild(""), jobTx1: buffer(responseEmpty), jobRx1: buffer(responseEmpty), jobState1: 0, jobSent1: 0, jobStarted1: std.time.monotonic(), jobFailed1: false, jobChild2: std.proc.spawnChild(""), jobTx2: buffer(responseEmpty), jobRx2: buffer(responseEmpty), jobState2: 0, jobSent2: 0, jobStarted2: std.time.monotonic(), jobFailed2: false, jobChild3: std.proc.spawnChild(""), jobTx3: buffer(responseEmpty), jobRx3: buffer(responseEmpty), jobState3: 0, jobSent3: 0, jobStarted3: std.time.monotonic(), jobFailed3: false }
+    return frameStorage(world, &mut app)
 }
 
 fn execute(world: World) -> i32 raises {
