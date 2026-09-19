@@ -13,7 +13,7 @@ A terminal user interface (TUI) framework built with **Zero** — a custom progr
 
 ## Features
 
-- **Lightweight** – single binary, no external dependencies beyond standard library
+- **Lightweight** – native executable using the system libcurl for HTTP/TLS
 - **Zero runtime** – compiled directly to native code via the Zero compiler
 - **Agent integration** – supports multiple LLM providers (OpenAI, Claude, Gemini, OpenRouter)
 - **Cross-compilation** – targets Linux musl x64, host development, etc.
@@ -29,30 +29,112 @@ zero-coding-tui/
 ├── zero.toml           # Package manifest
 ├── zero.graph          # Dependency graph
 ├── Makefile            # Build automation
+├── install.sh          # Linux/macOS installer for the zero-coding command
 ├── scripts/
 │   ├── setup-zero.sh   # Setup Zero compiler environment
 │   └── build.sh         # Build the Zero binary
 └── README.md           # This file
 ```
 
-## Building
+## Install globally on Linux or macOS
+
+The installed command is **`zero-coding`**. From this checkout, run:
+
+```sh
+make install
+```
+
+Or download and run the installer without cloning the repository:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Protocol-Lattice/zero-coding-tui/main/install.sh | sh
+```
+
+The installer builds for your machine, installs into `~/.local`, and adds
+`~/.local/bin` to your Bash, Zsh, or POSIX shell startup files when needed. Open a
+new terminal or run the printed `export PATH=...` command in the current terminal:
+
+```sh
+cd /path/to/your/project
+zero-coding
+```
+
+Your current directory is the workspace; `--cwd PATH` selects another one. The
+installation contains the native executable and a small launcher, so you can
+remove the source checkout afterward. Node.js and the Zero compiler are only
+needed while building. Git is needed for the application's workspace file tools.
+For other shells, add `~/.local/bin` to PATH manually.
+
+### Prerequisites for the installer
+
+- Linux or macOS, with a C compiler (`cc`) and `make`.
+- libcurl and its development headers for HTTP/TLS support.
+- Node.js 24 or newer, Git, `curl`, `tar`, and `sha256sum` or `shasum`.
+- Internet access on the first build to fetch the pinned Zero compiler.
+
+On macOS, install Apple's command line tools with `xcode-select --install` if
+`cc`, `make`, or Git is missing. On Debian/Ubuntu, the build tools are provided by
+`build-essential`; install `git`, `curl`, `libcurl4-openssl-dev`, and
+`ca-certificates` as well. Install
+Node.js 24+ separately if your distribution provides an older version.
+
+### Custom location, updates, and removal
+
+```sh
+# Another prefix; leave shell startup files alone.
+sh ./install.sh --prefix "$HOME/apps/zero" --no-modify-path
+
+# Install a binary you have already built (no compiler setup or rebuild).
+sh ./install.sh --binary ./dist/zero-coding
+
+# System-wide install: build as your user, then copy with administrator rights.
+make setup build
+sudo sh ./install.sh --binary ./dist/zero-coding --prefix /usr/local --no-modify-path
+
+# Remove the default user installation.
+make uninstall
+# For a custom installation, use the same prefix used to install it.
+sh ./install.sh --uninstall --prefix "$HOME/apps/zero"
+```
+
+Rerun the installer to update. From a checkout it builds that checkout; the
+downloaded installer builds `main` by default. `--ref TAG_OR_COMMIT` downloads a
+specific revision instead. Uninstall removes the launcher and native executable;
+it keeps shell PATH entries and user configuration.
+
+### Publishing
+
+`zero.toml` describes the package and build targets. Zero currently has no
+`zero publish` or global `zero install` command; see the upstream
+[package manifest reference](https://zerolang.ai/package-manifest) and
+[CLI reference](https://zerolang.ai/cli).
+
+Publish `install.sh` with the rest of this repository to make the download URL
+above available. Include `zero.graph`, `zero.toml`, `src/`, `native/`, and
+`scripts/`: the manifest alone is not a distributable application. A Git tag lets
+users pin a version with `sh install.sh --ref TAG`. For installation without build
+tools, distribute a native binary for each OS/architecture in GitHub Releases;
+users can install their matching download with `--binary`.
+
+## Building from source
 
 ### Prerequisites
 
 - **Node.js ≥ 24** (required by Zero's standard library)
-- **Git** (for fetching the Zero source)
+- A C compiler, libcurl development headers, `make`, Git, `curl`, `tar`, and a SHA-256 checksum tool
 
 ### Compile
 
 ```bash
-# Using the Makefile (recommended)
-make
+# Set up the pinned compiler, then build for your host OS/architecture.
+make setup build
 
 # Or manually via the Zero compiler
 ./scripts/build.sh
 ```
 
-The build creates `dist/zero-coding` (Linux musl x64) and copies it to `.tools/bin/zero`.
+The build creates `dist/zero-coding` for the host OS/architecture. The compiler
+itself is stored at `.tools/bin/zero`.
 
 ### Running
 
@@ -60,7 +142,7 @@ The build creates `dist/zero-coding` (Linux musl x64) and copies it to `.tools/b
 # Run the built binary
 ./dist/zero-coding
 
-# Or invoke via the Zero compiler directly
+# Or use the development launcher
 ./zero-coding --help
 ```
 
@@ -72,22 +154,24 @@ make test
 python3 -m unittest discover -s tests -v
 ```
 
+CI runs the build, tests, and an installation smoke test on Linux and macOS.
+
 ## Quick Start
 
 1. **Clone & install dependencies**
    ```bash
-   git clone <repo>
+   git clone https://github.com/Protocol-Lattice/zero-coding-tui.git
    cd zero-coding-tui
    ```
 
-2. **Compile the binary**
+2. **Build and install**
    ```bash
-   make
+   make install
    ```
 
 3. **Run the TUI**
    ```bash
-   ./dist/zero-coding
+   zero-coding
    ```
 
 4. **Test the implementation**
