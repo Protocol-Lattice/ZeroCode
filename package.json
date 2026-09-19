@@ -1,0 +1,16 @@
+{
+  "name": "zero-coding-website",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The product website for Zero, a native terminal coding agent.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "node --watch website/server.js",
+    "start": "node website/server.js",
+    "test:website": "node --test website/test/*.test.js",
+    "check:website": "node --check website/server.js && node --check website/public/main.js"
+  }
+}

@@ -525,6 +525,14 @@ Both MCP and skills are implemented in Zero, in `src/mcp.0` and `src/skills.0`.
 
 ## Development
 
+### Product website
+
+The standalone Node.js promotional website lives in [`website/`](website/README.md).
+Run `npm run dev` from this repository and open `http://localhost:3000`.
+It requires Node.js 24+ and has no package dependencies or build step.
+
+### Terminal application
+
 - **Source**: `src/main.0` is the entry point; modules group code by responsibility
 - **Parallel execution**: `src/parallel.0` owns worker scheduling, scoped subagents, approvals, and ordered results
 - **Memory**: `src/memory.0` owns bounded project notes, persistence and memory tool/command handling
