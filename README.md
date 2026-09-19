@@ -1,10 +1,10 @@
-# zero-coding-tui
+# zero-coding
 
 A terminal user interface (TUI) framework built with **Zero** — a custom programming language designed for creating high-performance terminal applications.
 
 ## Overview
 
-`zero-coding-tui` is a minimalistic TUI toolkit written in the **Zero** language. It provides a lightweight foundation for building interactive command-line interfaces, chat agents, and other terminal-based applications. The project includes:
+`zero-coding` is a minimalistic TUI toolkit written in the **Zero** language. It provides a lightweight foundation for building interactive command-line interfaces, chat agents, and other terminal-based applications. The project includes:
 
 - **Zero compiler** – compiles Zero source into a standalone binary (`zero-coding`)
 - **Native backend** – uses `native/exit.h` for low-level terminal operations
