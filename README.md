@@ -131,6 +131,102 @@ The Zero compiler supports four LLM providers out of the box:
 ./dist/zero-coding --provider openrouter --model any/custom-model-id
 ```
 
+## MCP servers
+
+The native Zero application connects to MCP servers over **stdio**. Define servers
+in `.mcp.json` in the workspace:
+
+```json
+{
+  "mcpServers": {
+    "my-tools": {
+      "command": "/absolute/path/to/mcp-server",
+      "args": ["--example-option"],
+      "env": {"SERVICE_TOKEN": "${SERVICE_TOKEN}"}
+    }
+  }
+}
+```
+
+Replace the command and arguments with those required by your server. Commands
+are executed directly, with argument boundaries preserved. `${VARIABLE}` expands
+an existing environment variable in `command`, `args`, `cwd`, or `env` values.
+The default server working directory is the workspace; `cwd` can override it.
+Keep credentials in environment variables rather than literal configuration values.
+
+In the TUI:
+
+```text
+/mcp                       List servers and discovered tools
+/mcp connect my-tools      Start a server and discover its tools
+/mcp connect all           Connect all configured servers
+/mcp disconnect my-tools   Stop one server
+/mcp disconnect all        Stop all servers
+/mcp reload                Disconnect and reread configuration
+```
+
+Connections are opt-in. Server processes stay alive across tool calls and stop
+when disconnected or when the app exits. Discovered tools work with all four
+providers and require the same approval as shell commands. `Esc` cancels an active
+MCP request and disconnects its server. Reconnect a server to refresh changed tools.
+
+For a noninteractive task:
+
+```sh
+./zero-coding --mcp all --approve --prompt "Use the configured tools to complete the task."
+```
+
+`--mcp-config PATH` selects another JSON configuration file. `--approve` authorizes
+MCP calls, file edits, and shell commands for that run; without it, noninteractive
+MCP calls are denied. Configuration supports up to four servers, 128 tools in a
+64 KiB catalog, 64 KiB protocol messages, and 16 KiB text tool results. Requests
+time out after 60 seconds. This client implements MCP tool discovery and calls;
+remote HTTP endpoints need a separately configured stdio bridge. Server-provided
+sampling, elicitation, resources, and prompts are not exposed as client features.
+
+## Skills
+
+Add project skills under `.agents/skills/NAME/SKILL.md`:
+
+```markdown
+---
+name: review-docs
+description: Review documentation for accuracy and runnable examples.
+---
+
+Check the requested documentation against the implementation.
+Read references/checklist.md if a detailed checklist is needed.
+Summarize the findings and stop when the requested review is complete.
+```
+
+The frontmatter name must match its directory. Plain, quoted, and folded
+descriptions are supported. Optional references, scripts, and assets live beside
+`SKILL.md`. Only skill metadata enters the model's initial skill catalog;
+the model calls `load_skill` when it needs the instructions. Its optional `path`
+argument reads a text reference relative to that skill's directory.
+
+```text
+/skills             Show available skills
+/skills reload      Rescan skill directories
+/skill review-docs  Apply a skill to the session
+/skill off          Clear the selected skill
+```
+
+User skills are discovered in `$XDG_CONFIG_HOME/zero-coding/skills`, or
+`~/.config/zero-coding/skills` when `XDG_CONFIG_HOME` is unset. Use
+`--skills-dir PATH` to replace that user collection with another directory;
+project skills take precedence when names collide. `--skill NAME` selects a skill
+at startup, and `--no-skills` disables discovery.
+
+Discovery is limited to 32 valid skills and a bounded catalog. Skill files and
+text references must be UTF-8 and at most 16 KiB. Workspace `.gitignore` rules,
+path checks, and symlink restrictions also apply to skills. Loading a skill does
+not run its scripts or grant approvals: scripts use the existing approved
+`run_command` flow. Skill instructions remain subordinate to the user's task.
+
+Both MCP and skills are implemented in Zero and exported into `src/main.0` from
+the canonical `zero.graph` program graph.
+
 ## Development
 
 - **Source**: `src/main.0` – The core TUI framework written in Zero

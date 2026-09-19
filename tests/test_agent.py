@@ -18,7 +18,7 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-EXE = ROOT / "dist" / "zero-coding"
+EXE = Path(os.environ.get("ZERO_TEST_EXE", ROOT / "dist" / "zero-coding"))
 KEYS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
 
 
@@ -95,6 +95,7 @@ def environment(endpoint=None, keys=True):
     if endpoint:
         env["ZERO_API_URL"] = endpoint
     env["TERM"] = "xterm-256color"
+    env["XDG_CONFIG_HOME"] = str(ROOT / ".zero/test-config")
     return env
 
 
