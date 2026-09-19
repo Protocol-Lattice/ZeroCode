@@ -35,7 +35,7 @@ jobs:
           make install PREFIX="$RUNNER_TEMP/zero-install" INSTALL_FLAGS=--no-modify-path
           export PATH="$RUNNER_TEMP/zero-install/bin:$PATH"
           cd "$RUNNER_TEMP"
-          zero-coding --version
-          zero-coding --self-test
+          zero-code --version
+          zero-code --self-test
       - name: Uninstall
         run: make uninstall PREFIX="$RUNNER_TEMP/zero-install"

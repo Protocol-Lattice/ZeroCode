@@ -31,4 +31,4 @@ fi
 make -C "$source_dir/native/zero-c"
 cp "$source_dir/.zero/bin/zero" "$project_dir/.tools/bin/zero"
 printf '%s\n' "$revision" > "$project_dir/.tools/compiler-revision"
-printf '\nCompiler ready. Run ./scripts/build.sh, then ./dist/zero-coding.\n'
+printf '\nCompiler ready. Run ./scripts/build.sh, then ./dist/zero-code.\n'

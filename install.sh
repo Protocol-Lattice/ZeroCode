@@ -3,7 +3,7 @@
 set -eu
 
 fail() {
-    printf 'zero-coding install: %s\n' "$*" >&2
+    printf 'zero code install: %s\n' "$*" >&2
     exit 1
 }
 
@@ -17,14 +17,14 @@ shell_quote() {
 
 usage() {
     cat <<'USAGE'
-Install zero-coding on Linux or macOS.
+Install zero-code on Linux or macOS.
 
 Usage: sh install.sh [options]
   --prefix DIR       Install into DIR/bin and DIR/libexec (default: ~/.local)
   --binary FILE      Install an already-built native binary instead of building
   --ref REF          Download and build a GitHub tag, branch, or commit
   --no-modify-path   Do not update shell startup files
-  --uninstall        Remove zero-coding from the selected prefix
+  --uninstall        Remove zero code from the selected prefix
   --help             Show this help
 
 By default a checkout is built locally; a standalone or piped installer downloads
@@ -39,7 +39,7 @@ add_to_profile() {
     # Match the exact export, so repeated installs do not add duplicate entries.
     if [ ! -f "$profile" ] || ! grep -Fqx -- "$path_line" "$profile"; then
         mkdir -p "$(dirname "$profile")"
-        printf '\n# zero-coding\n%s\n' "$path_line" >> "$profile"
+        printf '\n# zero-code\n%s\n' "$path_line" >> "$profile"
         printf 'Added PATH entry to %s\n' "$profile"
     fi
 }
@@ -122,14 +122,14 @@ main() {
     while [ "${prefix%/}" != "$prefix" ]; do prefix=${prefix%/}; done
     [ -n "$prefix" ] || fail '--prefix cannot be the filesystem root.'
     bin_dir="$prefix/bin"
-    lib_dir="$prefix/libexec/zero-coding"
-    launcher="$bin_dir/zero-coding"
-    installed_binary="$lib_dir/zero-coding"
+    lib_dir="$prefix/libexec/zero-code"
+    launcher="$bin_dir/zero-code"
+    installed_binary="$lib_dir/zero-code"
 
     if [ "$uninstall" = yes ]; then
         rm -f "$launcher" "$installed_binary"
         rmdir "$lib_dir" 2>/dev/null || :
-        printf 'Removed zero-coding from %s. Shell PATH entries were kept.\n' "$prefix"
+        printf 'Removed zero-code from %s. Shell PATH entries were kept.\n' "$prefix"
         return
     fi
     [ -z "$binary" ] || [ -z "$ref" ] || fail '--binary and --ref cannot be combined.'
@@ -154,13 +154,13 @@ main() {
         if [ -z "$project_dir" ]; then
             require curl
             require tar
-            temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/zero-coding-install.XXXXXX")
+            temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/zero-code-install.XXXXXX")
             project_dir="$temp_dir/source"
             mkdir "$project_dir"
             ref=${ref:-main}
-            printf 'Downloading zero-coding (%s)…\n' "$ref"
+            printf 'Downloading zero-code (%s)…\n' "$ref"
             curl --fail --location --show-error --retry 3 \
-                "https://codeload.github.com/Protocol-Lattice/zero-coding/tar.gz/$ref" \
+                "https://codeload.github.com/Protocol-Lattice/zero-code/tar.gz/$ref" \
                 -o "$temp_dir/source.tar.gz"
             tar -xzf "$temp_dir/source.tar.gz" --strip-components=1 -C "$project_dir"
         fi
@@ -169,7 +169,7 @@ main() {
             sh "$project_dir/scripts/setup-zero.sh"
         fi
         sh "$project_dir/scripts/build.sh"
-        binary="$project_dir/dist/zero-coding"
+        binary="$project_dir/dist/zero-code"
     fi
     [ -f "$binary" ] && [ -x "$binary" ] || fail "Not an executable binary: $binary"
     binary=$(CDPATH= cd -- "$(dirname -- "$binary")" && pwd)/$(basename -- "$binary")
@@ -177,12 +177,12 @@ main() {
     "$binary" --version || fail 'The binary cannot run on this machine.'
     [ ! -d "$launcher" ] && [ ! -d "$installed_binary" ] || fail 'An installation destination is a directory.'
     mkdir -p "$bin_dir" "$lib_dir"
-    staged_binary=$(mktemp "$lib_dir/.zero-coding.XXXXXX")
+    staged_binary=$(mktemp "$lib_dir/.zero-code.XXXXXX")
     cp "$binary" "$staged_binary"
     chmod 755 "$staged_binary"
-    staged_launcher=$(mktemp "$bin_dir/.zero-coding.XXXXXX")
+    staged_launcher=$(mktemp "$bin_dir/.zero-code.XXXXXX")
     {
-        printf '#!/bin/sh\n# Installed by zero-coding-tui/install.sh.\n'
+        printf '#!/bin/sh\n# Installed by zero-code-tui/install.sh.\n'
         # The app re-executes argv[0] for HTTP requests. An absolute path also
         # keeps --cwd and invocation via PATH working without changing directory.
         printf 'exec %s "$@"\n' "$(shell_quote "$installed_binary")"
@@ -194,7 +194,7 @@ main() {
     staged_launcher=
     printf '\nInstalled %s\n' "$launcher"
     configure_path
-    printf '\nRun zero-coding from any project directory.\n'
+    printf '\nRun zero-code from any project directory.\n'
 }
 
 main "$@"

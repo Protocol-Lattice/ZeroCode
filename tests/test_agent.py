@@ -18,7 +18,7 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-EXE = Path(os.environ.get("ZERO_TEST_EXE", ROOT / "dist" / "zero-coding"))
+EXE = Path(os.environ.get("ZERO_TEST_EXE", ROOT / "dist" / "zero-code"))
 KEYS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
 
 

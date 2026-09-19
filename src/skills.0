@@ -259,7 +259,7 @@ fn reloadSkills(app: mutref<App>) -> Void {
             append(root, home.value)
             append(root, "/.config")
         }
-        append(root, "/zero-coding/skills")
+        append(root, "/zero-code/skills")
     }
     if bufOk(root) && headerSafe(bytes(root)) {
         discoverSkillRoot(app, bytes(root))

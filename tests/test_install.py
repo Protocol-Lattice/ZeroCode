@@ -41,7 +41,7 @@ class InstallTests(unittest.TestCase):
     def run_installed(self, *args, env=None):
         command_env = (env or self.env).copy()
         command_env["PATH"] = str(self.prefix / "bin") + os.pathsep + command_env["PATH"]
-        return subprocess.run(["sh", "-c", 'exec zero-coding "$@"', "test", *args],
+        return subprocess.run(["sh", "-c", 'exec zero-code "$@"', "test", *args],
                               cwd=self.workspace, env=command_env, text=True,
                               capture_output=True, timeout=15)
 
@@ -59,8 +59,8 @@ class InstallTests(unittest.TestCase):
         downloaded.unlink()
         result = self.run_installed("--version")
         self.assert_ok(result)
-        self.assertIn("zero-coding 0.1.0", result.stdout)
-        self.assertEqual((self.prefix / "libexec/zero-coding/zero-coding").read_bytes(), EXE.read_bytes())
+        self.assertIn("zero-code 0.1.0", result.stdout)
+        self.assertEqual((self.prefix / "libexec/zero-code/zero-code").read_bytes(), EXE.read_bytes())
         self.assertFalse((Path(self.env["ZDOTDIR"]) / ".zshrc").exists())
 
     def test_requests_reexec_installed_binary_and_keep_workspace(self):
@@ -88,12 +88,12 @@ class InstallTests(unittest.TestCase):
         self.assert_ok(self.install(configure=True))
         self.assert_ok(self.install(configure=True))
         profile = Path(self.env["ZDOTDIR"]) / ".zshrc"
-        self.assertEqual(profile.read_text().count("# zero-coding"), 1)
+        self.assertEqual(profile.read_text().count("# zero-code"), 1)
         other = self.prefix / "bin/unrelated"
         other.write_text("keep me")
         self.assert_ok(self.install("--uninstall", binary=None))
-        self.assertFalse((self.prefix / "bin/zero-coding").exists())
-        self.assertFalse((self.prefix / "libexec/zero-coding").exists())
+        self.assertFalse((self.prefix / "bin/zero-code").exists())
+        self.assertFalse((self.prefix / "libexec/zero-code").exists())
         self.assertEqual(other.read_text(), "keep me")
         self.assertTrue(profile.exists())
         self.assert_ok(self.install("--uninstall", binary=None))
@@ -108,15 +108,15 @@ class InstallTests(unittest.TestCase):
             if not shutil.which(shell):
                 continue
             with self.subTest(shell=shell):
-                result = subprocess.run([shell, "-c", '. "$1"; zero-coding --version',
+                result = subprocess.run([shell, "-c", '. "$1"; zero-code --version',
                                          "test", str(profile)], cwd=self.workspace,
                                         env=self.env, text=True, capture_output=True, timeout=10)
                 self.assert_ok(result)
-                self.assertIn("zero-coding", result.stdout)
+                self.assertIn("zero-code", result.stdout)
 
     def test_failed_binary_validation_keeps_previous_installation(self):
         self.assert_ok(self.install())
-        launcher = self.prefix / "bin/zero-coding"
+        launcher = self.prefix / "bin/zero-code"
         previous = launcher.read_bytes()
         broken = self.write_executable(self.folder / "broken", "exit 42\n")
         result = self.install(binary=broken)
@@ -143,7 +143,7 @@ printf 'setup\\n' >> """ + shlex.quote(str(setup_log)) + "\n")
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 test -x "$project_dir/.tools/bin/zero"
 mkdir -p "$project_dir/dist"
-cp """ + shlex.quote(str(EXE)) + ' "$project_dir/dist/zero-coding"\n' +
+cp """ + shlex.quote(str(EXE)) + ' "$project_dir/dist/zero-code"\n' +
                               "printf 'build\\n' >> " + shlex.quote(str(build_log)) + "\n")
         return source, setup_log, build_log
 
@@ -160,7 +160,7 @@ cp """ + shlex.quote(str(EXE)) + ' "$project_dir/dist/zero-coding"\n' +
         source, setup_log, _ = self.source_fixture()
         archive = self.folder / "source.tar.gz"
         with tarfile.open(archive, "w:gz") as tar:
-            tar.add(source, arcname="zero-coding-tui-fixture")
+            tar.add(source, arcname="zero-code-tui-fixture")
         download_log = self.folder / "download.log"
         mock_bin = self.folder / "mock-bin"
         self.write_executable(mock_bin / "curl", """
@@ -178,7 +178,7 @@ exit 1
         result = self.install("--ref", "v0.1.0", binary=None,
                               input=(ROOT / "install.sh").read_text())
         self.assert_ok(result)
-        self.assertIn("https://codeload.github.com/Protocol-Lattice/zero-coding/tar.gz/v0.1.0",
+        self.assertIn("https://codeload.github.com/Protocol-Lattice/zero-code/tar.gz/v0.1.0",
                       download_log.read_text())
         self.assertTrue(setup_log.exists())
         self.assert_ok(self.run_installed("--version"))
@@ -188,7 +188,7 @@ exit 1
                      ("--ref", "v0.1.0"), ("--prefix",), ("--unknown",)):
             with self.subTest(args=args):
                 self.assertNotEqual(self.install(*args).returncode, 0)
-                self.assertFalse((self.prefix / "bin/zero-coding").exists())
+                self.assertFalse((self.prefix / "bin/zero-code").exists())
         mock_bin = self.folder / "mock-bin"
         self.write_executable(mock_bin / "uname", "printf 'FreeBSD\\n'\n")
         self.env["PATH"] = str(mock_bin) + os.pathsep + self.env["PATH"]

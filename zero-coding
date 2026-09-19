@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-if [ ! -x "$project_dir/dist/zero-coding" ] || [ "$project_dir/zero.graph" -nt "$project_dir/dist/zero-coding" ]; then
+if [ ! -x "$project_dir/dist/zero-code" ] || [ "$project_dir/zero.graph" -nt "$project_dir/dist/zero-code" ]; then
     "$project_dir/scripts/build.sh"
 fi
-exec "$project_dir/dist/zero-coding" "$@"
+exec "$project_dir/dist/zero-code" "$@"

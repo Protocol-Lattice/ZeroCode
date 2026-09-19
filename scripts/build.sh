@@ -8,4 +8,4 @@ if [ ! -x "$compiler" ]; then
 fi
 cd "$project_dir"
 mkdir -p dist
-"$compiler" build --target host --out "$project_dir/dist/zero-coding"
+"$compiler" build --target host --out "$project_dir/dist/zero-code"

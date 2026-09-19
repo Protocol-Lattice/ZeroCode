@@ -326,7 +326,7 @@ fn connectMcp(app: mutref<App>, index: usize) -> Void {
     }
     app.mcpPage = 0
     clear(app.mcpCursor)
-    sendMcp(app, "initialize", "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"zero-coding\",\"version\":\"0.1.0\"}}")
+    sendMcp(app, "initialize", "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"zero-code\",\"version\":\"0.1.0\"}}")
 }
 
 fn beginMcp(app: mutref<App>, name: Span<u8>) -> Void {

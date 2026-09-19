@@ -4,9 +4,9 @@ A terminal coding assistant built with **Zero**, with native file tools, streami
 
 ## Overview
 
-`zero-coding` runs coding tasks in your current workspace. The project includes:
+`zero code` runs coding tasks in your current workspace. The project includes:
 
-- **Zero compiler** – compiles Zero source into a standalone binary (`zero-coding`)
+- **Zero compiler** – compiles Zero source into a standalone binary (`zero-code`)
 - **Native transport** – a small C worker uses system libcurl; Zero parses responses and controls tool execution
 - **Test suite** – black-box tests for the compiled Zero executable
 - **Build system** – `Makefile` for cross-compilation targets
@@ -25,7 +25,7 @@ A terminal coding assistant built with **Zero**, with native file tools, streami
 ## Project Structure
 
 ```
-zero-coding/
+zero-code/
 ├── src/main.0          # Application state, task loop, approvals, startup
 ├── src/buffers.0       # Bounded buffers, JSON and UTF-8 helpers
 ├── src/workspace.0     # Path checks, range reads and atomic file edits
@@ -43,7 +43,7 @@ zero-coding/
 ├── zero.toml           # Package manifest
 ├── zero.graph          # Canonical Zero program graph
 ├── Makefile            # Build automation
-├── install.sh          # Linux/macOS installer for the zero-coding command
+├── install.sh          # Linux/macOS installer for the zero-code command
 ├── scripts/
 │   ├── setup-zero.sh   # Setup Zero compiler environment
 │   └── build.sh         # Build the Zero binary
@@ -52,7 +52,7 @@ zero-coding/
 
 ## Install globally on Linux or macOS
 
-The installed command is **`zero-coding`**. From this checkout, run:
+The installed command is **`zero-code`**. From this checkout, run:
 
 ```sh
 make install
@@ -61,7 +61,7 @@ make install
 Or download and run the installer without cloning the repository:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Protocol-Lattice/zero-coding/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Protocol-Lattice/zero-code/main/install.sh | sh
 ```
 
 The installer builds for your machine, installs into `~/.local`, and adds
@@ -70,7 +70,7 @@ new terminal or run the printed `export PATH=...` command in the current termina
 
 ```sh
 cd /path/to/your/project
-zero-coding
+zero-code
 ```
 
 Your current directory is the workspace; `--cwd PATH` selects another one. The
@@ -99,11 +99,11 @@ Node.js 24+ separately if your distribution provides an older version.
 sh ./install.sh --prefix "$HOME/apps/zero" --no-modify-path
 
 # Install a binary you have already built (no compiler setup or rebuild).
-sh ./install.sh --binary ./dist/zero-coding
+sh ./install.sh --binary ./dist/zero-code
 
 # System-wide install: build as your user, then copy with administrator rights.
 make setup build
-sudo sh ./install.sh --binary ./dist/zero-coding --prefix /usr/local --no-modify-path
+sudo sh ./install.sh --binary ./dist/zero-code --prefix /usr/local --no-modify-path
 
 # Remove the default user installation.
 make uninstall
@@ -147,17 +147,17 @@ make setup build
 ./scripts/build.sh
 ```
 
-The build creates `dist/zero-coding` for the host OS/architecture. The compiler
+The build creates `dist/zero-code` for the host OS/architecture. The compiler
 itself is stored at `.tools/bin/zero`.
 
 ### Running
 
 ```bash
 # Run the built binary
-./dist/zero-coding
+./dist/zero-code
 
 # Or use the development launcher
-./zero-coding --help
+./zero-code --help
 ```
 
 Use **↑ / ↓** to scroll the conversation and logs one line at a time, including
@@ -178,8 +178,8 @@ CI runs the build, tests, and an installation smoke test on Linux and macOS.
 
 1. **Clone & install dependencies**
    ```bash
-   git clone https://github.com/Protocol-Lattice/zero-coding-tui.git
-   cd zero-coding-tui
+   git clone https://github.com/Protocol-Lattice/zero-code-tui.git
+   cd zero-code-tui
    ```
 
 2. **Build and install**
@@ -189,7 +189,7 @@ CI runs the build, tests, and an installation smoke test on Linux and macOS.
 
 3. **Run the TUI**
    ```bash
-   zero-coding
+   zero-code
    ```
 
 4. **Test the implementation**
@@ -224,16 +224,16 @@ The application supports four LLM providers:
 
 ```bash
 # Connect to OpenAI with GPT-4
-./dist/zero-coding --provider openai --model gpt-4
+./dist/zero-code --provider openai --model gpt-4
 
 # Connect to Claude
-./dist/zero-coding --provider claude --model claude-sonnet-4-6
+./dist/zero-code --provider claude --model claude-sonnet-4-6
 
 # Connect to Gemini
-./dist/zero-coding --provider gemini --model gemini-3.8-flash
+./dist/zero-code --provider gemini --model gemini-3.8-flash
 
 # Connect to OpenRouter (free tier)
-./dist/zero-coding --provider openrouter --model any/custom-model-id
+./dist/zero-code --provider openrouter --model any/custom-model-id
 ```
 
 ## Parallel work and subagents
@@ -351,8 +351,8 @@ Manage notes directly in the TUI:
 These explicit commands work without an API key. They also work headlessly:
 
 ```sh
-zero-coding --cwd /path/to/project --prompt '/memory set testing Run make test.'
-zero-coding --cwd /path/to/project --prompt '/memory'
+zero-code --cwd /path/to/project --prompt '/memory set testing Run make test.'
+zero-code --cwd /path/to/project --prompt '/memory'
 ```
 
 The model can use the `memory` tool with `action` set to `list`, `set`, `delete`,
@@ -401,7 +401,7 @@ worker activity is collected in the coordinator's journal.
 Use `/logs` to show the current file, or inspect it without an API key:
 
 ```sh
-zero-coding --cwd /path/to/project --prompt '/logs'
+zero-code --cwd /path/to/project --prompt '/logs'
 ```
 
 Each line is a JSON object with a schema `version`, sequence `seq`, Unix-seconds
@@ -470,7 +470,7 @@ MCP request and disconnects its server. Reconnect a server to refresh changed to
 For a noninteractive task:
 
 ```sh
-./zero-coding --mcp all --approve --prompt "Use the configured tools to complete the task."
+./zero-code --mcp all --approve --prompt "Use the configured tools to complete the task."
 ```
 
 `--mcp-config PATH` selects another JSON configuration file. `--approve` authorizes
@@ -509,8 +509,8 @@ argument reads a text reference relative to that skill's directory.
 /skill off          Clear the selected skill
 ```
 
-User skills are discovered in `$XDG_CONFIG_HOME/zero-coding/skills`, or
-`~/.config/zero-coding/skills` when `XDG_CONFIG_HOME` is unset. Use
+User skills are discovered in `$XDG_CONFIG_HOME/zero-code/skills`, or
+`~/.config/zero-code/skills` when `XDG_CONFIG_HOME` is unset. Use
 `--skills-dir PATH` to replace that user collection with another directory;
 project skills take precedence when names collide. `--skill NAME` selects a skill
 at startup, and `--no-skills` disables discovery.
