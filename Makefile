@@ -11,10 +11,10 @@ build:
 	./scripts/build.sh
 
 run: build
-	./dist/zero-coding $(ARGS)
+	./dist/zero-code $(ARGS)
 
 test: build
-	./dist/zero-coding --self-test
+	./dist/zero-code --self-test
 	python3 -m unittest discover -s tests -v
 
 install:
@@ -24,4 +24,4 @@ uninstall:
 	sh ./install.sh --prefix "$(PREFIX)" --uninstall
 
 clean:
-	rm -f dist/zero-coding
+	rm -f dist/zero-code
