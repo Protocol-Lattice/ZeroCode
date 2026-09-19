@@ -160,7 +160,7 @@ main() {
             ref=${ref:-main}
             printf 'Downloading zero-code (%s)…\n' "$ref"
             curl --fail --location --show-error --retry 3 \
-                "https://codeload.github.com/Protocol-Lattice/zero-code/tar.gz/$ref" \
+                "https://codeload.github.com/Protocol-Lattice/ZeroCode/tar.gz/$ref" \
                 -o "$temp_dir/source.tar.gz"
             tar -xzf "$temp_dir/source.tar.gz" --strip-components=1 -C "$project_dir"
         fi

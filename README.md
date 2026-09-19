@@ -61,7 +61,7 @@ make install
 Or download and run the installer without cloning the repository:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Protocol-Lattice/zero-code/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Protocol-Lattice/ZeroCode/main/install.sh | sh
 ```
 
 The installer builds for your machine, installs into `~/.local`, and adds
