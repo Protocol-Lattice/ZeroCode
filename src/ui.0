@@ -216,6 +216,18 @@ fn handleKey(app: mutref<App>, key: u32) -> Void {
             }
             return
         }
+        if app.view == 0 || app.view == 4 {
+            if key == std.term.keyArrowUp() {
+                app.scroll = app.scroll + 1
+                return
+            }
+            if key == std.term.keyArrowDown() {
+                if app.scroll > 0 {
+                    app.scroll = app.scroll - 1
+                }
+                return
+            }
+        }
         if app.phase == 4 {
             if key == 121 || key == 89 {
                 approveTool(app)
@@ -563,7 +575,7 @@ fn render(world: World, app: mutref<App>) -> Void raises {
         paint(app, 14_usize, 7_usize, "\x1b[38;5;250m", "/quit         Exit  ·  Ctrl-D")
         paint(app, 15_usize, 7_usize, "\x1b[38;5;250m", "/mcp          Connect and manage MCP tool servers")
         paint(app, 16_usize, 7_usize, "\x1b[38;5;250m", "/skills       List skills  ·  /skill NAME selects one")
-        paint(app, 17_usize, 7_usize, "\x1b[38;5;245m", "Esc cancels work. PgUp/PgDn scroll. Paste is supported.")
+        paint(app, 17_usize, 7_usize, "\x1b[38;5;245m", "↑/↓ scroll · PgUp/PgDn page · Esc cancel · Paste supported")
     } else if bufLen(transcriptData) == 0 {
         renderWelcome(app, rows, columns)
     } else {
@@ -572,7 +584,7 @@ fn render(world: World, app: mutref<App>) -> Void raises {
     rule(app, rows - 6, columns)
     if app.phase == 4 {
         paint(app, rows - 5, 4_usize, "\x1b[1;38;5;222m", "Approve this action?")
-        paint(app, rows - 3, 4_usize, "\x1b[22;38;5;252m", "[y] approve once   [n] deny   [PgUp/PgDn] review")
+        paint(app, rows - 3, 4_usize, "\x1b[22;38;5;252m", "[y] approve once   [n] deny   [↑/↓ PgUp/PgDn] review")
     } else {
         renderInput(app, rows - 4, columns)
         var status: String = "ready"
@@ -612,7 +624,7 @@ fn render(world: World, app: mutref<App>) -> Void raises {
             number(frameData, std.time.asSecondsFloor(std.time.between(app.started, std.time.monotonic())) as usize)
             append(frameData, "s")
         }
-        paint(app, rows - 2, columns - 29, "\x1b[38;5;244m", "enter send  /help  ctrl-p")
+        paint(app, rows - 2, columns - 31, "\x1b[38;5;244m", "↑/↓ scroll  enter send  /help")
     }
     rule(app, rows - 1, columns)
     paint(app, rows, 4_usize, "\x1b[38;5;183m", providerName(app.provider))

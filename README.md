@@ -156,6 +156,10 @@ itself is stored at `.tools/bin/zero`.
 ./zero-coding --help
 ```
 
+Use **↑ / ↓** to scroll the conversation and logs one line at a time, including
+when reviewing an action for approval. **PgUp / PgDn** scroll by ten lines.
+In the provider picker, **↑ / ↓** select a provider.
+
 ### Testing
 
 ```bash
