@@ -135,8 +135,57 @@ Publish `install.sh` with the rest of this repository to make the download URL
 above available. Include `zero.graph`, `zero.toml`, `src/`, `native/`, and
 `scripts/`: the manifest alone is not a distributable application. A Git tag lets
 users pin a version with `sh install.sh --ref TAG`. For installation without build
-tools, distribute a native binary for each OS/architecture in GitHub Releases;
-users can install their matching download with `--binary`.
+tools, use the prebuilt archives described below.
+
+### Prebuilt binaries with GitHub Actions
+
+[`.github/workflows/prebuilds.yml`](.github/workflows/prebuilds.yml) builds and
+tests native binaries on four runners:
+
+| Archive | Build runner |
+|---------|--------------|
+| `zero-code-linux-x64.tar.gz` | Ubuntu 22.04, x86-64 |
+| `zero-code-linux-arm64.tar.gz` | Ubuntu 22.04, ARM64 |
+| `zero-code-macos-arm64.tar.gz` | macOS 14, Apple Silicon |
+| `zero-code-macos-x64.tar.gz` | macOS 15, Intel |
+
+After committing and pushing the workflow, open **Actions → Prebuilds → Run
+workflow** to build the selected branch. Download the packages from that run's
+**Artifacts** section; they are retained for 14 days. Each artifact contains a
+`.tar.gz` archive and its `.sha256` checksum. Manual runs only upload artifacts.
+
+To publish all four archives and a combined `SHA256SUMS` file to GitHub Releases,
+push a version tag pointing to the commit you want to release:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The tag must include this workflow. Publication waits for all four builds and
+their tests to pass. Tags containing a hyphen, such as `v0.1.0-rc.1`, create a
+prerelease. Rerunning a tag build replaces the matching release assets. The
+workflow uses GitHub's built-in token; no additional secret is needed.
+
+Each archive includes `zero-code`, `install.sh`, `README.md`, and `LICENSE`.
+For example, after downloading the macOS ARM64 archive and `SHA256SUMS` into the
+same directory:
+
+```sh
+grep '  zero-code-macos-arm64.tar.gz$' SHA256SUMS | shasum -a 256 -c -
+tar -xzf zero-code-macos-arm64.tar.gz
+cd zero-code-macos-arm64
+sh ./install.sh --binary ./zero-code
+```
+
+Choose the archive matching your operating system and CPU. Linux builds use
+glibc and the system libcurl, so they are not static musl/Alpine binaries. Use
+Ubuntu 22.04 or a compatible newer system with libcurl and CA certificates
+installed; on Ubuntu 22.04 the runtime packages are `libcurl4` and `ca-certificates`.
+macOS builds use the system libcurl. Build on an older OS yourself if needed.
+Prebuilt installation does not require Node.js or the Zero compiler; Git is
+still needed for workspace file tools. The standalone/piped installer continues
+to build from source unless you pass `--binary` with an extracted executable.
 
 ## Building from source
 
