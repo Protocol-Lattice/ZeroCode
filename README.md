@@ -1,3 +1,4 @@
+<img width="1620" height="971" alt="1" src="https://github.com/user-attachments/assets/7881c456-26cc-4f96-890d-02d4e21490bb" />
 # ZeroCode
 
 A terminal coding assistant built with **Zero**, with native file tools, streaming model responses, MCP servers, and project skills.
