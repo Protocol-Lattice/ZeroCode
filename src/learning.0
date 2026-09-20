@@ -1,0 +1,1358 @@
+// Runtime graph vocabulary. Source semantics stay in the compiler graph; these
+// records attach measured experience and versioned policy to canonical symbols.
+enum LearningNodeKind {
+    experience,
+    task_pattern,
+    strategy,
+    workflow,
+    heuristic,
+    failure,
+    evaluation,
+    improvement_candidate,
+    mutation,
+    strategy_version,
+    rollback,
+}
+
+fn learningSchema() -> String {
+    return "{\"schema\":1,\"revision\":0,\"head\":\"base\",\"nodes\":[],\"edges\":[]}"
+}
+
+// The pinned native backend passes scalar policy values across worker/ABI
+// boundaries: bit 0 selects the read window and bit 1 the invalid retry limit.
+fn learningBasePolicy() -> usize {
+    return 0
+}
+
+fn learningPolicyValid(policy: usize) -> Bool {
+    return policy <= 3
+}
+
+fn learningDefaultWindow(policy: usize, explicit: usize) -> usize {
+    if explicit > 0 {
+        return explicit
+    }
+    if !learningPolicyValid(policy) {
+        return 8192
+    }
+    return learningWindowValue(policy)
+}
+
+fn learningRetryLimit(policy: usize, permanent: Bool) -> usize {
+    if permanent && learningPolicyValid(policy) {
+        return learningRetryValue(policy)
+    }
+    return 3
+}
+
+fn learningPermanentError(result: Span<u8>) -> Bool {
+    return std.str.startsWith(result, "Error: path must be a string.") || std.str.startsWith(result, "Error: offset must be a nonnegative byte offset.") || std.str.startsWith(result, "Error: limit must be an integer from 4 to 12000 bytes.")
+}
+
+fn learningFits(content: Span<u8>, end: usize) -> usize {
+    if quotedSize(utf8Prefix(content, end)) + 512 <= 16384 { return std.mem.len(utf8Prefix(content, end)) }
+    var low: usize = 0
+    var high: usize = end
+    while low < high {
+        let middle: usize = (low + high + 1) / 2
+        if quotedSize(utf8Prefix(content, middle)) + 512 <= 16384 { low = middle }
+        else { high = middle - 1 }
+    }
+    return std.mem.len(utf8Prefix(content, low))
+}
+
+fn learningReadCost(total: usize, policy: usize) -> usize {
+    if total <= 16384 {
+        return 1
+    }
+    let window: usize = learningDefaultWindow(policy, 0_usize)
+    return (total + window - 1) / window
+}
+
+// This gate and the admission vocabulary are immutable to automatic mutations.
+fn learningRegressions(policy: usize) -> Bool {
+    if !learningPolicyValid(policy) {
+        return false
+    }
+    if learningDefaultWindow(policy, 4_usize) != 4 || learningDefaultWindow(policy, 8192_usize) != 8192 || learningDefaultWindow(policy, 12000_usize) != 12000 {
+        return false
+    }
+    if learningReadCost(0_usize, policy) != 1 || learningReadCost(16384_usize, policy) != 1 {
+        return false
+    }
+    if learningRetryLimit(policy, false) != 3 || learningRetryLimit(policy, true) < 2 {
+        return false
+    }
+    if learningPermanentError("Error: file is missing or unreadable.") || learningPermanentError("Error: action denied.") {
+        return false
+    }
+    if !learningPermanentError("Error: path must be a string.") {
+        return false
+    }
+    if safeRelative("../outside") || safeRelative(".zero-agent/learning/graph.json") || safeRelative(".env") {
+        return false
+    }
+    var content: [12000]u8 = [0_u8; 12000]
+    let filled: usize = std.mem.fill(content, 1_u8)
+    let end: usize = learningFits(content, learningWindowValue(policy))
+    return end > 0 && end >= learningFits(content, 8192_usize) && quotedSize(std.mem.prefix(content, end)) + 512 <= 16384 && learningFits("żółw🐢", 5_usize) == 4
+}
+
+fn learningNumber(document: Span<u8>, key: String) -> usize {
+    let parsed: Maybe<u32> = std.json.u32(document, key)
+    if parsed.has {
+        return parsed.value as usize
+    }
+    return 0
+}
+
+fn learningHash(output: MutSpan<u8>, value: Span<u8>) -> Void {
+    clear(output)
+    var digest: [64]u8 = [0_u8; 64]
+    let hashed: Maybe<Span<u8>> = std.crypto.sha256Hex(digest, value)
+    if hashed.has {
+        append(output, hashed.value)
+    }
+}
+
+fn learningSend(value: Span<u8>) -> Void {
+    process.zero_learning_reset()
+    var i: usize = 0
+    while i < std.mem.len(value) {
+        process.zero_learning_byte(value[i] as u32)
+        i = i + 1
+    }
+}
+
+fn learningReceive(output: MutSpan<u8>, count: usize) -> Bool {
+    clear(output)
+    if count > capacity(output) {
+        return false
+    }
+    var i: usize = 0
+    while i < count {
+        put(output, process.zero_learning_at(i as u32) as u8)
+        i = i + 1
+    }
+    return bufOk(output)
+}
+
+fn learningNode(graph: Span<u8>, identity: Span<u8>) -> Span<u8> {
+    let nodes: Span<u8> = field(graph, "nodes")
+    var idStorage: [160]u8 = [0_u8; 160]
+    let id: MutSpan<u8> = buffer(idStorage)
+    var index: usize = 0
+    while index < 4096 {
+        let node: Span<u8> = arrayItem(nodes, index)
+        if std.mem.eql(node, "null") {
+            break
+        }
+        if decode(id, field(node, "id")) && std.mem.eql(bytes(id), identity) {
+            return node
+        }
+        index = index + 1
+    }
+    return "null"
+}
+
+fn learningRules(graph: Span<u8>) -> Span<u8> {
+    var storage: [160]u8 = [0_u8; 160]
+    let head: MutSpan<u8> = buffer(storage)
+    if !decode(head, field(graph, "head")) || std.mem.eql(bytes(head), "base") {
+        return "[]"
+    }
+    return field(learningNode(graph, bytes(head)), "rules")
+}
+
+fn learningValidGraph(graph: Span<u8>) -> Bool {
+    if !std.json.validateBytes(graph) || learningNumber(graph, "schema") != 1 {
+        return false
+    }
+    let nodes: Maybe<usize> = std.json.arrayCount(field(graph, "nodes"))
+    let edges: Maybe<usize> = std.json.arrayCount(field(graph, "edges"))
+    let rules: Maybe<usize> = std.json.arrayCount(learningRules(graph))
+    if !nodes.has || !edges.has || !rules.has {
+        return false
+    }
+    if nodes.value > 4096 || edges.value > 8192 || rules.value > 64 {
+        return false
+    }
+    var headStorage: [160]u8 = [0_u8; 160]
+    let head: MutSpan<u8> = buffer(headStorage)
+    if !decode(head, field(graph, "head")) || !headerSafe(bytes(head)) {
+        return false
+    }
+    if !std.mem.eql(bytes(head), "base") {
+        let version: Span<u8> = learningNode(graph, bytes(head))
+        if !learningVersionValid(graph, version) {
+            return false
+        }
+    }
+    var i: usize = 0
+    while i < rules.value {
+        let rule: Span<u8> = arrayItem(learningRules(graph), i)
+        let policy: usize = learningDecodePolicy(rule)
+        if !learningPolicyValid(policy) {
+            return false
+        }
+        let operation: Span<u8> = field(rule, "operation")
+        if !std.mem.eql(operation, "\"read_window\"") && !std.mem.eql(operation, "\"invalid_retry_limit\"") { return false }
+        let scope: Span<u8> = field(rule, "scope")
+        if !std.mem.eql(scope, "\"task\"") && !std.mem.eql(scope, "\"project\"") && !std.mem.eql(scope, "\"global\"") {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn learningLoad(app: mutref<App>) -> Bool {
+    let count: i32 = process.zero_learning_load()
+    if count < 0 {
+        return false
+    }
+    if count == 0 {
+        setText(app.learningGraph, learningSchema())
+        return true
+    }
+    if !learningReceive(app.learningGraph, count as usize) || !learningValidGraph(bytes(app.learningGraph)) { return false }
+    if std.mem.eql(field(bytes(app.learningGraph), "global_pinned"), "true") {
+        let policy: usize = learningNumber(bytes(app.learningGraph), "global_policy")
+        if !learningPolicyValid(policy) { return false }
+        app.learningGlobalPolicy = policy
+        if !std.mem.eql(field(bytes(app.learningGraph), "global_version"), "null") {
+            if !decode(app.learningGlobalHead, field(bytes(app.learningGraph), "global_version")) || !headerSafe(bytes(app.learningGlobalHead)) { return false }
+        }
+    }
+    return true
+}
+
+fn learningPolicy(app: ref<App>) -> usize {
+    if !app.learningActive || !app.learningEnabled { return 0 }
+    return app.learningSelectedPolicy
+}
+
+fn learningText(app: ref<App>, output: MutSpan<u8>, value: Span<u8>, budget: usize) -> Void {
+    var i: usize = 0
+    var written: usize = 0
+    while i < std.mem.len(value) && written < budget {
+        let remaining: Span<u8> = std.mem.dropPrefix(value, i)
+        var skip: usize = 0
+        if bufLen(app.key) > 0 && std.str.startsWith(remaining, bytes(app.key)) {
+            skip = bufLen(app.key)
+        }
+        var k: usize = 0
+        while k < 5 {
+            var secret: Span<u8> = std.env.getOr("GOOGLE_API_KEY", "")
+            if k < 4 {
+                secret = std.env.getOr(keyVariable(k), "")
+            }
+            if std.mem.len(secret) > skip && std.str.startsWith(remaining, secret) {
+                skip = std.mem.len(secret)
+            }
+            k = k + 1
+        }
+        var start: usize = 0
+        k = 0
+        while k < bufLen(app.logSecrets) {
+            if app.logSecrets[k] == 0 {
+                let secret: Span<u8> = slice(bytes(app.logSecrets), start, k)
+                if std.mem.len(secret) > skip && std.str.startsWith(remaining, secret) {
+                    skip = std.mem.len(secret)
+                }
+                start = k + 1
+            }
+            k = k + 1
+        }
+        if skip > 0 {
+            append(output, "[REDACTED]")
+            i = i + skip
+            written = written + 10
+        } else {
+            let width: Maybe<usize> = std.unicode.widthAt(value, i)
+            let scalar: Maybe<u32> = std.unicode.decodeAt(value, i)
+            if width.has && scalar.has {
+                append(output, slice(value, i, i + width.value))
+                i = i + width.value
+                written = written + width.value
+            } else {
+                append(output, "�")
+                i = i + 1
+                written = written + 3
+            }
+        }
+    }
+    if i < std.mem.len(value) {
+        append(output, " [truncated]")
+    }
+}
+
+fn learningEvent(app: mutref<App>, event: Span<u8>, data: Span<u8>) -> Void {
+    if !app.learningActive || app.workerMode > 0 {
+        return
+    }
+    var recordStorage: [32784]u8 = [0_u8; 32784]
+    let record: MutSpan<u8> = buffer(recordStorage)
+    append(record, "{\"schema\":1,\"seq\":")
+    number(record, app.learningSequence)
+    append(record, ",\"time\":")
+    number(record, std.time.wallSeconds() as usize)
+    append(record, ",\"experience\":")
+    quoted(record, bytes(app.learningIdentity))
+    append(record, ",\"event\":")
+    quoted(record, event)
+    append(record, ",\"data\":")
+    append(record, data)
+    append(record, "}\n")
+    app.learningSequence = app.learningSequence + 1
+    if !bufOk(record) || !std.json.validateBytes(std.str.trimAscii(bytes(record))) {
+        app.learningComplete = false
+        return
+    }
+    learningSend(bytes(record))
+    if process.zero_learning_experience_write() != 1 {
+        app.learningComplete = false
+    }
+}
+
+fn learningStartGraph(app: mutref<App>, prompt: Span<u8>) -> Void {
+    if app.workerMode > 0 || app.demo || hasArg("--no-learning") {
+        return
+    }
+    learningSend(bytes(app.workspace))
+    if process.zero_learning_open(0_u32) != 1 {
+        logEntry(app, "  LEARNING", "Experience storage unavailable; validated policies remain unchanged.")
+        return
+    }
+    learningImportGlobal(app)
+    app.learningEnabled = learningLoad(app)
+    let count: i32 = process.zero_learning_experience_open()
+    if count <= 0 {
+        return
+    }
+    let copied: Bool = learningReceive(app.learningIdentity, count as usize)
+    app.learningActive = copied
+    clear(app.learningNodes)
+    clear(app.learningEdges)
+    app.learningComplete = copied
+    app.learningPromoteRead = false
+    app.learningPromoteRetry = false
+    app.learningSequence = 0
+    app.learningFailures = 0
+    app.learningCorrections = 0
+    app.learningTestsPassed = 0
+    app.learningTestsFailed = 0
+    app.learningTraversals = 0
+    app.learningRequests = 0
+    app.learningTools = 0
+    app.learningRepeatedInvalid = 0
+    app.learningPreviousFailed = false
+    app.learningTokenStart = app.tokens
+    app.learningStarted = std.time.monotonic()
+    clear(app.learningEvidence)
+    learningHash(app.learningTask, prompt)
+    learningHash(app.learningProject, bytes(app.workspace))
+    let decoded: Bool = decode(app.learningHead, field(bytes(app.learningGraph), "head"))
+    app.learningSelectedPolicy = learningPolicyFor(app, true)
+    var textStorage: [8208]u8 = [0_u8; 8208]
+    var recordStorage: [16400]u8 = [0_u8; 16400]
+    let text: MutSpan<u8> = buffer(textStorage)
+    let record: MutSpan<u8> = buffer(recordStorage)
+    learningText(app, text, prompt, 7900_usize)
+    append(record, "{\"task\":")
+    quoted(record, bytes(text))
+    append(record, ",\"pattern\":")
+    quoted(record, bytes(app.learningTask))
+    append(record, ",\"policy_version\":")
+    quoted(record, bytes(app.learningHead))
+    append(record, ",\"global_version\":")
+    quoted(record, bytes(app.learningGlobalHead))
+    append(record, ",\"provider\":")
+    quoted(record, providerSlug(app.provider))
+    append(record, ",\"model\":")
+    quoted(record, bytes(app.model))
+    append(record, "}")
+    learningEvent(app, "task", bytes(record))
+}
+
+fn learningObserveTool(app: mutref<App>, result: Span<u8>) -> Void {
+    if !app.learningActive || app.workerMode > 0 {
+        return
+    }
+    if !std.str.startsWith(result, "Skipped:") { app.learningTools = app.learningTools + 1 }
+    let failed: Bool = std.str.startsWith(result, "Error:") || app.commandResult && app.commandExitCode != 0
+    if failed {
+        app.learningFailures = app.learningFailures + 1
+    }
+    let corrected: Bool = !failed && app.learningPreviousFailed
+    if corrected {
+        app.learningCorrections = app.learningCorrections + 1
+    }
+    app.learningPreviousFailed = failed
+    if std.mem.eql(bytes(app.toolName), "read_file") && learningPermanentError(result) && app.repeatCount > app.learningRepeatedInvalid {
+        app.learningRepeatedInvalid = app.repeatCount
+    }
+    var textStorage: [8208]u8 = [0_u8; 8208]
+    var recordStorage: [24592]u8 = [0_u8; 24592]
+    let text: MutSpan<u8> = buffer(textStorage)
+    let record: MutSpan<u8> = buffer(recordStorage)
+    append(record, "{\"tool\":")
+    quoted(record, bytes(app.toolName))
+    append(record, ",\"arguments\":")
+    learningText(app, text, bytes(app.arguments), 3000_usize)
+    quoted(record, bytes(text))
+    append(record, ",\"result\":")
+    clear(text)
+    learningText(app, text, result, 3000_usize)
+    quoted(record, bytes(text))
+    append(record, ",\"failed\":")
+    if failed {
+        append(record, "true")
+    } else {
+        append(record, "false")
+    }
+    append(record, ",\"command_exit\":")
+    if app.commandResult {
+        var codeStorage: [32]u8 = [0_u8; 32]
+        let code: Maybe<Span<u8>> = std.fmt.i32(codeStorage, app.commandExitCode)
+        if code.has {
+            append(record, code.value)
+        } else {
+            append(record, "null")
+        }
+    } else {
+        append(record, "null")
+    }
+    append(record, ",\"output_bytes\":")
+    number(record, std.mem.len(result))
+    append(record, ",\"elapsed_ms\":")
+    if app.commandResult { number(record, app.commandElapsedMs) } else { append(record, "null") }
+    append(record, "}")
+    learningEvent(app, "tool", bytes(record))
+    if std.mem.eql(bytes(app.toolName), "run_command") {
+        let decoded: Bool = decode(text, field(bytes(app.arguments), "command"))
+        if std.str.contains(bytes(text), "zero query") || std.str.contains(bytes(text), "zero view") || std.str.contains(bytes(text), "zero patch") {
+            app.learningTraversals = app.learningTraversals + 1
+            learningEvent(app, "graph_traversal", bytes(record))
+        }
+        if std.str.contains(bytes(text), "test") || std.str.contains(bytes(text), "check") {
+            if app.commandResult {
+                if failed {
+                    app.learningTestsFailed = app.learningTestsFailed + 1
+                } else {
+                    app.learningTestsPassed = app.learningTestsPassed + 1
+                }
+                learningEvent(app, "test", bytes(record))
+            }
+        }
+    } else if std.str.contains(bytes(app.toolName), "search_graph") || std.str.contains(bytes(app.toolName), "trace_path") || std.str.contains(bytes(app.toolName), "get_code_snippet") {
+        app.learningTraversals = app.learningTraversals + 1
+        learningEvent(app, "graph_traversal", bytes(record))
+    }
+    if failed { learningEvent(app, "failure", bytes(record)) }
+    if corrected { learningEvent(app, "correction", bytes(record)) }
+    if std.mem.eql(bytes(app.toolName), "read_file") && !failed {
+        learningObserveRead(app, result)
+    }
+}
+
+fn learningObserveRead(app: mutref<App>, result: Span<u8>) -> Void {
+    if !std.json.validateBytes(result) || !std.mem.eql(field(bytes(app.arguments), "limit"), "null") {
+        return
+    }
+    let total: usize = learningNumber(result, "total_bytes")
+    if total <= 16384 {
+        return
+    }
+    var contentStorage: [16400]u8 = [0_u8; 16400]
+    var pathStorage: [2048]u8 = [0_u8; 2048]
+    var idStorage: [80]u8 = [0_u8; 80]
+    var rowStorage: [512]u8 = [0_u8; 512]
+    let content: MutSpan<u8> = buffer(contentStorage)
+    let path: MutSpan<u8> = buffer(pathStorage)
+    let id: MutSpan<u8> = buffer(idStorage)
+    let row: MutSpan<u8> = buffer(rowStorage)
+    if !decode(content, field(result, "content")) || !decode(path, field(bytes(app.arguments), "path")) {
+        return
+    }
+    var i: usize = 0
+    var ascii: Bool = true
+    while i < bufLen(content) {
+        if content[i] < 32 || content[i] > 126 || content[i] == 34 || content[i] == 92 {
+            ascii = false
+        }
+        i = i + 1
+    }
+    learningHash(id, bytes(path))
+    append(row, "{\"path\":")
+    quoted(row, bytes(id))
+    append(row, ",\"total\":")
+    number(row, total)
+    append(row, ",\"offset\":")
+    number(row, learningNumber(result, "offset"))
+    append(row, ",\"next\":")
+    number(row, learningNumber(result, "next_offset"))
+    append(row, ",\"ascii\":")
+    if ascii {
+        append(row, "true")
+    } else {
+        append(row, "false")
+    }
+    append(row, "}")
+    if bufLen(app.learningEvidence) > 0 {
+        put(app.learningEvidence, 44_u8)
+    }
+    append(app.learningEvidence, bytes(row))
+    if !bufOk(app.learningEvidence) {
+        app.learningComplete = false
+    }
+}
+
+fn learningReadEvidence(rows: Span<u8>) -> usize {
+    var idStorage: [80]u8 = [0_u8; 80]
+    var otherStorage: [80]u8 = [0_u8; 80]
+    let id: MutSpan<u8> = buffer(idStorage)
+    let other: MutSpan<u8> = buffer(otherStorage)
+    var best: usize = 0
+    var i: usize = 0
+    while i < 256 {
+        let first: Span<u8> = arrayItem(rows, i)
+        if std.mem.eql(first, "null") {
+            break
+        }
+        if learningNumber(first, "offset") == 0 && decode(id, field(first, "path")) {
+            let total: usize = learningNumber(first, "total")
+            var end: usize = 0
+            var j: usize = i
+            while j < 256 {
+                let row: Span<u8> = arrayItem(rows, j)
+                if std.mem.eql(row, "null") {
+                    break
+                }
+                let decoded: Bool = decode(other, field(row, "path"))
+                if std.mem.eql(bytes(id), bytes(other)) {
+                    if learningNumber(row, "total") != total || learningNumber(row, "offset") != end || !std.mem.eql(field(row, "ascii"), "true") {
+                        break
+                    }
+                    let next: usize = learningNumber(row, "next")
+                    if next <= end || next > total {
+                        break
+                    }
+                    end = next
+                    if end == total {
+                        if total > best {
+                            best = total
+                        }
+                        break
+                    }
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn learningAddNode(app: mutref<App>, node: Span<u8>) -> Void {
+    if bufLen(app.learningNodes) > 0 {
+        put(app.learningNodes, 44_u8)
+    }
+    append(app.learningNodes, node)
+}
+
+fn learningEdge(app: mutref<App>, from: Span<u8>, relation: Span<u8>, to: Span<u8>) -> Void {
+    let out: MutSpan<u8> = app.learningEdges
+    if bufLen(out) > 0 {
+        put(out, 44_u8)
+    }
+    append(out, "{\"from\":")
+    quoted(out, from)
+    append(out, ",\"relation\":")
+    quoted(out, relation)
+    append(out, ",\"to\":")
+    quoted(out, to)
+    append(out, "}")
+}
+
+fn learningId(output: MutSpan<u8>, prefix: Span<u8>, experience: Span<u8>, index: usize) -> Void {
+    clear(output)
+    append(output, prefix)
+    append(output, experience)
+    put(output, 58_u8)
+    number(output, index)
+}
+
+fn learningExperience(app: mutref<App>, status: Span<u8>, summary: Span<u8>) -> usize {
+    var rowsStorage: [65552]u8 = [0_u8; 65552]
+    var recordStorage: [8208]u8 = [0_u8; 8208]
+    var textStorage: [2064]u8 = [0_u8; 2064]
+    let rows: MutSpan<u8> = buffer(rowsStorage)
+    let record: MutSpan<u8> = buffer(recordStorage)
+    let text: MutSpan<u8> = buffer(textStorage)
+    append(rows, "[")
+    append(rows, bytes(app.learningEvidence))
+    append(rows, "]")
+    var total: usize = 0
+    if std.mem.eql(status, "completed") && app.learningComplete && app.learningTestsFailed == 0 {
+        total = learningReadEvidence(bytes(rows))
+    }
+    learningText(app, text, summary, 1800_usize)
+    append(record, "{\"kind\":\"experience\",\"id\":")
+    quoted(record, bytes(app.learningIdentity))
+    append(record, ",\"pattern\":")
+    quoted(record, bytes(app.learningTask))
+    append(record, ",\"project\":")
+    quoted(record, bytes(app.learningProject))
+    append(record, ",\"status\":")
+    quoted(record, status)
+    append(record, ",\"summary\":")
+    quoted(record, bytes(text))
+    append(record, ",\"policy_version\":")
+    quoted(record, bytes(app.learningHead))
+    append(record, ",\"global_version\":")
+    quoted(record, bytes(app.learningGlobalHead))
+    append(record, ",\"complete\":")
+    if app.learningComplete {
+        append(record, "true")
+    } else {
+        append(record, "false")
+    }
+    append(record, ",\"metrics\":{\"tools\":")
+    number(record, app.learningTools)
+    append(record, ",\"requests\":")
+    number(record, app.learningRequests)
+    append(record, ",\"tokens\":")
+    number(record, app.tokens - app.learningTokenStart)
+    append(record, ",\"elapsed_ms\":")
+    number(record, std.time.asMsFloor(std.time.between(app.learningStarted, std.time.monotonic())) as usize)
+    append(record, ",\"failures\":")
+    number(record, app.learningFailures)
+    append(record, ",\"corrections\":")
+    number(record, app.learningCorrections)
+    append(record, ",\"tests_passed\":")
+    number(record, app.learningTestsPassed)
+    append(record, ",\"tests_failed\":")
+    number(record, app.learningTestsFailed)
+    append(record, ",\"graph_traversals\":")
+    number(record, app.learningTraversals)
+    append(record, "},\"read_total\":")
+    number(record, total)
+    append(record, ",\"invalid_repeats\":")
+    number(record, app.learningRepeatedInvalid)
+    append(record, "}")
+    learningEvent(app, "outcome", bytes(record))
+    learningEvent(app, "replay_fixture", bytes(rows))
+    if !app.learningComplete {
+        var correctedStorage: [8208]u8 = [0_u8; 8208]
+        let corrected: MutSpan<u8> = buffer(correctedStorage)
+        historyObjectField(corrected, bytes(record), "complete", "false")
+        clear(record)
+        historyObjectField(record, bytes(corrected), "read_total", "0")
+        total = 0
+    }
+    learningAddNode(app, bytes(record))
+    clear(record)
+    append(record, "{\"kind\":\"task_pattern\",\"id\":\"pattern:")
+    append(record, bytes(app.learningIdentity))
+    append(record, "\",\"fingerprint\":")
+    quoted(record, bytes(app.learningTask))
+    append(record, "}")
+    learningAddNode(app, bytes(record))
+    let patternDecoded: Bool = decode(text, field(bytes(record), "id"))
+    learningEdge(app, bytes(app.learningIdentity), "matches_pattern", bytes(text))
+    if app.learningFailures > 0 {
+        clear(record)
+        append(record, "{\"kind\":\"failure\",\"id\":\"failure:")
+        append(record, bytes(app.learningIdentity))
+        append(record, "\",\"count\":")
+        number(record, app.learningFailures)
+        append(record, "}")
+        learningAddNode(app, bytes(record))
+        let failureDecoded: Bool = decode(text, field(bytes(record), "id"))
+        learningEdge(app, bytes(app.learningIdentity), "encountered", bytes(text))
+    }
+    return total
+}
+
+fn learningEvidenceCount(app: ref<App>, read: Bool) -> usize {
+    let nodes: Span<u8> = field(bytes(app.learningGraph), "nodes")
+    var seenStorage: [4096]u8 = [0_u8; 4096]
+    var patternStorage: [80]u8 = [0_u8; 80]
+    let seen: MutSpan<u8> = buffer(seenStorage)
+    let pattern: MutSpan<u8> = buffer(patternStorage)
+    append(seen, bytes(app.learningTask))
+    put(seen, 10_u8)
+    var count: usize = 1
+    var i: usize = 0
+    while i < 4096 && count < 3 {
+        let node: Span<u8> = arrayItem(nodes, i)
+        if std.mem.eql(node, "null") { break }
+        if std.mem.eql(field(node, "kind"), "\"experience\"") && std.mem.eql(field(node, "complete"), "true") {
+            let qualifies: Bool = read && learningNumber(node, "read_total") > 16384 || !read && learningNumber(node, "invalid_repeats") >= 3
+            if qualifies && decode(pattern, field(node, "pattern")) && bufLen(pattern) == 64 {
+                if !std.str.contains(bytes(seen), bytes(pattern)) {
+                    append(seen, bytes(pattern))
+                    put(seen, 10_u8)
+                    count = count + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
+fn learningEvaluate(app: ref<App>, baseline: usize, candidate: usize, total: usize, repeats: usize) -> Bool {
+    if !learningRegressions(candidate) || !app.learningComplete {
+        return false
+    }
+    var before: usize = 0
+    var after: usize = 0
+    if total > 16384 {
+        before = learningReadCost(total, baseline)
+        after = learningReadCost(total, candidate)
+    }
+    if repeats >= 3 {
+        before = before + learningRetryLimit(baseline, true)
+        after = after + learningRetryLimit(candidate, true)
+    }
+    if after >= before {
+        return false
+    }
+    let nodes: Span<u8> = field(bytes(app.learningGraph), "nodes")
+    var i: usize = 0
+    while i < 4096 {
+        let node: Span<u8> = arrayItem(nodes, i)
+        if std.mem.eql(node, "null") {
+            break
+        }
+        if std.mem.eql(field(node, "kind"), "\"experience\"") {
+            let bytes: usize = learningNumber(node, "read_total")
+            if learningReadCost(bytes, candidate) > learningReadCost(bytes, baseline) {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn learningCandidate(app: mutref<App>, read: Bool, total: usize, index: usize) -> Void {
+    var ruleStorage: [32784]u8 = [0_u8; 32784]
+    let ruleSnapshot: MutSpan<u8> = buffer(ruleStorage)
+    learningCurrentRules(app, ruleSnapshot)
+    var baseline: usize = learningPolicyFor(app, true)
+    var candidate: usize = baseline
+    let count: usize = learningEvidenceCount(app, read)
+    let promote: Bool = count >= 3
+    if promote {
+        baseline = learningPolicyFor(app, false)
+    }
+    candidate = baseline
+    if read {
+        candidate = candidate / 2 * 2 + 1
+    } else {
+        candidate = candidate % 2 + 2
+    }
+    var idStorage: [160]u8 = [0_u8; 160]
+    var evaluationStorage: [160]u8 = [0_u8; 160]
+    var versionStorage: [160]u8 = [0_u8; 160]
+    var recordStorage: [32784]u8 = [0_u8; 32784]
+    let id: MutSpan<u8> = buffer(idStorage)
+    let evaluation: MutSpan<u8> = buffer(evaluationStorage)
+    let version: MutSpan<u8> = buffer(versionStorage)
+    let record: MutSpan<u8> = buffer(recordStorage)
+    learningId(id, "candidate:", bytes(app.learningIdentity), index)
+    learningId(evaluation, "evaluation:", bytes(app.learningIdentity), index)
+    learningId(version, "version:", bytes(app.learningIdentity), index)
+    let existingRules: Maybe<usize> = std.json.arrayCount(bytes(ruleSnapshot))
+    var room: Bool = false
+    if existingRules.has { room = existingRules.value < 64 }
+    let accepted: Bool = room && learningEvaluate(app, baseline, candidate, total, app.learningRepeatedInvalid)
+    append(record, "{\"kind\":\"improvement_candidate\",\"id\":")
+    quoted(record, bytes(id))
+    append(record, ",\"target\":")
+    if read {
+        quoted(record, "symbol:zero-coding-tui@0.1.0/workspace::value.readTool")
+    } else {
+        quoted(record, "symbol:zero-coding-tui@0.1.0/main::value.recordToolResult")
+    }
+    append(record, ",\"operation\":")
+    if read {
+        quoted(record, "read_window")
+    } else {
+        quoted(record, "invalid_retry_limit")
+    }
+    append(record, ",\"scope\":")
+    if promote {
+        quoted(record, learningScope(app))
+    } else {
+        quoted(record, "task")
+    }
+    append(record, ",\"evidence_count\":")
+    number(record, count)
+    append(record, "}")
+    learningAddNode(app, bytes(record))
+    learningEvent(app, "candidate", bytes(record))
+    learningEdge(app, bytes(app.learningIdentity), "proposes", bytes(id))
+    if read { learningEdge(app, bytes(id), "mutates", "symbol:zero-coding-tui@0.1.0/workspace::value.readTool") }
+    else { learningEdge(app, bytes(id), "mutates", "symbol:zero-coding-tui@0.1.0/main::value.recordToolResult") }
+    clear(record)
+    append(record, "{\"kind\":\"evaluation\",\"id\":")
+    quoted(record, bytes(evaluation))
+    append(record, ",\"evaluator\":\"deterministic-policy-replay-v1\",\"isolated\":true,\"regressions_passed\":")
+    if learningRegressions(candidate) {
+        append(record, "true")
+    } else {
+        append(record, "false")
+    }
+    append(record, ",\"baseline_cost\":")
+    if read {
+        number(record, learningReadCost(total, baseline))
+    } else {
+        number(record, learningRetryLimit(baseline, true))
+    }
+    append(record, ",\"candidate_cost\":")
+    if read {
+        number(record, learningReadCost(total, candidate))
+    } else {
+        number(record, learningRetryLimit(candidate, true))
+    }
+    append(record, ",\"content_loss\":0,\"accepted\":")
+    if accepted {
+        append(record, "true")
+    } else {
+        append(record, "false")
+    }
+    append(record, ",\"reason\":")
+    if accepted {
+        quoted(record, "Strictly fewer replayed requests, unchanged coverage and no regression in retained fixtures or immutable checks.")
+    } else {
+        quoted(record, "No measurable improvement, incomplete experience, or regression failure. Candidate discarded.")
+    }
+    append(record, "}")
+    learningAddNode(app, bytes(record))
+    learningEvent(app, "evaluation", bytes(record))
+    learningEdge(app, bytes(id), "evaluated_by", bytes(evaluation))
+    clear(record)
+    append(record, "{\"kind\":\"mutation\",\"id\":\"mutation:")
+    append(record, bytes(id))
+    append(record, "\",\"candidate\":")
+    quoted(record, bytes(id))
+    append(record, ",\"status\":")
+    if accepted {
+        quoted(record, "accepted")
+    } else {
+        quoted(record, "rejected")
+    }
+    append(record, "}")
+    learningAddNode(app, bytes(record))
+    if !accepted { return }
+    if promote && !app.learningGlobalMode {
+        if read { app.learningPromoteRead = true } else { app.learningPromoteRetry = true }
+    }
+    clear(record)
+    append(record, "{\"kind\":\"strategy_version\",\"id\":")
+    quoted(record, bytes(version))
+    append(record, ",\"parent\":")
+    quoted(record, bytes(app.learningHead))
+    append(record, ",\"experience\":")
+    quoted(record, bytes(app.learningIdentity))
+    append(record, ",\"evaluation\":")
+    quoted(record, bytes(evaluation))
+    append(record, ",\"base_policy\":")
+    number(record, app.learningGlobalPolicy)
+    append(record, ",\"global_version\":")
+    quoted(record, bytes(app.learningGlobalHead))
+    append(record, ",\"rules\":[")
+    let rules: Span<u8> = bytes(ruleSnapshot)
+    var r: usize = 0
+    var kept: usize = 0
+    while r < 64 {
+        let rule: Span<u8> = arrayItem(rules, r)
+        if std.mem.eql(rule, "null") {
+            break
+        }
+        if kept > 0 {
+            put(record, 44_u8)
+        }
+        append(record, rule)
+        kept = kept + 1
+        r = r + 1
+    }
+    if kept > 0 {
+        put(record, 44_u8)
+    }
+    append(record, "{\"operation\":")
+    if read { quoted(record, "read_window") } else { quoted(record, "invalid_retry_limit") }
+    append(record, ",\"scope\":")
+    if promote {
+        quoted(record, learningScope(app))
+    } else {
+        quoted(record, "task")
+    }
+    append(record, ",\"pattern\":")
+    quoted(record, bytes(app.learningTask))
+    append(record, ",\"read_window\":")
+    number(record, learningWindowValue(candidate))
+    append(record, ",\"invalid_retry_limit\":")
+    number(record, learningRetryValue(candidate))
+    append(record, "}]}")
+    learningAddNode(app, bytes(record))
+    learningEdge(app, bytes(version), "descends_from", bytes(app.learningHead))
+    learningEdge(app, bytes(version), "validated_by", bytes(evaluation))
+    learningEdge(app, bytes(version), "triggered_by", bytes(app.learningIdentity))
+    if !std.mem.eql(bytes(app.learningGlobalHead), "base") { learningEdge(app, bytes(version), "inherits_global", bytes(app.learningGlobalHead)) }
+    setText(app.learningHead, bytes(version))
+    clear(record)
+    append(record, "{\"kind\":\"strategy\",\"id\":\"strategy:")
+    append(record, bytes(version))
+    append(record, "\",\"version\":")
+    quoted(record, bytes(version))
+    append(record, "}")
+    learningAddNode(app, bytes(record))
+    let strategyDecoded: Bool = decode(id, field(bytes(record), "id"))
+    learningEdge(app, bytes(version), "implements", bytes(id))
+    clear(record)
+    append(record, "{\"kind\":\"workflow\",\"id\":\"workflow:")
+    append(record, bytes(version))
+    append(record, "\",\"steps\":[\"inspect\",\"execute\",\"verify\",\"observe\",\"evaluate\"]}")
+    learningAddNode(app, bytes(record))
+    let workflowDecoded: Bool = decode(id, field(bytes(record), "id"))
+    learningEdge(app, bytes(version), "uses_workflow", bytes(id))
+    clear(record)
+    append(record, "{\"kind\":\"heuristic\",\"id\":\"heuristic:")
+    append(record, bytes(version))
+    append(record, "\",\"strategy_version\":")
+    quoted(record, bytes(version))
+    append(record, "}")
+    learningAddNode(app, bytes(record))
+    let heuristicDecoded: Bool = decode(id, field(bytes(record), "id"))
+    learningEdge(app, bytes(version), "uses_heuristic", bytes(id))
+}
+
+fn learningCommit(app: mutref<App>) -> i32 {
+    var storage: [2097168]u8 = [0_u8; 2097168]
+    let output: MutSpan<u8> = buffer(storage)
+    let revision: usize = learningNumber(bytes(app.learningGraph), "revision") + 1
+    append(output, "{\"schema\":1,\"revision\":")
+    number(output, revision)
+    append(output, ",\"global_pinned\":")
+    if hasArg("--learning-rollback") || std.mem.eql(field(bytes(app.learningGraph), "global_pinned"), "true") { append(output, "true") } else { append(output, "false") }
+    append(output, ",\"global_policy\":")
+    number(output, app.learningGlobalPolicy)
+    append(output, ",\"global_version\":")
+    quoted(output, bytes(app.learningGlobalHead))
+    append(output, ",\"head\":")
+    quoted(output, bytes(app.learningHead))
+    append(output, ",\"nodes\":[")
+    let nodes: Span<u8> = field(bytes(app.learningGraph), "nodes")
+    if std.mem.len(nodes) > 2 {
+        append(output, slice(nodes, 1_usize, std.mem.len(nodes) - 1))
+        if bufLen(app.learningNodes) > 0 {
+            put(output, 44_u8)
+        }
+    }
+    append(output, bytes(app.learningNodes))
+    append(output, "],\"edges\":[")
+    let edges: Span<u8> = field(bytes(app.learningGraph), "edges")
+    if std.mem.len(edges) > 2 {
+        append(output, slice(edges, 1_usize, std.mem.len(edges) - 1))
+        if bufLen(app.learningEdges) > 0 {
+            put(output, 44_u8)
+        }
+    }
+    append(output, bytes(app.learningEdges))
+    append(output, "]}")
+    if !bufOk(output) || !bufOk(app.learningNodes) || !bufOk(app.learningEdges) || !learningValidGraph(bytes(output)) {
+        return 0
+    }
+    learningSend(bytes(output))
+    let saved: i32 = process.zero_learning_commit(revision as u32)
+    if saved == 1 {
+        setText(app.learningGraph, bytes(output))
+    }
+    return saved
+}
+
+fn learningFinishGraph(app: mutref<App>, status: Span<u8>, summary: Span<u8>) -> Void {
+    if !app.learningActive || app.workerMode > 0 {
+        return
+    }
+    clear(app.learningNodes)
+    clear(app.learningEdges)
+    let total: usize = learningExperience(app, status, summary)
+    let evidenceRecorded: Bool = app.learningComplete
+    var attempt: usize = 0
+    var committed: Bool = false
+    while app.learningEnabled && attempt < 2 {
+        if !learningLoad(app) {
+            break
+        }
+        let decoded: Bool = decode(app.learningHead, field(bytes(app.learningGraph), "head"))
+        let experienceLength: usize = bufLen(app.learningNodes)
+        if evidenceRecorded && !std.mem.eql(status, "cancelled") && !std.mem.eql(status, "interrupted") {
+            if total > 16384 {
+                learningCandidate(app, true, total, 0_usize)
+            }
+            if app.learningRepeatedInvalid >= 3 {
+                learningCandidate(app, false, 0_usize, 1_usize)
+            }
+        }
+        if !app.learningComplete {
+            setLen(app.learningNodes, experienceLength)
+            clear(app.learningEdges)
+            let restored: Bool = decode(app.learningHead, field(bytes(app.learningGraph), "head"))
+            app.learningPromoteRead = false
+            app.learningPromoteRetry = false
+        }
+        let saved: i32 = learningCommit(app)
+        if saved == 1 {
+            committed = true
+            break
+        }
+        if saved != 2 {
+            break
+        }
+        setLen(app.learningNodes, experienceLength)
+        clear(app.learningEdges)
+        attempt = attempt + 1
+    }
+    if !committed {
+        logEntry(app, "  LEARNING", "Experience recorded; no policy published (graph unavailable, full, or concurrently changed).")
+    } else {
+        learningEvent(app, "persistent_version", field(bytes(app.learningGraph), "head"))
+    }
+    if committed && (app.learningPromoteRead || app.learningPromoteRetry) { learningPromoteGlobal(app, total) }
+    process.zero_learning_experience_close()
+    app.learningActive = false
+}
+
+fn appendLearningContext(app: mutref<App>) -> Void {
+    if !app.learningActive || !app.learningEnabled {
+        return
+    }
+    let policy: usize = learningPolicy(app)
+    if learningWindowValue(policy) == 8192 && learningRetryValue(policy) == 3 {
+        return
+    }
+    append(app.systemContext, "\nValidated semantic strategy (bounded runtime policy): ")
+    append(app.systemContext, "default ranged-read window=")
+    number(app.systemContext, learningWindowValue(policy))
+    append(app.systemContext, "; identical invalid-argument retry limit=")
+    number(app.systemContext, learningRetryValue(policy))
+    append(app.systemContext, ". Continue from next_offset until coverage is complete; correct invalid arguments before retrying. Explicit read limits, approvals, ignored paths, and user instructions retain priority. Strategy ancestry: ")
+    quoted(app.systemContext, bytes(app.learningHead))
+    append(app.systemContext, "; inherited global version: ")
+    quoted(app.systemContext, bytes(app.learningGlobalHead))
+}
+
+fn learningManageGraph(app: mutref<App>) -> Bool {
+    let rollback: Maybe<String> = std.args.valueAfter("--learning-rollback")
+    if !rollback.has && !hasArg("--learning-history") {
+        return false
+    }
+    var opened: Bool = false
+    if hasArg("--learning-global") { opened = learningGlobalOpen(app) }
+    else { learningSend(bytes(app.workspace))
+        opened = process.zero_learning_open(0_u32) == 1 }
+    app.exitCode = 1
+    if !opened || !learningLoad(app) {
+        logEntry(app, "  LEARNING", "Cannot read learning graph.")
+        return true
+    }
+    if !rollback.has {
+        logEntry(app, "  LEARNING GRAPH", bytes(app.learningGraph))
+        app.exitCode = 0
+        return true
+    }
+    let target: Span<u8> = rollback.value
+    if !std.mem.eql(target, "base") && !std.mem.eql(field(learningNode(bytes(app.learningGraph), target), "kind"), "\"strategy_version\"") {
+        logEntry(app, "  LEARNING", "Unknown strategy version; nothing changed.")
+        return true
+    }
+    clear(app.learningNodes)
+    clear(app.learningEdges)
+    app.learningGlobalPolicy = learningNumber(learningNode(bytes(app.learningGraph), target), "base_policy")
+    setText(app.learningGlobalHead, "base")
+    if !std.mem.eql(target, "base") {
+        let decoded: Bool = decode(app.learningGlobalHead, field(learningNode(bytes(app.learningGraph), target), "global_version"))
+    }
+    setText(app.learningHead, target)
+    var recordStorage: [512]u8 = [0_u8; 512]
+    let record: MutSpan<u8> = buffer(recordStorage)
+    append(record, "{\"kind\":\"rollback\",\"id\":\"rollback:")
+    number(record, learningNumber(bytes(app.learningGraph), "revision") + 1)
+    append(record, "\",\"target\":")
+    quoted(record, target)
+    append(record, "}")
+    learningAddNode(app, bytes(record))
+    if learningCommit(app) == 1 {
+        app.exitCode = 0
+        logEntry(app, "  LEARNING ROLLBACK", target)
+    } else {
+        logEntry(app, "  LEARNING", "Rollback conflict or storage failure; no version changed.")
+    }
+    return true
+}
+
+fn learningStorage(world: World, app: mutref<App>) -> i32 {
+    var graphStorage: [256]u8 = [0_u8; 256]
+    var nodeStorage: [131088]u8 = [0_u8; 131088]
+    var edgeStorage: [16400]u8 = [0_u8; 16400]
+    var evidenceStorage: [65552]u8 = [0_u8; 65552]
+    var identityStorage: [160]u8 = [0_u8; 160]
+    var taskStorage: [80]u8 = [0_u8; 80]
+    var projectStorage: [80]u8 = [0_u8; 80]
+    var headStorage: [160]u8 = [0_u8; 160]
+    var globalHeadStorage: [160]u8 = [0_u8; 160]
+    let previousGlobalHead: MutSpan<u8> = app.learningGlobalHead
+    let previousgraph: MutSpan<u8> = app.learningGraph
+    let previousnodes: MutSpan<u8> = app.learningNodes
+    let previousedges: MutSpan<u8> = app.learningEdges
+    let previousevidence: MutSpan<u8> = app.learningEvidence
+    let previousidentity: MutSpan<u8> = app.learningIdentity
+    let previoustask: MutSpan<u8> = app.learningTask
+    let previousproject: MutSpan<u8> = app.learningProject
+    let previoushead: MutSpan<u8> = app.learningHead
+    app.learningGlobalHead = buffer(globalHeadStorage)
+    app.learningGraph = buffer(graphStorage)
+    app.learningNodes = buffer(nodeStorage)
+    app.learningEdges = buffer(edgeStorage)
+    app.learningEvidence = buffer(evidenceStorage)
+    app.learningIdentity = buffer(identityStorage)
+    app.learningTask = buffer(taskStorage)
+    app.learningProject = buffer(projectStorage)
+    app.learningHead = buffer(headStorage)
+    let code: i32 = extensionReady(world, app)
+    learningFinish(app, "interrupted", "Session ended before a final outcome.")
+    process.zero_learning_close()
+    app.learningGraph = previousgraph
+    app.learningNodes = previousnodes
+    app.learningEdges = previousedges
+    app.learningEvidence = previousevidence
+    app.learningIdentity = previousidentity
+    app.learningTask = previoustask
+    app.learningProject = previousproject
+    app.learningHead = previoushead
+    app.learningGlobalHead = previousGlobalHead
+    return code
+}
+
+fn learningWindowValue(policy: usize) -> usize {
+    if policy % 2 == 1 { return 12000 }
+    return 8192
+}
+
+fn learningRetryValue(policy: usize) -> usize {
+    if policy >= 2 { return 2 }
+    return 3
+}
+
+fn learningDecodePolicy(rule: Span<u8>) -> usize {
+    let window: usize = learningNumber(rule, "read_window")
+    let retries: usize = learningNumber(rule, "invalid_retry_limit")
+    if (window != 8192 && window != 12000) || (retries != 2 && retries != 3) { return 4 }
+    var policy: usize = 0
+    if window == 12000 { policy = 1 }
+    if retries == 2 { policy = policy + 2 }
+    return policy
+}
+
+fn learningPolicyFor(app: ref<App>, taskScoped: Bool) -> usize {
+    if !app.learningEnabled || !app.learningActive { return learningBasePolicy() }
+    var ruleStorage: [32784]u8 = [0_u8; 32784]
+    let rules: MutSpan<u8> = buffer(ruleStorage)
+    learningCurrentRules(app, rules)
+    if !bufOk(rules) { return learningBasePolicy() }
+    return learningApplyRules(bytes(rules), bytes(app.learningTask), taskScoped, app.learningGlobalPolicy)
+}
+
+fn learningApplyRules(rules: Span<u8>, task: Span<u8>, taskScoped: Bool, base: usize) -> usize {
+    var policy: usize = base
+    var rank: usize = 0
+    while rank < 2 {
+        var i: usize = 0
+        while i < 64 {
+            let rule: Span<u8> = arrayItem(rules, i)
+            if std.mem.eql(rule, "null") { break }
+            var patternStorage: [80]u8 = [0_u8; 80]
+            let pattern: MutSpan<u8> = buffer(patternStorage)
+            let decoded: Bool = decode(pattern, field(rule, "pattern"))
+            let local: Bool = std.mem.eql(field(rule, "scope"), "\"task\"")
+            if rank == 0 && !local || rank == 1 && local && taskScoped && std.mem.eql(bytes(pattern), task) {
+                let value: usize = learningDecodePolicy(rule)
+                if !learningPolicyValid(value) { return 0 }
+                if std.mem.eql(field(rule, "operation"), "\"read_window\"") { policy = policy / 2 * 2 + value % 2 }
+                if std.mem.eql(field(rule, "operation"), "\"invalid_retry_limit\"") { policy = policy % 2 + value / 2 * 2 }
+            }
+            i = i + 1
+        }
+        rank = rank + 1
+    }
+    return policy
+}
+
+// Only anonymous, project-validated scalar evidence crosses the project boundary.
+// Global strategies require independent validation in three distinct workspaces.
+fn learningGlobalOpen(app: ref<App>) -> Bool {
+    if hasArg("--no-global-learning") { return false }
+    var root: Span<u8> = std.env.getOr("ZERO_LEARNING_GLOBAL_ROOT", "")
+    if std.mem.len(root) == 0 { root = std.env.getOr("XDG_STATE_HOME", "") }
+    if std.mem.len(root) == 0 { root = std.env.getOr("HOME", "") }
+    if std.mem.len(root) == 0 { return false }
+    learningSend(root)
+    return process.zero_learning_open(1_u32) == 1
+}
+
+fn learningImportGlobal(app: mutref<App>) -> Void {
+    setText(app.learningGlobalHead, "base")
+    app.learningGlobalPolicy = 0
+    if learningGlobalOpen(app) {
+        if learningLoad(app) {
+            app.learningGlobalPolicy = learningApplyRules(learningRules(bytes(app.learningGraph)), "", false, 0_usize)
+            let decoded: Bool = decode(app.learningGlobalHead, field(bytes(app.learningGraph), "head"))
+        }
+    }
+    let selected: i32 = process.zero_learning_select(0_u32)
+}
+
+fn learningScope(app: ref<App>) -> String {
+    if app.learningGlobalMode { return "global" }
+    return "project"
+}
+
+fn learningPromoteGlobal(app: mutref<App>, total: usize) -> Void {
+    if !learningGlobalOpen(app) { return }
+    var taskStorage: [80]u8 = [0_u8; 80]
+    var headStorage: [160]u8 = [0_u8; 160]
+    var recordStorage: [1024]u8 = [0_u8; 1024]
+    let task: MutSpan<u8> = buffer(taskStorage)
+    let head: MutSpan<u8> = buffer(headStorage)
+    let record: MutSpan<u8> = buffer(recordStorage)
+    setText(task, bytes(app.learningTask))
+    setText(head, bytes(app.learningHead))
+    setText(app.learningTask, bytes(app.learningProject))
+    app.learningGlobalMode = true
+    app.learningGlobalPolicy = 0
+    setText(app.learningGlobalHead, "base")
+    var attempt: usize = 0
+    while attempt < 2 {
+        if !learningLoad(app) { break }
+        clear(app.learningNodes)
+        clear(app.learningEdges)
+        clear(record)
+        let decoded: Bool = decode(app.learningHead, field(bytes(app.learningGraph), "head"))
+        append(record, "{\"kind\":\"experience\",\"id\":")
+        quoted(record, bytes(app.learningIdentity))
+        append(record, ",\"pattern\":")
+        quoted(record, bytes(app.learningProject))
+        append(record, ",\"project\":")
+        quoted(record, bytes(app.learningProject))
+        append(record, ",\"source_version\":")
+        quoted(record, bytes(head))
+        append(record, ",\"complete\":true,\"read_total\":")
+        if app.learningPromoteRead { number(record, total) } else { number(record, 0_usize) }
+        append(record, ",\"invalid_repeats\":")
+        if app.learningPromoteRetry { number(record, app.learningRepeatedInvalid) } else { number(record, 0_usize) }
+        append(record, "}")
+        learningAddNode(app, bytes(record))
+        if app.learningPromoteRead && learningEvidenceCount(app, true) >= 3 { learningCandidate(app, true, total, 2_usize) }
+        if app.learningPromoteRetry && learningEvidenceCount(app, false) >= 3 { learningCandidate(app, false, 0_usize, 3_usize) }
+        let saved: i32 = learningCommit(app)
+        if saved != 2 { break }
+        attempt = attempt + 1
+    }
+    app.learningGlobalMode = false
+    setText(app.learningTask, bytes(task))
+    let selected: i32 = process.zero_learning_select(0_u32)
+    let restored: Bool = learningLoad(app)
+    let decoded: Bool = decode(app.learningHead, field(bytes(app.learningGraph), "head"))
+}
+
+fn learningEventText(app: mutref<App>, event: Span<u8>, value: Span<u8>) -> Void {
+    if !app.learningActive || app.workerMode > 0 { return }
+    var textStorage: [8208]u8 = [0_u8; 8208]
+    var recordStorage: [32784]u8 = [0_u8; 32784]
+    let text: MutSpan<u8> = buffer(textStorage)
+    let record: MutSpan<u8> = buffer(recordStorage)
+    learningText(app, text, value, 7500_usize)
+    append(record, "{\"text\":")
+    quoted(record, bytes(text))
+    append(record, "}")
+    learningEvent(app, event, bytes(record))
+}
+
+fn learningVersionValid(graph: Span<u8>, version: Span<u8>) -> Bool {
+    if !std.mem.eql(field(version, "kind"), "\"strategy_version\"") { return false }
+    var idStorage: [160]u8 = [0_u8; 160]
+    let id: MutSpan<u8> = buffer(idStorage)
+    if !decode(id, field(version, "evaluation")) { return false }
+    let evaluation: Span<u8> = learningNode(graph, bytes(id))
+    if !std.mem.eql(field(evaluation, "kind"), "\"evaluation\"") || !std.mem.eql(field(evaluation, "accepted"), "true") || !std.mem.eql(field(evaluation, "regressions_passed"), "true") { return false }
+    if !std.mem.eql(field(evaluation, "evaluator"), "\"deterministic-policy-replay-v1\"") { return false }
+    if learningNumber(evaluation, "candidate_cost") >= learningNumber(evaluation, "baseline_cost") { return false }
+    if !decode(id, field(version, "experience")) { return false }
+    let experience: Span<u8> = learningNode(graph, bytes(id))
+    if !std.mem.eql(field(experience, "kind"), "\"experience\"") || !std.mem.eql(field(experience, "complete"), "true") { return false }
+    let rules: Span<u8> = field(version, "rules")
+    let count: Maybe<usize> = std.json.arrayCount(rules)
+    if !count.has { return false }
+    if count.value == 0 || count.value > 64 { return false }
+    let last: Span<u8> = arrayItem(rules, count.value - 1)
+    let candidate: usize = learningDecodePolicy(last)
+    if !learningRegressions(candidate) { return false }
+    if std.mem.eql(field(last, "operation"), "\"read_window\"") {
+        let total: usize = learningNumber(experience, "read_total")
+        if total <= 16384 || learningReadCost(total, candidate) != learningNumber(evaluation, "candidate_cost") { return false }
+    } else if std.mem.eql(field(last, "operation"), "\"invalid_retry_limit\"") {
+        if learningNumber(experience, "invalid_repeats") < 3 || learningRetryValue(candidate) != learningNumber(evaluation, "candidate_cost") { return false }
+    } else { return false }
+    if !decode(id, field(version, "parent")) { return false }
+    if !std.mem.eql(bytes(id), "base") {
+        if std.mem.eql(field(version, "id"), field(version, "parent")) || !std.mem.eql(field(learningNode(graph, bytes(id)), "kind"), "\"strategy_version\"") { return false }
+    }
+    return true
+}
+
+fn learningCurrentRules(app: ref<App>, output: MutSpan<u8>) -> Void {
+    clear(output)
+    var pendingStorage: [131600]u8 = [0_u8; 131600]
+    let pending: MutSpan<u8> = buffer(pendingStorage)
+    append(pending, "{\"nodes\":[")
+    append(pending, bytes(app.learningNodes))
+    append(pending, "]}")
+    let version: Span<u8> = learningNode(bytes(pending), bytes(app.learningHead))
+    if !std.mem.eql(version, "null") { append(output, field(version, "rules")) }
+    else { append(output, learningRules(bytes(app.learningGraph))) }
+}
+
+// Keep the full graph out of the long-lived execution stack. Tool buffers are
+// large; only the selected scalar policy survives these bounded transactions.
+fn learningStart(app: mutref<App>, prompt: Span<u8>) -> Void {
+    if app.workerMode > 0 || app.demo || hasArg("--no-learning") { return }
+    var graphStorage: [2097168]u8 = [0_u8; 2097168]
+    let previous: MutSpan<u8> = app.learningGraph
+    app.learningGraph = buffer(graphStorage)
+    learningStartGraph(app, prompt)
+    app.learningGraph = previous
+}
+
+fn learningFinish(app: mutref<App>, status: Span<u8>, summary: Span<u8>) -> Void {
+    if !app.learningActive || app.workerMode > 0 { return }
+    var graphStorage: [2097168]u8 = [0_u8; 2097168]
+    let previous: MutSpan<u8> = app.learningGraph
+    app.learningGraph = buffer(graphStorage)
+    learningFinishGraph(app, status, summary)
+    app.learningGraph = previous
+}
+
+fn learningManage(app: mutref<App>) -> Bool {
+    var graphStorage: [2097168]u8 = [0_u8; 2097168]
+    let previous: MutSpan<u8> = app.learningGraph
+    app.learningGraph = buffer(graphStorage)
+    let handled: Bool = learningManageGraph(app)
+    app.learningGraph = previous
+    return handled
+}

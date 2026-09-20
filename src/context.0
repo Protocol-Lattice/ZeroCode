@@ -342,10 +342,13 @@ fn ensureHistorySpace(app: mutref<App>, reserve: usize, keepLatest: Bool) -> Boo
             // The active exchange may contain large signed reasoning blocks.
             // Preserve them intact beyond the normal 64 KiB working budget.
             if !bufOk(app.history) || bufLen(app.history) > hardBudget {
-                if !retainRecentHistory(app, bytes(snapshot), hardBudget, keepLatest) { return false }
+                if !retainRecentHistory(app, bytes(snapshot), hardBudget, keepLatest) {
+                    return false
+                }
             }
         }
     }
+    learningEvent(app, "context_compaction", "{\"recent_history_retained\":true}")
     logEntry(app, "  CONTEXT COMPACTED", "Earlier tool output was shortened automatically. Current instructions and recent tool exchanges are retained.")
     return true
 }
@@ -367,8 +370,11 @@ fn userMessage(app: mutref<App>, message: Span<u8>) -> Bool {
 }
 
 fn appendToolResult(app: mutref<App>, result: Span<u8>) -> Void {
+    learningObserveTool(app, result)
     finishWorkerTool(app, result)
-    if std.str.startsWith(result, "Error:") { app.memorySkipSave = true }
+    if std.str.startsWith(result, "Error:") {
+        app.memorySkipSave = true
+    }
     let historyData: MutSpan<u8> = app.history
     let pendingData: MutSpan<u8> = app.pending
     let toolIdData: MutSpan<u8> = app.toolId

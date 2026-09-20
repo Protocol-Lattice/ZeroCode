@@ -20,7 +20,11 @@ A terminal coding assistant built with **Zero**, with native file tools, streami
 - **Large files** – UTF-8 range reads and approved edits of files up to 64 MiB
 - **Bounded context** – automatic shortening of old tool output and a digest of older exchanges
 - **Project memory** – automatic task recaps and saved facts persist across sessions, with commands to inspect and forget them
+- **Validated learning** – structured task experience, isolated policy replay, immutable strategy versions, and rollback are part of the normal prompt lifecycle
 - **Host builds** – Linux and macOS builds using the pinned Zero compiler and system libcurl
+
+See [continuous learning](docs/learning.md) for the mutation gates, scope
+promotion, supported policy changes, experience storage, and rollback commands.
 
 ## Project Structure
 
@@ -35,12 +39,14 @@ zero-code/
 ├── src/context.0       # History, tool results and automatic compaction
 ├── src/memory.0         # Persistent project facts, approvals and atomic storage
 ├── src/logs.0           # Automatic local session journals and key redaction
+├── src/learning.0       # Semantic strategy graph, evidence, replay gates and versions
 ├── src/mcp.0           # Persistent MCP stdio connections
 ├── src/skills.0        # Skill discovery and loading
 ├── src/skill_fetch.0   # Repository fetching and project skill imports
 ├── src/ui.0            # Terminal rendering and keyboard input
 ├── native/http_stream.c # HTTP transport worker
 ├── native/session_log.c # Bounded native append writer
+├── native/learning_store.c # Private journals and atomic graph transactions
 ├── tests/              # Black-box tests of the compiled binary
 ├── zero.toml           # Package manifest
 ├── zero.graph          # Canonical Zero program graph
@@ -231,6 +237,8 @@ The application supports four LLM providers:
 - `--cwd <dir>` – Working directory for the agent
 - `--no-memory` – Disable reading and changing saved project memory for this run
 - `--no-session-logs` – Disable automatic session logging for this run
+- `--no-learning` – Disable experience capture and automatic policy learning
+- `--no-global-learning` – Keep learning local to this project
 
 ## Example Usage
 
@@ -464,9 +472,10 @@ keys and keys entered through `/key` are redacted, including across streaming
 chunks; the key dialog itself is never recorded. Logs can still contain other
 sensitive text from prompts or tool output. Keep `.zero-agent/` out of version
 control. `--no-session-logs` disables logs independently of `--no-memory`; use
-both flags to disable both persistence mechanisms. Demo, snapshot, help, and
+both flags to disable session logs and memory. Demo, snapshot, help, and
 self-test runs do not create logs. If storage fails, a visible warning disables
-logging for that run while the task continues.
+logging for that run while the task continues. Learning experiences have their
+own journal; add `--no-learning` to disable that persistence as well.
 
 ## MCP servers
 

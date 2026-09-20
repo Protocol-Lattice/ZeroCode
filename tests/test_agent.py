@@ -111,6 +111,9 @@ def environment(endpoint=None, keys=True):
         env["ZERO_API_URL"] = endpoint
     env["TERM"] = "xterm-256color"
     env["XDG_CONFIG_HOME"] = str(ROOT / ".zero/test-config")
+    # Never read or promote a developer's real cross-project strategies in tests.
+    env["ZERO_LEARNING_GLOBAL_ROOT"] = env.pop(
+        "ZERO_TEST_LEARNING_GLOBAL_ROOT", str(ROOT / ".zero/no-global-test-store"))
     return env
 
 

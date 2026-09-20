@@ -9,7 +9,7 @@ fn sessionLogUnavailable(app: mutref<App>) -> Void {
 }
 
 fn rememberLogKey(app: mutref<App>, key: Span<u8>) -> Void {
-    if !app.logEnabled || std.mem.len(key) == 0 { return }
+    if (!app.logEnabled && hasArg("--no-learning")) || std.mem.len(key) == 0 { return }
     // Keys are kept only in RAM, including keys replaced through /key.
     if std.mem.len(key) > 2032 || containsNul(key) {
         sessionLogUnavailable(app)

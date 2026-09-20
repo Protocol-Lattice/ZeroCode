@@ -110,7 +110,7 @@ fn readTool(app: mutref<App>) -> Void {
         return
     }
     var offset: usize = 0
-    var limit: usize = 8192
+    var limit: usize = learningDefaultWindow(learningPolicy(app), 0_usize)
     let offsetRaw: Span<u8> = field(args, "offset")
     let limitRaw: Span<u8> = field(args, "limit")
     if !std.mem.eql(offsetRaw, "null") {
@@ -164,6 +164,9 @@ fn readTool(app: mutref<App>) -> Void {
         while end > start && !std.text.utf8Valid(slice(data, start, end)) && count - end < 3 {
             end = end - 1
         }
+    }
+    if end > start && std.text.utf8Valid(slice(data, start, end)) {
+        end = start + learningFits(slice(data, start, end), end - start)
     }
     let content: Span<u8> = slice(data, start, end)
     if !std.text.utf8Valid(content) || containsNul(content) || count > 0 && end == start {

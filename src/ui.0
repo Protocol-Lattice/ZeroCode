@@ -107,6 +107,7 @@ fn displayEntry(app: mutref<App>, title: Span<u8>, text: Span<u8>) -> Void {
 }
 
 fn logEntry(app: mutref<App>, title: Span<u8>, text: Span<u8>) -> Void {
+    learningEventText(app, title, text)
     sessionLogEntry(app, title, text)
     displayEntry(app, title, text)
 }

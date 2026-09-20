@@ -233,6 +233,7 @@ fn receiveResponse(app: mutref<App>) -> Void {
             append(pendingData, calls)
         }
     }
+    if bufLen(scratchData) > 0 { learningEventText(app, "assistant", bytes(scratchData)) }
     if bufLen(scratchData) > 0 && !app.streamVisible {
         logEntry(app, "  ZERO", bytes(scratchData))
     }
@@ -242,8 +243,15 @@ fn receiveResponse(app: mutref<App>) -> Void {
     }
     app.toolIndex = 0
     if std.mem.eql(arrayItem(bytes(pendingData), 0_usize), "null") {
+        if bufLen(scratchData) > 0 {
+            learningFinish(app, "completed", bytes(scratchData))
+        } else {
+            learningFinish(app, "failed", "Empty model response.")
+        }
         autoSaveMemory(app, bytes(scratchData))
-        if app.workerMode == 2 { workerSaveSummary(app, bytes(scratchData)) }
+        if app.workerMode == 2 {
+            workerSaveSummary(app, bytes(scratchData))
+        }
         if bufLen(scratchData) == 0 {
             logEntry(app, "  !  Empty response", "The model returned no text or tool calls. Try another model or a smaller prompt.")
         }
@@ -331,6 +339,10 @@ fn startRequest(app: mutref<App>) -> Void {
     app.phase = 1
     app.started = std.time.monotonic()
     app.turn = app.turn + 1
+    if app.learningActive {
+        app.learningRequests = app.learningRequests + 1
+        learningEvent(app, "model_request", "{\"transport\":\"provider\"}")
+    }
     app.streamMode = 0
     app.httpStatus = 0
     app.streamActive = 0

@@ -55,7 +55,7 @@ class MemoryTests(unittest.TestCase):
                 self.assertEqual(json.loads(path.read_text())["recent"], ["Remembered."])
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
                 self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
-                self.assertEqual({item.name for item in path.parent.iterdir()}, {"memory.json", "sessions"})
+                self.assertEqual({item.name for item in path.parent.iterdir()}, {"memory.json", "sessions", "learning"})
                 self.assertNotIn("test-key-never-render-me", path.read_text())
                 with MockAPI([reply(provider, calls=[("memory", {"action": "list"})]),
                               reply(provider, "Recalled.")]) as api:
@@ -219,7 +219,7 @@ class MemoryTests(unittest.TestCase):
             result = self.command(folder, "/memory clear")
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(path.read_bytes(), before)
-            self.assertEqual({item.name for item in path.parent.iterdir()}, {"memory.json", "memory.lock", "sessions"})
+            self.assertEqual({item.name for item in path.parent.iterdir()}, {"memory.json", "memory.lock", "sessions", "learning"})
             lock.rmdir()
             self.assertEqual(self.command(folder, "/memory clear").returncode, 0)
 

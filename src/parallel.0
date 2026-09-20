@@ -524,11 +524,23 @@ fn loadWorker(app: mutref<App>) -> Bool {
     if !decode(app.activeSkill, field(config, "instructions")) {
         return false
     }
+    let learned: usize = learningNumber(config, "learning_policy")
+    if !learningPolicyValid(learned) { return false }
+    app.learningSelectedPolicy = learned
+    app.learningGlobalPolicy = learned
+    app.learningEnabled = learned > 0
+    app.learningActive = learned > 0
+    setText(app.learningGraph, learningSchema())
+    setText(app.learningHead, "delegated-policy-snapshot")
     app.memoryEnabled = std.mem.eql(field(config, "memory_enabled"), "true")
     clear(app.memory)
     if app.memoryEnabled {
-        if !decode(app.memory, field(config, "memory")) { return false }
-        if bufLen(app.memory) > 0 && !validMemory(bytes(app.memory)) { return false }
+        if !decode(app.memory, field(config, "memory")) {
+            return false
+        }
+        if bufLen(app.memory) > 0 && !validMemory(bytes(app.memory)) {
+            return false
+        }
     }
     app.approve = std.mem.eql(field(config, "approve"), "true")
     app.headless = true
@@ -628,8 +640,14 @@ fn startJob(app: mutref<App>, index: usize) -> Void {
     quoted(output, bytes(app.endpoint))
     append(output, ",\"instructions\":")
     quoted(output, bytes(app.activeSkill))
+    append(output, ",\"learning_policy\":")
+    number(output, learningPolicy(app))
     append(output, ",\"memory_enabled\":")
-    if app.memoryEnabled && bufOk(app.memory) { append(output, "true") } else { append(output, "false") }
+    if app.memoryEnabled && bufOk(app.memory) {
+        append(output, "true")
+    } else {
+        append(output, "false")
+    }
     append(output, ",\"memory\":")
     quoted(output, bytes(app.memory))
     append(output, ",\"approve\":")
@@ -677,6 +695,7 @@ fn jobEvent(app: mutref<App>, index: usize) -> Void {
         failJob(app, index, "Error: worker returned invalid JSON.")
         return
     }
+    learningEventText(app, "worker_trajectory", message)
     let kind: Span<u8> = field(message, "type")
     if std.mem.eql(kind, "\"log\"") {
         if decode(app.scratch, field(message, "text")) {
@@ -687,8 +706,11 @@ fn jobEvent(app: mutref<App>, index: usize) -> Void {
             failJob(app, index, "Error: invalid worker tool state.")
             return
         }
-        if std.mem.eql(kind, "\"tool_started\"") { updateWorker(app, index, eventWorkerToolStarted, message) }
-        else { updateWorker(app, index, eventWorkerToolFinished, message) }
+        if std.mem.eql(kind, "\"tool_started\"") {
+            updateWorker(app, index, eventWorkerToolStarted, message)
+        } else {
+            updateWorker(app, index, eventWorkerToolFinished, message)
+        }
     } else if std.mem.eql(kind, "\"approval\"") {
         if jobState(app, index) != 1 || !std.str.startsWith(field(message, "id"), "\"") {
             failJob(app, index, "Error: invalid worker approval state.")
@@ -709,8 +731,11 @@ fn jobEvent(app: mutref<App>, index: usize) -> Void {
         }
         setJobState(app, index, 3_usize)
         setJobFailed(app, index, std.mem.eql(field(message, "failed"), "true"))
-        if jobFailed(app, index) { updateWorker(app, index, eventWorkerFailed, bytes(jobTx(app, index))) }
-        else { updateWorker(app, index, eventWorkerCompleted, "") }
+        if jobFailed(app, index) {
+            updateWorker(app, index, eventWorkerFailed, bytes(jobTx(app, index)))
+        } else {
+            updateWorker(app, index, eventWorkerCompleted, "")
+        }
         let files: Maybe<u32> = std.json.u32(message, "files_changed")
         let tokens: Maybe<u32> = std.json.u32(message, "tokens")
         if files.has {
