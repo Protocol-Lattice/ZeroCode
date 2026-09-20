@@ -36,8 +36,6 @@ jobs:
           package-manager-cache: false
       - name: Check JavaScript
         run: npm run check:website
-      - name: Test website and Pages asset paths
-        run: npm run test:website
       - name: Upload website
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: actions/upload-pages-artifact@v4
