@@ -338,7 +338,7 @@ fn showSkills(app: mutref<App>) -> Void {
     if app.skillCount == 0 {
         append(output, "No skills found. Add .agents/skills/NAME/SKILL.md with name and description frontmatter.\n")
     }
-    append(output, "\n/skill NAME selects a skill; /skill off clears it. /skills reload rescans.")
+    append(output, "\n/skill NAME selects a skill; /skill off clears it. /skills reload rescans.\n/skills fetch REPOSITORY [--path DIRECTORY] [--ref BRANCH_OR_TAG] imports project skills.")
     logEntry(app, "  SKILLS", bytes(output))
 }
 

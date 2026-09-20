@@ -36,6 +36,7 @@ zero-code/
 ├── src/logs.0           # Automatic local session journals and key redaction
 ├── src/mcp.0           # Persistent MCP stdio connections
 ├── src/skills.0        # Skill discovery and loading
+├── src/skill_fetch.0   # Repository fetching and project skill imports
 ├── src/ui.0            # Terminal rendering and keyboard input
 ├── native/http_stream.c # HTTP transport worker
 ├── native/session_log.c # Bounded native append writer
@@ -541,9 +542,49 @@ argument reads a text reference relative to that skill's directory.
 ```text
 /skills             Show available skills
 /skills reload      Rescan skill directories
+/skills fetch REPO  Fetch skills from a Git repository into this project
 /skill review-docs  Apply a skill to the session
 /skill off          Clear the selected skill
 ```
+
+Fetch a skill collection using a Git URL or a GitHub `owner/repository` shorthand:
+
+```text
+/skills fetch anthropics/skills
+/skills fetch https://github.com/owner/repository.git --path skills/review-docs
+/skills fetch git@github.com:owner/repository.git --path skills --ref v1.0
+```
+
+`--path` selects one skill directory or a directory containing skill folders;
+quote paths containing spaces. Without it, Zero checks for a root `SKILL.md`,
+then `skills/`, then `.agents/skills/`, then skill folders at the repository root.
+`--path .` explicitly selects the repository root. `--ref` selects a branch or
+tag; otherwise Git's default branch is used. HTTPS, HTTP, SSH, Git, and `file://`
+URLs are supported. Git uses your existing credentials, with interactive prompts
+disabled, and the fetch stops after 120 seconds. Press **Esc** to cancel a clone.
+
+Fetched skills are installed in the current workspace's `.agents/skills/` and
+the catalog refreshes immediately. Existing files or directories with the same
+skill name are kept, including local edits; fetching again does not update them.
+Fetching is an explicit user action and works without an API key or `--approve`:
+
+```sh
+zero-code --cwd /path/to/project --prompt '/skills fetch owner/repository --path skills'
+```
+
+Zero validates metadata with the same rules used for local discovery and copies
+tracked references, scripts, and assets, preserving executable permissions.
+It never runs bundled scripts or initializes submodules. Symlinks, unsafe paths,
+and files ignored by the source or workspace are rejected. Each skill is staged
+before installation, so a failed copy does not expose a partial skill. Other
+successfully imported skills remain installed if a later skill fails. Temporary
+files are cleaned up after success, failure, or cancellation.
+
+A fetch handles up to 32 skills and examines at most 512 collection entries.
+Each skill may contain up to 256 tracked files totaling 16 MiB, with a file list
+smaller than 32 KiB. Use `--path` to select a smaller collection if needed.
+`SKILL.md` retains the 16 KiB UTF-8 limit. `--no-skills` and demo mode disable
+fetching.
 
 User skills are discovered in `$XDG_CONFIG_HOME/zero-code/skills`, or
 `~/.config/zero-code/skills` when `XDG_CONFIG_HOME` is unset. Use
@@ -557,7 +598,8 @@ path checks, and symlink restrictions also apply to skills. Loading a skill does
 not run its scripts or grant approvals: scripts use the existing approved
 `run_command` flow. Skill instructions remain subordinate to the user's task.
 
-Both MCP and skills are implemented in Zero, in `src/mcp.0` and `src/skills.0`.
+MCP and skills are implemented in Zero, in `src/mcp.0`, `src/skills.0`, and
+`src/skill_fetch.0`.
 
 ## Development
 

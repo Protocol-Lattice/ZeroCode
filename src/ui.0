@@ -619,7 +619,7 @@ fn render(world: World, app: mutref<App>) -> Void raises {
         paint(app, 13_usize, 7_usize, "\x1b[38;5;250m", "/status /logs  Connection details / session log path")
         paint(app, 14_usize, 7_usize, "\x1b[38;5;250m", "/quit         Exit  ·  Ctrl-D")
         paint(app, 15_usize, 7_usize, "\x1b[38;5;250m", "/mcp          Connect and manage MCP tool servers")
-        paint(app, 16_usize, 7_usize, "\x1b[38;5;250m", "/skills       List skills  ·  /skill NAME selects one")
+        paint(app, 16_usize, 7_usize, "\x1b[38;5;250m", "/skills       List skills  ·  /skills fetch REPO imports")
         paint(app, 17_usize, 7_usize, "\x1b[38;5;250m", "/memory       View, set or forget saved project facts")
         paint(app, 7_usize, 7_usize, "\x1b[38;5;245m", "↑/↓ scroll · PgUp/PgDn page · Esc cancel · Paste supported")
     } else if bufLen(transcriptData) == 0 && !app.workersVisible {
@@ -659,13 +659,17 @@ fn render(world: World, app: mutref<App>) -> Void raises {
             status = "MCP request · esc to stop"
             color = "\x1b[38;5;183m"
         }
+        if app.phase == 7 {
+            status = "fetching skills · esc to stop"
+            color = "\x1b[38;5;183m"
+        }
         if app.demo {
             status = "demo · simulated session"
             color = "\x1b[38;5;222m"
         }
         paint(app, rows - 2, 4_usize, color, "● ")
         append(frameData, status)
-        if app.phase == 1 || app.phase == 3 || app.phase == 5 {
+        if app.phase == 1 || app.phase == 3 || app.phase == 5 || app.phase == 7 {
             append(frameData, " · ")
             number(frameData, std.time.asSecondsFloor(std.time.between(app.started, std.time.monotonic())) as usize)
             append(frameData, "s")

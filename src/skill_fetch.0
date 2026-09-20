@@ -1,0 +1,475 @@
+// Remote skills are an explicit user command. Clone asynchronously, then stage
+// tracked files before publishing each validated skill without replacing one.
+type SkillImport {
+    root: Span<u8>,
+    folder: Span<u8>,
+    name: Span<u8>,
+    stage: Span<u8>,
+}
+
+fn skillFetchUsage() -> String {
+    return "Usage: /skills fetch REPOSITORY [--path DIRECTORY] [--ref BRANCH_OR_TAG]"
+}
+
+fn skillFetchToken(text: Span<u8>, start: usize, output: MutSpan<u8>) -> Maybe<usize> {
+    clear(output)
+    var index: usize = start
+    while index < std.mem.len(text) && (text[index] == 32 || text[index] == 9) { index = index + 1 }
+    var quote: u8 = 0
+    while index < std.mem.len(text) {
+        let c: u8 = text[index]
+        index = index + 1
+        if quote == 0 && (c == 32 || c == 9) { break }
+        if c == quote { quote = 0 }
+        else if quote == 0 && (c == 34 || c == 39) { quote = c }
+        else { put(output, c) }
+    }
+    if quote != 0 || !bufOk(output) || !headerSafe(bytes(output)) { return null }
+    return index
+}
+
+fn skillRepositoryPart(text: Span<u8>) -> Bool {
+    if std.mem.len(text) == 0 || std.mem.eql(text, ".") || std.mem.eql(text, "..") { return false }
+    var i: usize = 0
+    while i < std.mem.len(text) {
+        let c: u8 = text[i]
+        if !(c >= 65 && c <= 90) && !(c >= 97 && c <= 122) && !(c >= 48 && c <= 57) && c != 45 && c != 95 && c != 46 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn skillRepository(source: Span<u8>, output: MutSpan<u8>) -> Bool {
+    clear(output)
+    if std.mem.len(source) == 0 || !headerSafe(source) || source[0] == 45 { return false }
+    if std.str.startsWith(source, "https://") || std.str.startsWith(source, "http://") || std.str.startsWith(source, "ssh://") || std.str.startsWith(source, "git://") || std.str.startsWith(source, "file://") || std.str.startsWith(source, "git@") {
+        append(output, source)
+    } else {
+        let slash: usize = std.str.indexOf(source, "/")
+        if slash >= std.mem.len(source) || !skillRepositoryPart(slice(source, 0_usize, slash)) || !skillRepositoryPart(std.mem.dropPrefix(source, slash + 1)) { return false }
+        append(output, "https://github.com/")
+        append(output, source)
+    }
+    return bufOk(output)
+}
+
+fn removeSkillTemporary(path: Span<u8>) -> Void {
+    if std.mem.len(path) == 0 || !headerSafe(path) { return }
+    var storage: [9216]u8 = [0_u8; 9216]
+    let args: MutSpan<u8> = buffer(storage)
+    // Only private mktemp paths created by this module are passed here.
+    append(args, "-c\nrm -rf -- \"$1\"\nzero-skill-cleanup\n")
+    append(args, path)
+    if !bufOk(args) { return }
+    var answer: [16]u8 = [0_u8; 16]
+    let removed: Maybe<usize> = std.proc.captureArgs("/bin/sh", bytes(args), answer)
+}
+
+fn cleanupSkillFetch(app: mutref<App>) -> Void {
+    if app.phase != 7 { return }
+    var storage: [8192]u8 = [0_u8; 8192]
+    let temporary: MutSpan<u8> = buffer(storage)
+    if decode(temporary, field(bytes(app.arguments), "temporary")) { removeSkillTemporary(bytes(temporary)) }
+    clear(app.arguments)
+}
+
+fn skillFetchFailure(app: mutref<App>, message: Span<u8>) -> Void {
+    stopChild(app)
+    app.phase = 0
+    app.exitCode = 1
+    logEntry(app, "  SKILLS FETCH", message)
+}
+
+fn beginSkillFetch(app: mutref<App>, text: Span<u8>) -> Void {
+    app.exitCode = 1
+    if hasArg("--no-skills") || app.demo {
+        logEntry(app, "  SKILLS FETCH", "Error: fetching skills is disabled in demo mode or with --no-skills.")
+        return
+    }
+    var tokenStorage: [4096]u8 = [0_u8; 4096]
+    var repoStorage: [4096]u8 = [0_u8; 4096]
+    var pathStorage: [2048]u8 = [0_u8; 2048]
+    var refStorage: [272]u8 = [0_u8; 272]
+    let token: MutSpan<u8> = buffer(tokenStorage)
+    let repository: MutSpan<u8> = buffer(repoStorage)
+    let path: MutSpan<u8> = buffer(pathStorage)
+    let revision: MutSpan<u8> = buffer(refStorage)
+    let first: Maybe<usize> = skillFetchToken(text, 0_usize, token)
+    if !first.has || !skillRepository(bytes(token), repository) {
+        logEntry(app, "  SKILLS FETCH", skillFetchUsage())
+        return
+    }
+    var offset: usize = first.value
+    var valid: Bool = true
+    var havePath: Bool = false
+    var haveRef: Bool = false
+    while offset < std.mem.len(text) && valid {
+        let next: Maybe<usize> = skillFetchToken(text, offset, token)
+        if !next.has { logEntry(app, "  SKILLS FETCH", skillFetchUsage())
+            return }
+        offset = next.value
+        if bufLen(token) == 0 { break }
+        let isPath: Bool = std.mem.eql(bytes(token), "--path") && !havePath
+        let isRef: Bool = std.mem.eql(bytes(token), "--ref") && !haveRef
+        if !isPath && !isRef { valid = false
+            break }
+        let value: Maybe<usize> = skillFetchToken(text, offset, token)
+        if !value.has || bufLen(token) == 0 { logEntry(app, "  SKILLS FETCH", skillFetchUsage())
+            return }
+        offset = value.value
+        if isPath {
+            havePath = true
+            valid = std.mem.eql(bytes(token), ".") || safeRelative(bytes(token))
+            setText(path, bytes(token))
+        } else {
+            haveRef = true
+            valid = token[0] != 45 && !std.str.contains(bytes(token), " ") && !std.str.contains(bytes(token), "\t")
+            setText(revision, bytes(token))
+        }
+    }
+    if !valid || !bufOk(path) || !bufOk(revision) {
+        logEntry(app, "  SKILLS FETCH", skillFetchUsage())
+        return
+    }
+    var absolute: [8192]u8 = [0_u8; 8192]
+    let destination: Maybe<String> = resolvedPath(app, ".agents/skills", absolute)
+    if !destination.has {
+        logEntry(app, "  SKILLS FETCH", "Error: .agents/skills is ignored, unsafe, or symlinked. Git is required to fetch skills.")
+        return
+    }
+    var temporaryStorage: [8192]u8 = [0_u8; 8192]
+    let created: Maybe<usize> = std.proc.captureArgs("/bin/sh", "-c\nzero_fetch_tmp=$(mktemp -d \"${TMPDIR:-/tmp}/zero-skills-fetch.XXXXXX\") || exit 1; cd -- \"$zero_fetch_tmp\" && pwd -P", temporaryStorage)
+    if !created.has || created.value >= std.mem.len(temporaryStorage) {
+        logEntry(app, "  SKILLS FETCH", "Error: could not create a temporary repository directory.")
+        return
+    }
+    let temporary: Span<u8> = std.str.trimAscii(std.mem.prefix(temporaryStorage, created.value))
+    if std.mem.len(temporary) == 0 || !headerSafe(temporary) { return }
+    // During phase 7, arguments owns fetch state; packet is only clone argv.
+    clear(app.arguments)
+    append(app.arguments, "{\"temporary\":")
+    quoted(app.arguments, temporary)
+    append(app.arguments, ",\"path\":")
+    quoted(app.arguments, bytes(path))
+    put(app.arguments, 125_u8)
+    clear(app.packet)
+    append(app.packet, "-c\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX; export GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -oBatchMode=yes'; exec git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c protocol.allow=never -c protocol.https.allow=always -c protocol.http.allow=always -c protocol.ssh.allow=always -c protocol.git.allow=always -c protocol.file.allow=always clone --quiet --depth 1 --single-branch --no-local --template= \"$@\"\nzero-skill-clone\n")
+    if bufLen(revision) > 0 {
+        append(app.packet, "--branch\n")
+        append(app.packet, bytes(revision))
+        put(app.packet, 10_u8)
+    }
+    append(app.packet, "--\n")
+    append(app.packet, bytes(repository))
+    put(app.packet, 10_u8)
+    append(app.packet, temporary)
+    append(app.packet, "/repository")
+    app.phase = 7
+    app.turnStart = bufLen(app.history)
+    if !bufOk(app.arguments) || !bufOk(app.packet) {
+        skillFetchFailure(app, "Error: repository or path is too long.")
+        return
+    }
+    app.child = std.proc.spawnChildArgs("/bin/sh", bytes(app.packet), bytes(app.workspace), "")
+    clear(app.packet)
+    clear(app.result)
+    clear(app.errors)
+    if !std.proc.childValid(app.child) {
+        skillFetchFailure(app, "Error: could not start Git to fetch the repository.")
+        return
+    }
+    let closed: Bool = std.proc.closeStdin(app.child)
+    app.started = std.time.monotonic()
+    logEntry(app, "  SKILLS FETCH", "Fetching repository into .agents/skills. Existing skills will be kept. Esc cancels.")
+}
+
+fn copyFetchedSkillFile(source: Span<u8>, target: Span<u8>) -> Bool {
+    var storage: [18432]u8 = [0_u8; 18432]
+    let args: MutSpan<u8> = buffer(storage)
+    append(args, "-c\nparent=${2%/*}; mkdir -p -- \"$parent\" && cp -p -- \"$1\" \"$2\" && printf ok\nzero-skill-copy\n")
+    append(args, source)
+    put(args, 10_u8)
+    append(args, target)
+    if !bufOk(args) { return false }
+    var answer: [16]u8 = [0_u8; 16]
+    let copied: Maybe<usize> = std.proc.captureArgs("/bin/sh", bytes(args), answer)
+    return copied.has && copied.value == 2 && std.mem.eql(std.mem.prefix(answer, 2_usize), "ok")
+}
+
+fn stageFetchedSkill(app: ref<App>, filesToImport: ref<SkillImport>) -> Bool {
+    let root: Span<u8> = filesToImport.root
+    let folder: Span<u8> = filesToImport.folder
+    let name: Span<u8> = filesToImport.name
+    let stage: Span<u8> = filesToImport.stage
+    var listStorage: [32768]u8 = [0_u8; 32768]
+    var argsStorage: [12288]u8 = [0_u8; 12288]
+    var relativeStorage: [4096]u8 = [0_u8; 4096]
+    var sourceStorage: [8192]u8 = [0_u8; 8192]
+    var targetStorage: [8192]u8 = [0_u8; 8192]
+    var stagedStorage: [8192]u8 = [0_u8; 8192]
+    let args: MutSpan<u8> = buffer(argsStorage)
+    let relative: MutSpan<u8> = buffer(relativeStorage)
+    let staged: MutSpan<u8> = buffer(stagedStorage)
+    // NUL separation preserves spaces and lets validation reject control bytes.
+    append(args, "-c\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX; cd -- \"$1\" && git --literal-pathspecs ls-files -z -- \"$2\"\nzero-skill-files\n")
+    append(args, root)
+    put(args, 10_u8)
+    if std.mem.len(folder) > 0 { append(args, folder) } else { append(args, ".") }
+    if !bufOk(args) { return false }
+    let listed: Maybe<usize> = std.proc.captureArgs("/bin/sh", bytes(args), listStorage)
+    if !listed.has || listed.value == 0 || listed.value >= std.mem.len(listStorage) { return false }
+    let files: Span<u8> = std.mem.prefix(listStorage, listed.value)
+    var offset: usize = 0
+    var count: usize = 0
+    var total: usize = 0
+    var manifest: Bool = false
+    while offset < std.mem.len(files) {
+        var end: usize = offset
+        while end < std.mem.len(files) && files[end] != 0 { end = end + 1 }
+        if end == std.mem.len(files) { return false }
+        let file: Span<u8> = slice(files, offset, end)
+        offset = end + 1
+        var suffix: Span<u8> = file
+        if std.mem.len(folder) > 0 {
+            if !std.str.startsWith(file, folder) || std.mem.len(file) <= std.mem.len(folder) || file[std.mem.len(folder)] != 47 { return false }
+            suffix = std.mem.dropPrefix(file, std.mem.len(folder) + 1)
+        }
+        if !safeRelative(suffix) { return false }
+        let source: Maybe<String> = resolveInRoot(root, file, sourceStorage)
+        if !source.has || std.fs.isDir(source.value) { return false }
+        let size: Maybe<usize> = fileByteSize(source.value)
+        if !size.has || size.value > 16777216 { return false }
+        total = total + size.value
+        count = count + 1
+        if total > 16777216 || count > 256 { return false }
+        setText(relative, ".agents/skills/")
+        append(relative, name)
+        put(relative, 47_u8)
+        append(relative, suffix)
+        if !bufOk(relative) { return false }
+        let target: Maybe<String> = resolvedPath(app, bytes(relative), targetStorage)
+        if !target.has { return false }
+        setText(staged, stage)
+        put(staged, 47_u8)
+        append(staged, name)
+        put(staged, 47_u8)
+        append(staged, suffix)
+        if !bufOk(staged) || !copyFetchedSkillFile(source.value, bytes(staged)) { return false }
+        if std.mem.eql(suffix, "SKILL.md") { manifest = true }
+    }
+    return manifest
+}
+
+// 0: no valid metadata; 1: imported; 2: already present; 3: import failed.
+fn importFetchedSkill(app: mutref<App>, root: Span<u8>, folder: Span<u8>, expected: Span<u8>) -> usize {
+    var pathStorage: [4096]u8 = [0_u8; 4096]
+    var absolute: [8192]u8 = [0_u8; 8192]
+    var manifestStorage: [8192]u8 = [0_u8; 8192]
+    var checkedStorage: [8192]u8 = [0_u8; 8192]
+    var recheckedStorage: [8192]u8 = [0_u8; 8192]
+    var contentStorage: [16400]u8 = [0_u8; 16400]
+    var nameStorage: [80]u8 = [0_u8; 80]
+    var descriptionStorage: [1040]u8 = [0_u8; 1040]
+    let path: MutSpan<u8> = buffer(pathStorage)
+    let content: MutSpan<u8> = buffer(contentStorage)
+    let name: MutSpan<u8> = buffer(nameStorage)
+    let description: MutSpan<u8> = buffer(descriptionStorage)
+    append(path, folder)
+    if bufLen(path) > 0 { put(path, 47_u8) }
+    append(path, "SKILL.md")
+    if !bufOk(path) { return 0 }
+    let manifest: Maybe<String> = resolveInRoot(root, bytes(path), manifestStorage)
+    if !manifest.has || !readBounded(content, manifest.value) || !std.text.utf8Valid(bytes(content)) || containsNul(bytes(content)) { return 0 }
+    if !skillMetadata(name, bytes(content), "name") || !extensionName(bytes(name)) || !skillMetadata(description, bytes(content), "description") { return 0 }
+    if std.mem.len(expected) > 0 && !std.mem.eql(bytes(name), expected) { return 0 }
+    setText(path, ".agents/skills/")
+    append(path, bytes(name))
+    let destination: Maybe<String> = resolvedPath(app, bytes(path), absolute)
+    if !destination.has {
+        logEntry(app, "  SKILL REJECTED", bytes(name))
+        return 3
+    }
+    if std.fs.exists(destination.value) {
+        logEntry(app, "  SKILL KEPT (already exists)", bytes(name))
+        return 2
+    }
+    if !createParent(destination.value) { return 3 }
+    let checked: Maybe<String> = resolvedPath(app, bytes(path), checkedStorage)
+    if !checked.has { return 3 }
+    var stageStorage: [8192]u8 = [0_u8; 8192]
+    var argsStorage: [18432]u8 = [0_u8; 18432]
+    let args: MutSpan<u8> = buffer(argsStorage)
+    append(args, "-d\n")
+    append(args, bytes(app.workspace))
+    append(args, "/.agents/skills/.zero-fetch.XXXXXX")
+    if !bufOk(args) { return 3 }
+    let made: Maybe<usize> = std.proc.captureArgs("/usr/bin/mktemp", bytes(args), stageStorage)
+    if !made.has || made.value == 0 || made.value >= std.mem.len(stageStorage) { return 3 }
+    let stage: Span<u8> = std.str.trimAscii(std.mem.prefix(stageStorage, made.value))
+    var installed: Bool = false
+    let files: SkillImport = SkillImport { root: root, folder: folder, name: bytes(name), stage: stage }
+    if stageFetchedSkill(app, &files) {
+        let rechecked: Maybe<String> = resolvedPath(app, bytes(path), recheckedStorage)
+        if rechecked.has {
+            clear(args)
+            // Move into the parent, so a competing NAME is never treated as a
+            // container for another NAME. -n keeps any existing destination.
+            append(args, "-c\nsource=\"$1/$2\"; parent=\"$3/.agents/skills\"; [ ! -e \"$parent/$2\" ] && [ ! -L \"$parent/$2\" ] && mv -n -- \"$source\" \"$parent/\" && [ ! -e \"$source\" ] && printf ok\nzero-skill-install\n")
+            append(args, stage)
+            put(args, 10_u8)
+            append(args, bytes(name))
+            put(args, 10_u8)
+            append(args, bytes(app.workspace))
+            if bufOk(args) {
+                var answer: [16]u8 = [0_u8; 16]
+                let moved: Maybe<usize> = std.proc.captureArgs("/bin/sh", bytes(args), answer)
+                installed = moved.has && moved.value == 2 && std.mem.eql(std.mem.prefix(answer, 2_usize), "ok")
+            }
+        }
+    }
+    removeSkillTemporary(stage)
+    if installed {
+        logEntry(app, "  SKILL FETCHED", bytes(name))
+        return 1
+    }
+    logEntry(app, "  SKILL REJECTED", bytes(name))
+    logEntry(app, "  SKILLS FETCH", "Error: unsafe, ignored, oversized or unreadable skill files, destination conflict, or copy failure. No partial skill was installed.")
+    return 3
+}
+
+fn finishSkillFetch(app: mutref<App>) -> Void {
+    var rootStorage: [8192]u8 = [0_u8; 8192]
+    var pathStorage: [4096]u8 = [0_u8; 4096]
+    var probeStorage: [8192]u8 = [0_u8; 8192]
+    var checkedStorage: [8192]u8 = [0_u8; 8192]
+    var folderStorage: [256]u8 = [0_u8; 256]
+    var candidateStorage: [4096]u8 = [0_u8; 4096]
+    let root: MutSpan<u8> = buffer(rootStorage)
+    let path: MutSpan<u8> = buffer(pathStorage)
+    let probe: MutSpan<u8> = buffer(probeStorage)
+    let candidate: MutSpan<u8> = buffer(candidateStorage)
+    let decoded: Bool = decode(root, field(bytes(app.arguments), "temporary")) && decode(path, field(bytes(app.arguments), "path"))
+    append(root, "/repository")
+    if !decoded || !bufOk(root) { skillFetchFailure(app, "Error: invalid fetch state.")
+        return }
+    if std.mem.eql(bytes(path), ".") { clear(path) }
+    else if bufLen(path) == 0 {
+        setText(probe, bytes(root))
+        append(probe, "/SKILL.md")
+        if !std.fs.exists(bytes(probe)) {
+            setText(probe, bytes(root))
+            append(probe, "/skills")
+            if std.fs.isDir(bytes(probe)) { setText(path, "skills") }
+            else {
+                setText(probe, bytes(root))
+                append(probe, "/.agents/skills")
+                if std.fs.isDir(bytes(probe)) { setText(path, ".agents/skills") }
+            }
+        }
+    }
+    if bufLen(path) > 0 {
+        let checked: Maybe<String> = resolveInRoot(bytes(root), bytes(path), checkedStorage)
+        if !checked.has || !std.fs.isDir(checked.value) {
+            skillFetchFailure(app, "Error: skill source directory is missing, ignored, unsafe or symlinked.")
+            return
+        }
+    }
+    var imported: usize = 0
+    var kept: usize = 0
+    var rejected: usize = 0
+    let single: usize = importFetchedSkill(app, bytes(root), bytes(path), "")
+    if single == 1 { imported = 1 }
+    else if single == 2 { kept = 1 }
+    else if single == 3 { rejected = 1 }
+    else {
+        setText(probe, bytes(root))
+        if bufLen(path) > 0 { put(probe, 47_u8)
+            append(probe, bytes(path)) }
+        let count: Maybe<usize> = std.fs.dirEntryCount(bytes(probe))
+        if count.has {
+            var index: usize = 0
+            while index < count.value && index < 512 {
+                if imported + kept + rejected >= 32 {
+                    logEntry(app, "  SKILLS FETCH", "Stopped after 32 skills. Use --path to fetch another skill directory.")
+                    break
+                }
+                let folder: Maybe<Span<u8>> = std.fs.dirEntryName(folderStorage, bytes(probe), index)
+                index = index + 1
+                if folder.has && extensionName(folder.value) {
+                    setText(candidate, bytes(path))
+                    if bufLen(candidate) > 0 { put(candidate, 47_u8) }
+                    append(candidate, folder.value)
+                    if bufOk(candidate) {
+                        let result: usize = importFetchedSkill(app, bytes(root), bytes(candidate), folder.value)
+                        if result == 1 { imported = imported + 1 }
+                        else if result == 2 { kept = kept + 1 }
+                        else if result == 3 { rejected = rejected + 1 }
+                    }
+                }
+            }
+            if index >= 512 && count.value > 512 { logEntry(app, "  SKILLS FETCH", "Scanned the first 512 entries. Use --path to select a smaller directory.") }
+        }
+    }
+    cleanupSkillFetch(app)
+    app.phase = 0
+    reloadSkills(app)
+    clear(app.scratch)
+    append(app.scratch, "Fetched ")
+    number(app.scratch, imported)
+    append(app.scratch, " skill(s) into .agents/skills; kept ")
+    number(app.scratch, kept)
+    append(app.scratch, " existing; rejected ")
+    number(app.scratch, rejected)
+    append(app.scratch, ". Catalog refreshed.")
+    logEntry(app, "  SKILLS FETCH", bytes(app.scratch))
+    app.exitCode = 0
+    if rejected > 0 || imported + kept == 0 {
+        app.exitCode = 1
+        if imported + kept + rejected == 0 { logEntry(app, "  SKILLS FETCH", "Error: no valid skills found. Use --path for a skill or collection directory with valid SKILL.md metadata.") }
+    }
+}
+
+fn pollSkillFetch(app: mutref<App>) -> Void {
+    if app.phase != 7 { return }
+    var chunk: [4096]u8 = [0_u8; 4096]
+    let count: Maybe<usize> = std.proc.readStderr(app.child, chunk)
+    if count.has { append(app.errors, std.mem.prefix(chunk, count.value)) }
+    // Drain stdout as well, including unexpected output from Git helpers.
+    let output: Maybe<usize> = std.proc.readStdout(app.child, chunk)
+    if !bufOk(app.errors) {
+        skillFetchFailure(app, "Error: Git output exceeded the limit.")
+        return
+    }
+    if std.time.hasElapsed(app.started, std.time.monotonic(), std.time.seconds(120)) {
+        skillFetchFailure(app, "Error: repository fetch timed out after 120 seconds.")
+        return
+    }
+    if std.proc.running(app.child) { return }
+    let status: ProcStatus = std.proc.wait(app.child)
+    while true {
+        let more: Maybe<usize> = std.proc.readStderr(app.child, chunk)
+        if more.has && more.value > 0 { append(app.errors, std.mem.prefix(chunk, more.value)) }
+        else { break }
+    }
+    let closed: Bool = std.proc.close(app.child)
+    app.child = std.proc.spawnChild("")
+    if std.proc.failed(status) {
+        logEntry(app, "  GIT", bytes(app.errors))
+        skillFetchFailure(app, "Error: repository fetch failed. Check the URL, branch/tag, Git installation and repository access.")
+        return
+    }
+    finishSkillFetch(app)
+}
+
+fn skillsCommand(app: mutref<App>, input: Span<u8>) -> Void {
+    if std.mem.eql(input, "/skills") || std.mem.eql(input, "/skills reload") {
+        if std.mem.eql(input, "/skills reload") { reloadSkills(app) }
+        showSkills(app)
+        app.exitCode = 0
+    } else if std.str.startsWith(input, "/skills fetch ") {
+        beginSkillFetch(app, std.str.trimAscii(std.mem.dropPrefix(input, 14_usize)))
+    } else {
+        app.exitCode = 1
+        logEntry(app, "  SKILLS", skillFetchUsage())
+    }
+}
