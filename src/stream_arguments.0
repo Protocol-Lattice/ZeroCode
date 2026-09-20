@@ -1,7 +1,7 @@
 // A response's tool arguments grow independently of its provider metadata.
 // While HTTP is active, pending is a bounded page arena rather than a tool
 // queue. Each of 128 call/block indices owns a head and tail in streamArguments.
-// Pages hold next (offset + 1), used bytes, and 4096 bytes of decoded JSON text.
+// Pages hold next (offset + 1), used bytes, and 1024 bytes of decoded JSON text.
 fn streamArgumentOffset(data: Span<u8>, at: usize) -> usize {
     return data[at] as usize + data[at + 1] as usize * 256 + data[at + 2] as usize * 65536 + data[at + 3] as usize * 16777216
 }
@@ -41,12 +41,12 @@ fn storeStreamArgument(app: mutref<App>, index: usize, raw: Span<u8>) -> Bool {
     var offset: usize = 0
     // An empty first fragment still records that the metadata owns a placeholder.
     while offset < bufLen(decoded) || tail == 0 {
-        var used: usize = 4096
+        var used: usize = 1024
         if tail != 0 { used = streamArgumentOffset(bytes(arena), tail - 1 + 4) }
-        if used == 4096 {
-            if bufLen(arena) + 4104 > capacity(arena) { return false }
+        if used == 1024 {
+            if bufLen(arena) + 1032 > capacity(arena) { return false }
             let next: usize = bufLen(arena) + 1
-            setLen(arena, bufLen(arena) + 4104)
+            setLen(arena, bufLen(arena) + 1032)
             setStreamArgumentOffset(arena, next - 1, 0_usize)
             setStreamArgumentOffset(arena, next - 1 + 4, 0_usize)
             if tail == 0 { setStreamArgumentOffset(slots, index * 8, next) }
@@ -56,7 +56,7 @@ fn storeStreamArgument(app: mutref<App>, index: usize, raw: Span<u8>) -> Bool {
             used = 0
         }
         var count: usize = bufLen(decoded) - offset
-        if count > 4096 - used { count = 4096 - used }
+        if count > 1024 - used { count = 1024 - used }
         let copied: usize = std.mem.copy(arena[tail - 1 + 8 + used..], slice(bytes(decoded), offset, offset + count))
         if copied != count { return false }
         setStreamArgumentOffset(arena, tail - 1 + 4, used + count)
@@ -71,7 +71,7 @@ fn writeStreamArgument(app: ref<App>, output: MutSpan<u8>, index: usize, encode:
         return }
     let arena: Span<u8> = bytes(app.pending)
     var page: usize = streamArgumentOffset(bytes(app.streamArguments), index * 8)
-    var storage: [24594]u8 = [0_u8; 24594]
+    var storage: [6162]u8 = [0_u8; 6162]
     let escaped: MutSpan<u8> = buffer(storage)
     if encode { put(output, 34_u8) }
     while page != 0 {

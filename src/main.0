@@ -1529,9 +1529,9 @@ fn displayStorage(world: World, app: mutref<App>) -> i32 {
     var transcript: [65536]u8 = [0_u8; 65536]
     let previoustranscript: MutSpan<u8> = app.transcript
     app.transcript = buffer(transcript)
-    // Reused as the SSE argument arena. One extra MiB covers page headers and
+    // Reused as the SSE argument arena. An extra 256 KiB covers page headers and
     // at most 128 partially filled pages within the 14 MiB response budget.
-    var pending: [15728656]u8 = [0_u8; 15728656]
+    var pending: [14942224]u8 = [0_u8; 14942224]
     let previouspending: MutSpan<u8> = app.pending
     app.pending = buffer(pending)
     let code: i32 = packetStorage(world, app)
