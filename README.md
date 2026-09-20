@@ -196,7 +196,7 @@ CI runs the build, tests, and an installation smoke test on Linux and macOS.
 
 1. **Clone & install dependencies**
    ```bash
-   git clone https://github.com/Protocol-Lattice/zero-code-tui.git
+   git clone https://github.com/Protocol-Lattice/ZeroCode-tui.git
    cd zero-code-tui
    ```
 
