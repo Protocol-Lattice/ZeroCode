@@ -8,3 +8,5 @@ dist/
 __pycache__/
 *.pyc
 .zero-agent/
+AGENTS.md
+RTK.md
