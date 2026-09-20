@@ -1,3 +1,157 @@
+// Keep large file payloads in pending execution, not in every later request.
+// IDs, paths, metadata and results remain paired; omitted text is explicit.
+fn historyObjectField(output: MutSpan<u8>, object: Span<u8>, name: String, replacement: Span<u8>) -> Void {
+    let count: Maybe<usize> = std.json.objectFieldCount(object)
+    if !count.has { setOk(output, false)
+        return }
+    put(output, 123_u8)
+    var i: usize = 0
+    while i < count.value {
+        var keyStorage: [256]u8 = [0_u8; 256]
+        let key: Maybe<Span<u8>> = std.json.objectKey(keyStorage, object, i)
+        if !key.has { setOk(output, false)
+            return }
+        if i > 0 { put(output, 44_u8) }
+        quoted(output, key.value)
+        put(output, 58_u8)
+        if std.mem.eql(key.value, name) { append(output, replacement) }
+        else { append(output, field(object, key.value)) }
+        i = i + 1
+    }
+    put(output, 125_u8)
+}
+
+fn historyFileArguments(output: MutSpan<u8>, args: Span<u8>) -> Void {
+    let count: Maybe<usize> = std.json.objectFieldCount(args)
+    if !count.has { setOk(output, false)
+        return }
+    put(output, 123_u8)
+    var i: usize = 0
+    while i < count.value {
+        var keyStorage: [256]u8 = [0_u8; 256]
+        let key: Maybe<Span<u8>> = std.json.objectKey(keyStorage, args, i)
+        if !key.has { setOk(output, false)
+            return }
+        if i > 0 { put(output, 44_u8) }
+        quoted(output, key.value)
+        put(output, 58_u8)
+        let value: Span<u8> = field(args, key.value)
+        if std.mem.len(value) > 4096 && (std.mem.eql(key.value, "content") || std.mem.eql(key.value, "old_text") || std.mem.eql(key.value, "new_text")) {
+            quoted(output, "[Client omitted large file text from history. The complete original arguments were retained for execution. Check the tool result and read the required file range before further edits.]")
+        } else { append(output, value) }
+        i = i + 1
+    }
+    put(output, 125_u8)
+}
+
+fn historyToolCall(output: MutSpan<u8>, call: Span<u8>, provider: usize, decoded: MutSpan<u8>, limit: usize) -> Void {
+    var function: Span<u8> = call
+    if provider != 2 { function = field(call, "function") }
+    var nameStorage: [128]u8 = [0_u8; 128]
+    let name: MutSpan<u8> = buffer(nameStorage)
+    let named: Bool = decode(name, field(function, "name"))
+    if !named || !std.mem.eql(bytes(name), "write_file") && !std.mem.eql(bytes(name), "edit_file") {
+        append(output, call)
+        return
+    }
+    var args: Span<u8> = field(call, "input")
+    if provider != 2 {
+        let raw: Span<u8> = field(function, "arguments")
+        if std.mem.len(raw) <= limit || !decode(decoded, raw) {
+            append(output, call)
+            return
+        }
+        args = bytes(decoded)
+    }
+    if std.mem.len(args) <= limit {
+        append(output, call)
+        return
+    }
+    var shortStorage: [16384]u8 = [0_u8; 16384]
+    let shortArgs: MutSpan<u8> = buffer(shortStorage)
+    historyFileArguments(shortArgs, args)
+    if !bufOk(shortArgs) { setOk(output, false)
+        return }
+    if provider == 2 {
+        historyObjectField(output, call, "input", bytes(shortArgs))
+    } else {
+        var quotedStorage: [32768]u8 = [0_u8; 32768]
+        let encoded: MutSpan<u8> = buffer(quotedStorage)
+        // Decoding is complete; reuse its large buffer for provider metadata.
+        let shortened: MutSpan<u8> = decoded
+        clear(shortened)
+        quoted(encoded, bytes(shortArgs))
+        historyObjectField(shortened, function, "arguments", bytes(encoded))
+        if !bufOk(encoded) || !bufOk(shortened) { setOk(output, false)
+            return }
+        historyObjectField(output, call, "function", bytes(shortened))
+    }
+}
+
+fn historyAssistant(output: MutSpan<u8>, message: Span<u8>, provider: usize, decoded: MutSpan<u8>) -> Void {
+    let count: Maybe<usize> = std.json.objectFieldCount(message)
+    if !count.has { setOk(output, false)
+        return }
+    put(output, 123_u8)
+    var argumentLimit: usize = 16384
+    if std.mem.len(message) > 65536 { argumentLimit = 4096 }
+    var i: usize = 0
+    var written: usize = 0
+    while i < count.value {
+        var keyStorage: [256]u8 = [0_u8; 256]
+        let key: Maybe<Span<u8>> = std.json.objectKey(keyStorage, message, i)
+        if !key.has { setOk(output, false)
+            return }
+        if provider != 2 || std.mem.eql(key.value, "role") || std.mem.eql(key.value, "content") {
+            if written > 0 { put(output, 44_u8) }
+            quoted(output, key.value)
+            put(output, 58_u8)
+            let value: Span<u8> = field(message, key.value)
+            if std.str.startsWith(value, "[") && (std.mem.eql(key.value, "tool_calls") || provider == 2 && std.mem.eql(key.value, "content")) {
+                put(output, 91_u8)
+                var index: usize = 0
+                while true {
+                    let call: Span<u8> = arrayItem(value, index)
+                    if std.mem.eql(call, "null") { break }
+                    if index > 0 { put(output, 44_u8) }
+                    historyToolCall(output, call, provider, decoded, argumentLimit)
+                    index = index + 1
+                }
+                put(output, 93_u8)
+            } else { append(output, value) }
+            written = written + 1
+        }
+        i = i + 1
+    }
+    put(output, 125_u8)
+}
+
+fn appendAssistantHistory(app: mutref<App>, message: Span<u8>) -> Bool {
+    clear(app.packet)
+    historyAssistant(app.packet, message, app.provider, app.arguments)
+    if !bufOk(app.packet) || !ensureHistorySpace(app, bufLen(app.packet) + 512, false) { return false }
+    if bufLen(app.history) > 0 { put(app.history, 44_u8) }
+    append(app.history, bytes(app.packet))
+    return bufOk(app.history)
+}
+
+fn failAssistantHistory(app: mutref<App>, message: Span<u8>) -> Void {
+    var storage: [512]u8 = [0_u8; 512]
+    let text: MutSpan<u8> = buffer(storage)
+    append(text, "The model response cannot fit in conversation history after file-text compaction. Response: ")
+    number(text, std.mem.len(message))
+    append(text, " bytes; content: ")
+    number(text, std.mem.len(field(message, "content")))
+    append(text, "; tool calls: ")
+    number(text, std.mem.len(field(message, "tool_calls")))
+    append(text, "; reasoning details: ")
+    number(text, std.mem.len(field(message, "reasoning_details")))
+    append(text, ". History limit: ")
+    number(text, capacity(app.history))
+    append(text, " bytes. Request smaller sections or fewer tools at once.")
+    failTurn(app, bytes(text))
+}
+
 fn shortToolText(output: MutSpan<u8>, raw: Span<u8>) -> Void {
     if std.mem.len(raw) <= 3072 {
         append(output, raw)
@@ -135,18 +289,19 @@ fn historyDigest(output: MutSpan<u8>, history: Span<u8>, before: usize) -> Void 
     }
 }
 
-fn ensureHistorySpace(app: mutref<App>, reserve: usize) -> Bool {
+fn ensureHistorySpace(app: mutref<App>, reserve: usize, keepLatest: Bool) -> Bool {
     if reserve > capacity(app.history) {
         return false
     }
-    var budget: usize = capacity(app.history) - reserve
+    let hardBudget: usize = capacity(app.history) - reserve
+    var budget: usize = hardBudget
     if budget > 65536 {
         budget = 65536
     }
     if bufOk(app.history) && bufLen(app.history) <= budget {
         return true
     }
-    var storage: [114704]u8 = [0_u8; 114704]
+    var storage: [1048608]u8 = [0_u8; 1048608]
     let snapshot: MutSpan<u8> = buffer(storage)
     put(snapshot, 91_u8)
     append(snapshot, bytes(app.history))
@@ -183,8 +338,12 @@ fn ensureHistorySpace(app: mutref<App>, reserve: usize) -> Bool {
         put(snapshot, 91_u8)
         append(snapshot, bytes(app.history))
         put(snapshot, 93_u8)
-        if !retainRecentHistory(app, bytes(snapshot), budget) {
-            return false
+        if !retainRecentHistory(app, bytes(snapshot), budget, true) {
+            // The active exchange may contain large signed reasoning blocks.
+            // Preserve them intact beyond the normal 64 KiB working budget.
+            if !bufOk(app.history) || bufLen(app.history) > hardBudget {
+                if !retainRecentHistory(app, bytes(snapshot), hardBudget, keepLatest) { return false }
+            }
         }
     }
     logEntry(app, "  CONTEXT COMPACTED", "Earlier tool output was shortened automatically. Current instructions and recent tool exchanges are retained.")
@@ -193,7 +352,7 @@ fn ensureHistorySpace(app: mutref<App>, reserve: usize) -> Bool {
 
 fn userMessage(app: mutref<App>, message: Span<u8>) -> Bool {
     let historyData: MutSpan<u8> = app.history
-    if !ensureHistorySpace(app, quotedSize(message) + 128) {
+    if !ensureHistorySpace(app, quotedSize(message) + 128, false) {
         failTurn(app, "The current request is too large for conversation memory.")
         return false
     }
@@ -213,7 +372,7 @@ fn appendToolResult(app: mutref<App>, result: Span<u8>) -> Void {
     let historyData: MutSpan<u8> = app.history
     let pendingData: MutSpan<u8> = app.pending
     let toolIdData: MutSpan<u8> = app.toolId
-    if !ensureHistorySpace(app, quotedSize(result) + 256) {
+    if !ensureHistorySpace(app, quotedSize(result) + 256, true) {
         failTurn(app, "The active tool batch is too large to retain safely. Request fewer tools at once.")
         return
     }
@@ -250,7 +409,7 @@ fn appendToolResult(app: mutref<App>, result: Span<u8>) -> Void {
     }
 }
 
-fn retainRecentHistory(app: mutref<App>, history: Span<u8>, budget: usize) -> Bool {
+fn retainRecentHistory(app: mutref<App>, history: Span<u8>, budget: usize, keepLatest: Bool) -> Bool {
     var userIndex: usize = 0
     var user: Span<u8> = "null"
     var count: usize = 0
@@ -285,7 +444,7 @@ fn retainRecentHistory(app: mutref<App>, history: Span<u8>, budget: usize) -> Bo
             cut = i
         }
     }
-    if count > userIndex + 1 && cut == count {
+    if count > userIndex + 1 && cut == count && keepLatest {
         return false
     }
     clear(summary)

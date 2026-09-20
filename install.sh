@@ -165,8 +165,10 @@ main() {
             tar -xzf "$temp_dir/source.tar.gz" --strip-components=1 -C "$project_dir"
         fi
         compiler=${ZERO_COMPILER:-"$project_dir/.tools/bin/zero"}
-        if [ ! -x "$compiler" ] && [ -z "${ZERO_COMPILER:-}" ]; then
-            sh "$project_dir/scripts/setup-zero.sh"
+        if [ -z "${ZERO_COMPILER:-}" ]; then
+            if [ ! -x "$compiler" ] || [ ! -f "$project_dir/.tools/compiler-frame-limit" ] || [ "$(cat "$project_dir/.tools/compiler-frame-limit")" != 16777216 ]; then
+                sh "$project_dir/scripts/setup-zero.sh"
+            fi
         fi
         sh "$project_dir/scripts/build.sh"
         binary="$project_dir/dist/zero-code"

@@ -173,12 +173,12 @@ class Terminal:
 
 
 class AgentTests(unittest.TestCase):
-    def run_agent(self, api, provider="openrouter", directory=None, extra=(), prompt="Please do the task.", max_turns=4):
+    def run_agent(self, api, provider="openrouter", directory=None, extra=(), prompt="Please do the task.", max_turns=4, timeout=15):
         workspace = contextlib.nullcontext(directory) if directory is not None else tempfile.TemporaryDirectory(prefix="zero agent ")
         with workspace as folder:
             return subprocess.run([str(EXE), "--provider", provider, "--model", "any/custom-model-id",
                                    "--cwd", str(folder), "--max-turns", str(max_turns), "--prompt", prompt, *extra],
-                                  env=environment(api.url), text=True, capture_output=True, timeout=15)
+                                  env=environment(api.url), text=True, capture_output=True, timeout=timeout)
 
     def test_native_core(self):
         result = subprocess.run([str(EXE), "--self-test"], capture_output=True, text=True, timeout=5)
@@ -250,7 +250,7 @@ class AgentTests(unittest.TestCase):
                 self.assertEqual(Path(folder, "README.md").read_text(), "# Project\n")
                 self.assertIn("next_offset", json.dumps(api.requests[2][1]))
 
-    def test_file_read_boundaries_and_failed_large_overwrite(self):
+    def test_file_read_boundaries_and_large_overwrite(self):
         for size in (16368, 16384, 16385, 3500000):
             with self.subTest(size=size), tempfile.TemporaryDirectory() as folder:
                 contents = b"a" * size
@@ -271,10 +271,10 @@ class AgentTests(unittest.TestCase):
                 if size > 16384:
                     with MockAPI([
                         reply("openrouter", calls=[("write_file", {"path": "file.txt", "content": "replacement"})]),
-                        reply("openrouter", "Could not overwrite.")]) as api:
+                        reply("openrouter", "Overwrite complete.")]) as api:
                         result = self.run_agent(api, directory=folder, extra=("--approve",))
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                        self.assertEqual(Path(folder, "file.txt").read_bytes(), contents)
+                        self.assertEqual(Path(folder, "file.txt").read_text(), "replacement")
 
     def test_tui_read_large_graph_then_write_readme(self):
         with tempfile.TemporaryDirectory() as folder:

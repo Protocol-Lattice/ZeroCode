@@ -167,10 +167,6 @@ fn receiveResponse(app: mutref<App>) -> Void {
         }
         return
     }
-    if !ensureHistorySpace(app, std.mem.len(payload) + 512) {
-        failTurn(app, "The current model response is too large to retain safely. Retry with a smaller output.")
-        return
-    }
     usageCount(app, payload)
     clear(pendingData)
     clear(scratchData)
@@ -180,12 +176,10 @@ fn receiveResponse(app: mutref<App>) -> Void {
             failTurn(app, "Claude response did not contain content.")
             return
         }
-        if bufLen(historyData) > 0 {
-            put(historyData, 44_u8)
+        if !appendAssistantHistory(app, payload) {
+            failAssistantHistory(app, payload)
+            return
         }
-        append(historyData, "{\"role\":\"assistant\",\"content\":")
-        append(historyData, content)
-        put(historyData, 125_u8)
         put(pendingData, 91_u8)
         var index: usize = 0
         var tools: usize = 0
@@ -227,10 +221,10 @@ fn receiveResponse(app: mutref<App>) -> Void {
             failTurn(app, "Model reached its output limit. Retry with a smaller task or another model.")
             return
         }
-        if bufLen(historyData) > 0 {
-            put(historyData, 44_u8)
+        if !appendAssistantHistory(app, message) {
+            failAssistantHistory(app, message)
+            return
         }
-        append(historyData, message)
         let decoded: Bool = decode(scratchData, field(message, "content"))
         let calls: Span<u8> = field(message, "tool_calls")
         if std.mem.eql(calls, "null") {
@@ -287,7 +281,7 @@ fn startRequest(app: mutref<App>) -> Void {
         return
     }
     requestBody(app)
-    if !bufOk(scratchData) && ensureHistorySpace(app, 65536_usize) {
+    if !bufOk(scratchData) && ensureHistorySpace(app, 65536_usize, true) {
         requestBody(app)
     }
     if !bufOk(scratchData) || !bufOk(historyData) || !bufOk(app.systemContext) {

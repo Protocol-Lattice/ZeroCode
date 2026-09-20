@@ -6,7 +6,8 @@ import tempfile
 import unittest
 
 from tests import test_agent as agent
-from tests.test_agent import MockAPI, Terminal, environment, reply
+from tests.test_agent import MockAPI, StreamReply, Terminal, environment, reply
+from tests.test_streaming import chunk, claude_events, sse
 
 
 def assert_tool_pairs(test, messages, provider):
@@ -37,6 +38,245 @@ def assert_tool_pairs(test, messages, provider):
 
 class ScalingTests(unittest.TestCase):
     run_agent = agent.AgentTests.run_agent
+
+    def test_large_provider_metadata_survives_file_write_and_edit(self):
+        content = 'Wiersz: "żółw" i wszystkie przykłady.\n' * 600
+        metadata = "signed-provider-state-" + "ABCD" * 45000
+        for provider in ("openrouter", "openai", "claude", "gemini"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as folder:
+                responses = [reply(provider, calls=[("read_file", {"path": "README.md"})]),
+                             reply(provider, text="", calls=[("write_file", {"path": "README.md", "content": content})]),
+                             reply(provider, text="", calls=[("edit_file", {"path": "README.md", "old_text": content, "new_text": content + "Koniec.\n"})]),
+                             reply(provider, "Complete.")]
+                Path(folder, "README.md").write_text("Original\n" * 1500)
+                for response in responses[1:3]:
+                    if provider == "claude":
+                        response["content"].insert(0, {"type": "thinking", "thinking": "Preserve the full file.", "signature": metadata})
+                    else:
+                        message = response["choices"][0]["message"]
+                        message["reasoning_details"] = [{"type": "reasoning.encrypted", "data": metadata, "id": "reasoning-state"}]
+                        # Metadata may also occur inside the function object.
+                        message["tool_calls"][0]["function"]["thought_signature"] = metadata
+                with MockAPI(responses) as api:
+                    result = self.run_agent(api, provider, folder, extra=("--approve",), timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(Path(folder, "README.md").read_text(), content + "Koniec.\n")
+                    self.assertEqual(len(api.requests), 4)
+                    for _, request in api.requests[2:]:
+                        messages = request["messages"]
+                        assert_tool_pairs(self, messages, provider)
+                        if provider == "claude":
+                            signatures = [block["signature"] for message in messages if isinstance(message.get("content"), list)
+                                          for block in message["content"] if block.get("type") == "thinking"]
+                        else:
+                            signatures = [detail["data"] for message in messages for detail in message.get("reasoning_details", [])
+                                          if detail.get("type") == "reasoning.encrypted"]
+                            for message in messages:
+                                for call in message.get("tool_calls", []):
+                                    if call["function"]["name"] in ("write_file", "edit_file"):
+                                        self.assertEqual(call["function"]["thought_signature"], metadata)
+                        self.assertTrue(signatures)
+                        self.assertTrue(all(signature == metadata for signature in signatures))
+
+    def test_large_active_exchange_is_retained_until_all_tool_results(self):
+        for provider in ("openrouter", "claude"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as folder:
+                responses = []
+                metadata = []
+                for index in range(2):
+                    metadata.append(f"signed-state-{index}-" + "ABCD" * 155000)
+                    calls = [("write_file", {"path": f"file{index}-{i}.txt", "content": f"complete {index}-{i}\n"}) for i in range(2)]
+                    response = reply(provider, text="", calls=calls)
+                    if provider == "claude":
+                        response["content"].insert(0, {"type": "redacted_thinking", "data": metadata[-1]})
+                    else:
+                        response["choices"][0]["message"]["reasoning_details"] = [{"type": "reasoning.encrypted", "data": metadata[-1]}]
+                    responses.append(response)
+                with MockAPI(responses + [reply(provider, "All files complete.")]) as api:
+                    result = self.run_agent(api, provider, folder, extra=("--approve",), prompt="KEEP_CURRENT_TASK: save four files.", timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(len(api.requests), 3)
+                    for index, (_, request) in enumerate(api.requests[1:]):
+                        encoded = json.dumps(request)
+                        self.assertIn(metadata[index], encoded)
+                        self.assertIn("KEEP_CURRENT_TASK", encoded)
+                        assert_tool_pairs(self, request["messages"], provider)
+                        for i in range(2):
+                            self.assertEqual(Path(folder, f"file{index}-{i}.txt").read_text(), f"complete {index}-{i}\n")
+                    self.assertNotIn(metadata[0], json.dumps(api.requests[-1][1]))
+                    self.assertIn("Client-generated digest", json.dumps(api.requests[-1][1]))
+
+    def test_medium_file_arguments_in_large_batch_are_compacted(self):
+        for provider in ("openrouter", "claude"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as folder:
+                calls = [("write_file", {"path": f"file{i}.txt", "content": f"file {i}:" + "x" * 12000}) for i in range(12)]
+                response = reply(provider, text="", calls=calls)
+                # JSON escapes in the tool name must not bypass compaction.
+                raw = json.dumps(response).replace('"name": "write_file"', '"name": "\\u0077rite_file"').encode()
+                with MockAPI([raw, reply(provider, "Batch complete.")]) as api:
+                    result = self.run_agent(api, provider, folder, extra=("--approve",), timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    for _, args in calls:
+                        self.assertEqual(Path(folder, args["path"]).read_text(), args["content"])
+                    self.assertLess(len(json.dumps(api.requests[-1][1]["messages"])), 16000)
+                    assert_tool_pairs(self, api.requests[-1][1]["messages"], provider)
+
+    def test_response_beyond_history_limit_reports_sizes_without_writing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            file = Path(folder, "file.txt")
+            file.write_text("Original file must survive.")
+            response = reply("openrouter", text="", calls=[("write_file", {"path": "file.txt", "content": "Replacement"})])
+            response["choices"][0]["message"]["reasoning_details"] = [{"type": "reasoning.encrypted", "data": "A" * 1100000}]
+            with MockAPI([response]) as api:
+                result = self.run_agent(api, directory=folder, extra=("--approve",))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(file.read_text(), "Original file must survive.")
+                self.assertEqual(len(api.requests), 1)
+                self.assertIn("History limit: 1048576 bytes", result.stdout)
+                self.assertIn("reasoning details:", result.stdout)
+
+    def test_write_1000kb_limit_counts_utf8_bytes_and_preserves_permissions(self):
+        content = "ż" * 500000
+        for provider in ("openrouter", "openai", "claude", "gemini"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as folder:
+                file = Path(folder, "README.md")
+                file.write_text("Original README\n" * 2000)
+                file.chmod(0o755)
+                calls = [("write_file", {"path": "README.md", "content": content}),
+                         ("write_file", {"path": "README.md", "content": content + "!"})]
+                with MockAPI([reply(provider, calls=[call]) for call in calls] + [reply(provider, "Finished.")]) as api:
+                    result = self.run_agent(api, provider, folder, extra=("--approve",), timeout=60)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(file.read_text(), content)
+                    self.assertEqual(stat.S_IMODE(file.stat().st_mode), 0o755)
+                    self.assertEqual(list(Path(folder).glob("*.zero-edit.*")), [])
+                    self.assertIn("Preview truncated", result.stdout)
+                    self.assertIn("1000 KB", result.stdout)
+                    self.assertLess(len(result.stdout), 60000)
+                    self.assertEqual(len(api.requests), 3)
+                    for _, request in api.requests:
+                        assert_tool_pairs(self, request["messages"], provider)
+                        self.assertLess(len(json.dumps(request).encode()), 122880)
+                    self.assertIn("Client omitted large file text", json.dumps(api.requests[-1][1]))
+
+    def test_edit_1000kb_fragments_cross_window_and_reject_oversize(self):
+        old = "OLD:" + "ą" * 499998
+        new = "NEW:" + "ę" * 499998
+        prefix = b"p" * 1500000
+        for provider in ("openrouter", "claude"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as folder:
+                file = Path(folder, "large.txt")
+                file.write_bytes(prefix + old.encode() + b"tail")
+                calls = [("edit_file", {"path": "large.txt", "old_text": old, "new_text": new}),
+                         ("edit_file", {"path": "large.txt", "old_text": new + "!", "new_text": "bad"}),
+                         ("edit_file", {"path": "large.txt", "old_text": new, "new_text": new + "!"})]
+                with MockAPI([reply(provider, calls=[call]) for call in calls] + [reply(provider, "Finished.")]) as api:
+                    result = self.run_agent(api, provider, folder, extra=("--approve",), timeout=60)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(file.read_bytes(), prefix + new.encode() + b"tail")
+                    self.assertEqual(list(Path(folder).glob("*.zero-edit.*")), [])
+                    self.assertEqual(len(api.requests), 4)
+                    for _, request in api.requests:
+                        assert_tool_pairs(self, request["messages"], provider)
+                    self.assertGreaterEqual(result.stdout.count("1000 KB"), 2)
+
+    def test_large_write_denial_and_stale_preview_keep_original_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            file = Path(folder, "README.md")
+            original = b"a" * 4095 + "🐢".encode() + b"b" * 50000
+            file.write_bytes(original)
+            responses = [reply("openrouter", calls=[("write_file", {"path": "README.md", "content": "replacement"})]),
+                         reply("openrouter", "Checked.")]
+            with MockAPI(responses) as api:
+                result = self.run_agent(api, directory=folder)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(file.read_bytes(), original)
+                self.assertIn("denied", result.stdout)
+            with MockAPI(responses) as api:
+                terminal = Terminal(["--cwd", folder], environment(api.url))
+                try:
+                    terminal.wait_for("Your terminal.")
+                    terminal.send("replace README\r")
+                    terminal.wait_for("Approve this action?")
+                    changed = original[:-1] + b"X"
+                    file.write_bytes(changed)
+                    terminal.send("y")
+                    terminal.wait_for("Checked.")
+                    self.assertEqual(file.read_bytes(), changed)
+                    self.assertIn("changed since the preview", json.dumps(api.requests))
+                    self.assertEqual(list(Path(folder).glob("*.zero-edit.*")), [])
+                finally:
+                    terminal.close()
+
+    def test_large_content_creates_file_and_grows_small_edit_in_one_batch(self):
+        content = "x" * 1000000
+        with tempfile.TemporaryDirectory() as folder:
+            small = Path(folder, "small.txt")
+            small.write_text("old")
+            calls = [("write_file", {"path": "new.txt", "content": content}),
+                     ("edit_file", {"path": "small.txt", "old_text": "old", "new_text": content})]
+            with MockAPI([reply("openrouter", calls=calls), reply("openrouter", "Finished.")]) as api:
+                result = self.run_agent(api, directory=folder, extra=("--approve",), timeout=60)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(Path(folder, "new.txt").read_text(), content)
+                self.assertEqual(small.read_text(), content)
+                self.assertIn("wrote 1.0 MB · 1 lines", result.stdout)
+                self.assertEqual(list(Path(folder).glob("*.zero-edit.*")), [])
+                assert_tool_pairs(self, api.requests[-1][1]["messages"], "openrouter")
+
+    def test_whole_file_rewrite_preserves_every_line_beyond_preview(self):
+        original = "".join(f"Line {i}: Keep this example and every section in the file.\n" for i in range(447))
+        translated = "".join(f"Wiersz {i}: Zachowaj przykład, cytat \"żółw\" i wszystkie sekcje pliku.\n" for i in range(447))
+        for provider in ("openrouter", "openai", "claude", "gemini"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as folder:
+                file = Path(folder, "README.md")
+                file.write_text(original)
+                calls = [("write_file", {"path": "README.md", "content": translated})]
+                with MockAPI([reply(provider, calls=calls), reply(provider, "Translated.")]) as api:
+                    result = self.run_agent(api, provider, folder, extra=("--approve",))
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(file.read_text(), translated)
+                    self.assertEqual(len(file.read_text().splitlines()), 447)
+                    self.assertIn("447 lines. Preview", result.stdout)
+                    self.assertIn("· 447 lines", result.stdout)
+                    self.assertNotIn("Wiersz 446:", result.stdout)
+
+    def test_edit_limit_allows_worst_case_json_escaping(self):
+        old = "\x01" * 1000000
+        new = "\x02" * 1000000
+        with tempfile.TemporaryDirectory() as folder:
+            file = Path(folder, "file.txt")
+            file.write_text(old)
+            with MockAPI([reply("openrouter", calls=[("edit_file", {"path": "file.txt", "old_text": old, "new_text": new})]),
+                          reply("openrouter", "Finished.")]) as api:
+                result = self.run_agent(api, directory=folder, extra=("--approve",), timeout=60)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(file.read_text(), new)
+                assert_tool_pairs(self, api.requests[-1][1]["messages"], "openrouter")
+
+    def test_streamed_1000kb_edit_retains_complete_arguments(self):
+        old = "A" * 999999 + "\n"
+        new = "ż" * 500000
+        args = json.dumps({"path": "file.txt", "old_text": old, "new_text": new}, ensure_ascii=False)
+        pieces = [args[i:i + 12000] for i in range(0, len(args), 12000)]
+        for provider in ("openrouter", "claude"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as folder:
+                file = Path(folder, "file.txt")
+                file.write_text(old)
+                if provider == "claude":
+                    events = list(claude_events([({"type": "tool_use", "id": "large_call", "name": "edit_file", "input": {}},
+                                                 [{"type": "input_json_delta", "partial_json": part} for part in pieces])], "tool_use"))
+                else:
+                    events = [chunk({"role": "assistant", "tool_calls": [{"index": 0, "id": "large_call", "type": "function",
+                               "function": {"name": "edit_file", "arguments": ""}}]})]
+                    events += [chunk({"tool_calls": [{"index": 0, "function": {"arguments": part}}]}) for part in pieces]
+                    events += [chunk(finish="tool_calls"), "[DONE]"]
+                with MockAPI([StreamReply([sse(event) for event in events]), reply(provider, "Streamed edit complete.")]) as api:
+                    result = self.run_agent(api, provider, folder, extra=("--approve",), timeout=60)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(file.read_text(), new)
+                    self.assertEqual(len(api.requests), 2)
+                    assert_tool_pairs(self, api.requests[-1][1]["messages"], provider)
 
     def test_large_file_paging_preserves_unicode_and_boundaries(self):
         content = ("line: żółw 🐢\n" * 10000).encode()

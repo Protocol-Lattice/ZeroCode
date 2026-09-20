@@ -405,7 +405,7 @@ class ParallelTests(unittest.TestCase):
                 Path(folder, "oversized.txt").write_text("Original file survives.")
                 Path(folder, "read.txt").write_text("The valid read follows the rejected write.")
                 calls = [
-                    ("write_file", {"path": "oversized.txt", "content": "x" * 16500}),
+                    ("write_file", {"path": "oversized.txt", "content": "x" * 1000001}),
                     ("read_file", {"path": "read.txt"}),
                 ]
                 with MockAPI([reply(provider, calls=calls), reply(provider, "Oversized arguments handled.")]) as api:

@@ -6,6 +6,10 @@ if [ ! -x "$compiler" ]; then
     printf 'Set up the pinned Zero compiler first: ./scripts/setup-zero.sh\n' >&2
     exit 1
 fi
+if [ -z "${ZERO_COMPILER:-}" ] && { [ ! -f "$project_dir/.tools/compiler-frame-limit" ] || [ "$(cat "$project_dir/.tools/compiler-frame-limit")" != 16777216 ]; }; then
+    printf 'Update the pinned compiler for 1000 KB file tools: ./scripts/setup-zero.sh\n' >&2
+    exit 1
+fi
 cd "$project_dir"
 mkdir -p dist
 "$compiler" build --target host --out "$project_dir/dist/zero-code"

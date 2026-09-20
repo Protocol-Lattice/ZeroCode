@@ -38,7 +38,52 @@ fn streamArrayLength(array: Span<u8>) -> usize {
     return length
 }
 
+fn appendStreamToolArguments(app: mutref<App>, delta: Span<u8>) -> Bool {
+    let fields: Maybe<usize> = std.json.objectFieldCount(delta)
+    if !fields.has || fields.value != 1 { return false }
+    var key: String = "tool_calls"
+    if app.provider == 2 { key = "content" }
+    let incomingCalls: Span<u8> = field(delta, key)
+    let count: Maybe<usize> = std.json.arrayCount(incomingCalls)
+    if !count.has || count.value != 1 { return false }
+    let incomingCall: Span<u8> = arrayItem(incomingCalls, 0_usize)
+    let callFields: Maybe<usize> = std.json.objectFieldCount(incomingCall)
+    let index: Maybe<u32> = std.json.u32(incomingCall, "index")
+    if !callFields.has || callFields.value != 2 || !index.has || index.value >= 128 { return false }
+    let message: Span<u8> = bytes(app.streamMessage)
+    let previousCall: Span<u8> = streamArrayItem(field(message, key), index.value as usize)
+    var previous: Span<u8> = field(previousCall, "_input_json")
+    var incoming: Span<u8> = field(incomingCall, "_input_json")
+    if app.provider != 2 {
+        let function: Span<u8> = field(incomingCall, "function")
+        let functionFields: Maybe<usize> = std.json.objectFieldCount(function)
+        if !functionFields.has || functionFields.value != 1 { return false }
+        previous = field(field(previousCall, "function"), "arguments")
+        incoming = field(function, "arguments")
+    }
+    if std.mem.len(previous) < 2 || std.mem.len(incoming) < 2 || previous[0] != 34 || incoming[0] != 34 { return false }
+    if previous[std.mem.len(previous) - 1] != 34 || incoming[std.mem.len(incoming) - 1] != 34 { return false }
+    // Locate the exact JSON string only when its bytes are unique. Identical
+    // metadata or multiple matching calls use the general structural merger.
+    if std.str.count(message, previous) != 1 { return false }
+    let start: usize = std.str.indexOf(message, previous)
+    if start >= std.mem.len(message) { return false }
+    let at: usize = start + std.mem.len(previous) - 1
+    clear(app.scratch)
+    append(app.scratch, std.mem.prefix(message, at))
+    append(app.scratch, slice(incoming, 1_usize, std.mem.len(incoming) - 1))
+    append(app.scratch, std.mem.dropPrefix(message, at))
+    if !bufOk(app.scratch) {
+        failTurn(app, "Streamed response exceeded the message limit.")
+        return true
+    }
+    setText(app.streamMessage, bytes(app.scratch))
+    if !bufOk(app.streamMessage) { failTurn(app, "Streamed response exceeded the message limit.") }
+    return true
+}
+
 fn updateStreamMessage(app: mutref<App>, delta: Span<u8>) -> Void {
+    if appendStreamToolArguments(app, delta) { return }
     clear(app.scratch)
     mergeStreamJson(app.scratch, bytes(app.streamMessage), delta, false, 0_usize)
     if !bufOk(app.scratch) {
@@ -47,7 +92,7 @@ fn updateStreamMessage(app: mutref<App>, delta: Span<u8>) -> Void {
     }
     setText(app.streamMessage, bytes(app.scratch))
     if !bufOk(app.streamMessage) {
-        failTurn(app, "Streamed response exceeded the 96 KiB message limit.")
+        failTurn(app, "Streamed response exceeded the 14 MiB message limit.")
     }
 }
 
@@ -123,12 +168,17 @@ fn handleStreamEvent(app: mutref<App>) -> Void {
         }
         updateStreamMessage(app, delta)
     }
+    let finish: Span<u8> = field(firstChoice, "finish_reason")
+    let usage: Span<u8> = field(event, "usage")
+    // Most deltas carry neither field. Avoid copying the accumulated file text
+    // a second time for an update that would preserve both existing values.
+    if std.mem.eql(finish, "null") && std.mem.eql(usage, "null") { return }
     var updateStorage: [4096]u8 = [0_u8; 4096]
     let update: MutSpan<u8> = buffer(updateStorage)
     append(update, "{\"_finish_reason\":")
-    append(update, field(firstChoice, "finish_reason"))
+    append(update, finish)
     append(update, ",\"usage\":")
-    append(update, field(event, "usage"))
+    append(update, usage)
     put(update, 125_u8)
     if app.phase == 1 {
         updateStreamMessage(app, bytes(update))
@@ -180,6 +230,7 @@ fn consumeHttp(app: mutref<App>, data: Span<u8>) -> Void {
                     app.streamMode = 3
                 } else {
                     app.streamMode = 2
+                    clear(app.response)
                     number(app.response, app.httpStatus)
                     put(app.response, 10_u8)
                 }
@@ -200,7 +251,7 @@ fn consumeHttp(app: mutref<App>, data: Span<u8>) -> Void {
     }
 }
 
-fn streamBlockObject(output: MutSpan<u8>, object: Span<u8>, block: Bool) -> Void {
+fn streamBlockObject(output: MutSpan<u8>, object: Span<u8>, block: Bool, input: MutSpan<u8>) -> Void {
     let count: Maybe<usize> = std.json.objectFieldCount(object)
     if !count.has {
         setOk(output, false)
@@ -224,8 +275,6 @@ fn streamBlockObject(output: MutSpan<u8>, object: Span<u8>, block: Bool) -> Void
             put(output, 58_u8)
             let value: Span<u8> = field(object, key.value)
             if std.mem.eql(key.value, "input") && !std.mem.eql(field(object, "_input_json"), "null") {
-                var storage: [32768]u8 = [0_u8; 32768]
-                let input: MutSpan<u8> = buffer(storage)
                 if !decode(input, field(object, "_input_json")) || !std.json.validateBytes(bytes(input)) || !std.str.startsWith(bytes(input), "{") {
                     setOk(output, false)
                     return
@@ -241,7 +290,7 @@ fn streamBlockObject(output: MutSpan<u8>, object: Span<u8>, block: Bool) -> Void
     put(output, 125_u8)
 }
 
-fn streamObject(output: MutSpan<u8>, object: Span<u8>, block: Bool) -> Void {
+fn streamObject(output: MutSpan<u8>, object: Span<u8>, block: Bool, input: MutSpan<u8>) -> Void {
     let count: Maybe<usize> = std.json.objectFieldCount(object)
     if !count.has {
         setOk(output, false)
@@ -265,8 +314,6 @@ fn streamObject(output: MutSpan<u8>, object: Span<u8>, block: Bool) -> Void {
             put(output, 58_u8)
             let value: Span<u8> = field(object, key.value)
             if std.mem.eql(key.value, "input") && !std.mem.eql(field(object, "_input_json"), "null") {
-                var storage: [32768]u8 = [0_u8; 32768]
-                let input: MutSpan<u8> = buffer(storage)
                 if !decode(input, field(object, "_input_json")) || !std.json.validateBytes(bytes(input)) || !std.str.startsWith(bytes(input), "{") {
                     setOk(output, false)
                     return
@@ -280,7 +327,7 @@ fn streamObject(output: MutSpan<u8>, object: Span<u8>, block: Bool) -> Void {
                     if index > 0 {
                         put(output, 44_u8)
                     }
-                    streamBlockObject(output, arrayItem(value, index), true)
+                    streamBlockObject(output, arrayItem(value, index), true, input)
                     index = index + 1
                 }
                 put(output, 93_u8)
@@ -304,27 +351,28 @@ fn finishHttp(app: mutref<App>) -> Void {
         return
     }
     finishSessionLogStream(app, true)
-    clear(app.response)
-    append(app.response, "200\n")
+    clear(app.scratch)
+    append(app.scratch, "200\n")
     let message: Span<u8> = bytes(app.streamMessage)
     if app.provider == 2 {
-        streamObject(app.response, message, false)
+        streamObject(app.scratch, message, false, app.arguments)
     } else {
-        append(app.response, "{\"choices\":[{\"message\":")
-        streamObject(app.response, message, false)
-        append(app.response, ",\"finish_reason\":")
-        append(app.response, field(message, "_finish_reason"))
-        append(app.response, "}],\"usage\":")
-        append(app.response, field(message, "usage"))
-        put(app.response, 125_u8)
+        append(app.scratch, "{\"choices\":[{\"message\":")
+        streamObject(app.scratch, message, false, app.arguments)
+        append(app.scratch, ",\"finish_reason\":")
+        append(app.scratch, field(message, "_finish_reason"))
+        append(app.scratch, "}],\"usage\":")
+        append(app.scratch, field(message, "usage"))
+        put(app.scratch, 125_u8)
     }
-    if !bufOk(app.response) {
+    if !bufOk(app.scratch) {
         failTurn(app, "Streamed message is invalid or exceeds the response limit.")
         return
     }
     if app.provider == 2 {
         usageCount(app, message)
     }
+    setText(app.response, bytes(app.scratch))
     if app.streamVisible {
         append(app.transcript, "\n\n")
     }

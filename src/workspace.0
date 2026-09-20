@@ -275,28 +275,76 @@ fn fileUtf8(path: String) -> Bool {
     return false
 }
 
+fn fileChangePreview(app: mutref<App>, title: String, content: Span<u8>) -> Void {
+    if std.mem.len(content) <= 12000 {
+        logEntry(app, title, content)
+        return
+    }
+    var storage: [12304]u8 = [0_u8; 12304]
+    let preview: MutSpan<u8> = buffer(storage)
+    append(preview, "Content: ")
+    number(preview, std.mem.len(content))
+    append(preview, " bytes, ")
+    number(preview, textLineCount(content))
+    append(preview, " lines. Preview of the first 12000 bytes:\n")
+    append(preview, utf8Prefix(content, 12000_usize))
+    append(preview, "\n[Preview truncated; the operation uses the complete supplied content.]")
+    logEntry(app, title, bytes(preview))
+}
+
 fn prepareLargeFile(app: mutref<App>, path: String) -> Bool {
-    var oldStorage: [16384]u8 = [0_u8; 16384]
-    var newStorage: [16384]u8 = [0_u8; 16384]
+    var oldStorage: [1000016]u8 = [0_u8; 1000016]
+    var newStorage: [1000016]u8 = [0_u8; 1000016]
     let old: MutSpan<u8> = buffer(oldStorage)
     let replacement: MutSpan<u8> = buffer(newStorage)
-    if !decode(old, field(bytes(app.arguments), "old_text")) || bufLen(old) == 0 || !decode(replacement, field(bytes(app.arguments), "new_text")) {
-        toolResult(app, "Error: edit text is missing or exceeds 16 KiB.")
+    let writing: Bool = std.mem.eql(bytes(app.toolName), "write_file")
+    if writing {
+        if !decode(replacement, field(bytes(app.arguments), "content")) {
+            toolResult(app, "Error: content must be a string of at most 1000 KB (1000000 UTF-8 bytes).")
+            return false
+        }
+        if bufLen(replacement) > 1000000 {
+            toolResult(app, "Error: file content exceeds 1000 KB (1000000 UTF-8 bytes).")
+            return false
+        }
+    } else if !decode(old, field(bytes(app.arguments), "old_text")) || bufLen(old) == 0 || !decode(replacement, field(bytes(app.arguments), "new_text")) {
+        toolResult(app, "Error: edit text is missing or exceeds 1000 KB (1000000 UTF-8 bytes) per fragment.")
         return false
     }
     if !fileUtf8(path) || !fileFingerprint(path, app.result) {
         toolResult(app, "Error: file is not UTF-8, is unreadable, or exceeds 64 MiB.")
         return false
     }
-    let found: Maybe<usize> = findFileText(path, bytes(old))
-    if !found.has {
-        toolResult(app, "Error: old_text must occur exactly once. Read the required range and retry.")
-        return false
+    if !writing {
+        let found: Maybe<usize> = findFileText(path, bytes(old))
+        if !found.has {
+            toolResult(app, "Error: old_text must occur exactly once. Read the required range and retry.")
+            return false
+        }
     }
     app.sent = 2
     logEntry(app, "  REVIEW FILE CHANGE", path)
-    logEntry(app, "  - REMOVE", bytes(old))
-    logEntry(app, "  + INSERT", bytes(replacement))
+    if writing {
+        var preview: [4100]u8 = [0_u8; 4100]
+        let size: Maybe<usize> = std.fs.readBytesAt(path, 0_usize, preview)
+        if !size.has {
+            toolResult(app, "Error: existing file cannot be read. Read and retry.")
+            return false
+        }
+        var count: usize = size.value
+        if count > std.mem.len(preview) { count = std.mem.len(preview) }
+        clear(app.scratch)
+        append(app.scratch, "Replacing the entire file (")
+        number(app.scratch, size.value)
+        append(app.scratch, " bytes). Current content preview:\n")
+        append(app.scratch, utf8Prefix(std.mem.prefix(preview, count), 4096_usize))
+        append(app.scratch, "\n[Preview truncated; the entire file will be replaced.]")
+        logEntry(app, "  CURRENT CONTENT", bytes(app.scratch))
+        fileChangePreview(app, "  + PROPOSED CONTENT", bytes(replacement))
+    } else {
+        fileChangePreview(app, "  - REMOVE", bytes(old))
+        fileChangePreview(app, "  + INSERT", bytes(replacement))
+    }
     return true
 }
 
@@ -327,28 +375,38 @@ fn copyFileRange(source: String, destination: String, start: usize, end: usize) 
     return true
 }
 
-fn writeLargeEdit(app: mutref<App>, source: String, temporary: String) -> Bool {
-    var oldStorage: [16384]u8 = [0_u8; 16384]
-    var newStorage: [16384]u8 = [0_u8; 16384]
+fn writeLargeFile(app: mutref<App>, source: String, temporary: String) -> Bool {
+    var oldStorage: [1000016]u8 = [0_u8; 1000016]
+    var newStorage: [1000016]u8 = [0_u8; 1000016]
     var fingerprintStorage: [128]u8 = [0_u8; 128]
     let old: MutSpan<u8> = buffer(oldStorage)
     let replacement: MutSpan<u8> = buffer(newStorage)
     let fingerprint: MutSpan<u8> = buffer(fingerprintStorage)
-    if !decode(old, field(bytes(app.arguments), "old_text")) || !decode(replacement, field(bytes(app.arguments), "new_text")) {
-        return false
-    }
-    let found: Maybe<usize> = findFileText(source, bytes(old))
     let size: Maybe<usize> = fileByteSize(source)
-    if !found.has || !size.has {
+    if !size.has {
         return false
     }
-    if size.value + bufLen(replacement) > 67108864 + bufLen(old) {
-        return false
+    var start: usize = 0
+    var end: usize = size.value
+    if std.mem.eql(bytes(app.toolName), "write_file") {
+        if !decode(replacement, field(bytes(app.arguments), "content")) || bufLen(replacement) > 1000000 {
+            return false
+        }
+    } else {
+        if !decode(old, field(bytes(app.arguments), "old_text")) || !decode(replacement, field(bytes(app.arguments), "new_text")) {
+            return false
+        }
+        let found: Maybe<usize> = findFileText(source, bytes(old))
+        if !found.has || size.value + bufLen(replacement) > 67108864 + bufLen(old) {
+            return false
+        }
+        start = found.value
+        end = found.value + bufLen(old)
     }
     if !fileFingerprint(source, fingerprint) || !std.mem.eql(bytes(fingerprint), bytes(app.result)) {
         return false
     }
-    if !copyFileRange(source, temporary, 0_usize, found.value) {
+    if !copyFileRange(source, temporary, 0_usize, start) {
         return false
     }
     let written: Maybe<usize> = std.fs.appendBytes(temporary, bytes(replacement))
@@ -358,7 +416,7 @@ fn writeLargeEdit(app: mutref<App>, source: String, temporary: String) -> Bool {
     if written.value != bufLen(replacement) {
         return false
     }
-    if !copyFileRange(source, temporary, found.value + bufLen(old), size.value) {
+    if !copyFileRange(source, temporary, end, size.value) {
         return false
     }
     if !fileFingerprint(source, fingerprint) || !std.mem.eql(bytes(fingerprint), bytes(app.result)) {
@@ -379,7 +437,7 @@ fn applyLargeFile(app: mutref<App>, path: String) -> Void {
         return
     }
     let tempPath: Span<u8> = std.str.trimAscii(std.mem.prefix(temporary, created.value))
-    if !writeLargeEdit(app, path, tempPath) {
+    if !writeLargeFile(app, path, tempPath) {
         let removed: Bool = std.fs.remove(tempPath)
         toolResult(app, "Error: file changed since the preview, edit is ambiguous, or write failed. Read and retry.")
         return
@@ -428,13 +486,13 @@ fn prepareFile(app: mutref<App>) -> Bool {
     if std.fs.exists(fullPath.value) {
         app.sent = 1
         let size: Maybe<usize> = fileByteSize(fullPath.value)
-        if size.has && std.mem.eql(bytes(toolNameData), "edit_file") {
+        if size.has {
             if size.value > 16384 {
                 return prepareLargeFile(app, fullPath.value)
             }
         }
         if !readBounded(resultData, fullPath.value) {
-            toolResult(app, "Error: existing file cannot be read or exceeds 16 KiB.")
+            toolResult(app, "Error: existing file cannot be read.")
             return false
         }
         if !std.text.utf8Valid(bytes(resultData)) {
@@ -447,16 +505,16 @@ fn prepareFile(app: mutref<App>) -> Bool {
             toolResult(app, "Error: cannot edit a missing file.")
             return false
         }
-        if !decode(scratchData, field(bytes(argumentsData), "old_text")) || bufLen(scratchData) == 0 {
-            toolResult(app, "Error: old_text must be a nonempty string.")
+        if !decode(scratchData, field(bytes(argumentsData), "old_text")) || bufLen(scratchData) == 0 || bufLen(scratchData) > 1000000 {
+            toolResult(app, "Error: old_text must be a nonempty string of at most 1000 KB (1000000 UTF-8 bytes).")
             return false
         }
         if std.str.count(bytes(resultData), bytes(scratchData)) != 1 {
             toolResult(app, "Error: old_text must occur exactly once. Read the file again.")
             return false
         }
-        if !decode(scratchData, field(bytes(argumentsData), "new_text")) {
-            toolResult(app, "Error: new_text must be a string.")
+        if !decode(scratchData, field(bytes(argumentsData), "new_text")) || bufLen(scratchData) > 1000000 {
+            toolResult(app, "Error: new_text must be a string of at most 1000 KB (1000000 UTF-8 bytes).")
             return false
         }
     } else {
@@ -468,8 +526,8 @@ fn prepareFile(app: mutref<App>) -> Bool {
             toolResult(app, "The file already contains the requested content. No write is needed. If the task is satisfied, call finish_task now.")
             return false
         }
-        if bufLen(scratchData) > 12288 {
-            toolResult(app, "Error: file content exceeds 12 KiB. Make smaller edits.")
+        if bufLen(scratchData) > 1000000 {
+            toolResult(app, "Error: file content exceeds 1000 KB (1000000 UTF-8 bytes).")
             return false
         }
     }
@@ -480,12 +538,12 @@ fn prepareFile(app: mutref<App>) -> Bool {
     logEntry(app, "  CURRENT CONTENT", bytes(scratchData))
     if std.mem.eql(bytes(toolNameData), "edit_file") {
         let found: Bool = decode(scratchData, field(bytes(argumentsData), "old_text"))
-        logEntry(app, "  - REMOVE", bytes(scratchData))
+        fileChangePreview(app, "  - REMOVE", bytes(scratchData))
         let changed: Bool = decode(scratchData, field(bytes(argumentsData), "new_text"))
-        logEntry(app, "  + INSERT", bytes(scratchData))
+        fileChangePreview(app, "  + INSERT", bytes(scratchData))
     } else {
         let changed: Bool = decode(scratchData, field(bytes(argumentsData), "content"))
-        logEntry(app, "  + PROPOSED CONTENT", bytes(scratchData))
+        fileChangePreview(app, "  + PROPOSED CONTENT", bytes(scratchData))
     }
     return true
 }
@@ -524,8 +582,8 @@ fn applyFile(app: mutref<App>) -> Void {
         return
     }
     if std.mem.eql(bytes(toolNameData), "edit_file") {
-        var oldStorage: [16384]u8 = [0_u8; 16384]
-        var newStorage: [16384]u8 = [0_u8; 16384]
+        var oldStorage: [1000016]u8 = [0_u8; 1000016]
+        var newStorage: [1000016]u8 = [0_u8; 1000016]
         var old: MutSpan<u8> = buffer(oldStorage)
         var replacement: MutSpan<u8> = buffer(newStorage)
         let oldOk: Bool = decode(old, field(bytes(argumentsData), "old_text"))
@@ -542,8 +600,8 @@ fn applyFile(app: mutref<App>) -> Void {
     } else {
         let valid: Bool = decode(scratchData, field(bytes(argumentsData), "content"))
     }
-    if !bufOk(scratchData) || bufLen(scratchData) > 16384 {
-        toolResult(app, "Error: resulting file exceeds 16 KiB.")
+    if !bufOk(scratchData) || bufLen(scratchData) > 67108864 {
+        toolResult(app, "Error: resulting file exceeds the file size limit.")
         return
     }
     if !createParent(fullPath.value) {
@@ -585,10 +643,10 @@ fn applyFile(app: mutref<App>) -> Void {
 }
 
 fn findFileText(path: String, needle: Span<u8>) -> Maybe<usize> {
-    if std.mem.len(needle) == 0 || std.mem.len(needle) > 16368 {
+    if std.mem.len(needle) == 0 || std.mem.len(needle) > 1000000 {
         return null
     }
-    var data: [32768]u8 = [0_u8; 32768]
+    var data: [2000000]u8 = [0_u8; 2000000]
     var offset: usize = 0
     var found: usize = 0
     var matched: Bool = false

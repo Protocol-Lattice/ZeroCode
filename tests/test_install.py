@@ -138,6 +138,7 @@ project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 mkdir -p "$project_dir/.tools/bin"
 printf '#!/bin/sh\\nexit 0\\n' > "$project_dir/.tools/bin/zero"
 chmod 755 "$project_dir/.tools/bin/zero"
+printf '16777216\\n' > "$project_dir/.tools/compiler-frame-limit"
 printf 'setup\\n' >> """ + shlex.quote(str(setup_log)) + "\n")
         self.write_executable(source / "scripts/build.sh", """
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -155,6 +156,26 @@ cp """ + shlex.quote(str(EXE)) + ' "$project_dir/dist/zero-code"\n' +
         self.assertEqual(build_log.read_text(), "build\nbuild\n")
         shutil.rmtree(source)
         self.assert_ok(self.run_installed("--version"))
+
+    def test_existing_compiler_is_refreshed_for_large_file_buffers(self):
+        source, setup_log, _ = self.source_fixture()
+        self.write_executable(source / ".tools/bin/zero", "exit 0\n")
+        self.assert_ok(self.install(binary=None, script=source / "install.sh"))
+        self.assertEqual(setup_log.read_text(), "setup\n")
+
+    def test_compiler_buffer_patch_is_repeatable_and_rejects_unknown_definition(self):
+        header = self.folder / "zero.h"
+        header.write_text("#define Z_DIRECT_FRAME_LOCAL_LIMIT_BYTES 131072u\n")
+        command = ["node", str(ROOT / "scripts/configure-zero-buffers.mjs"), str(header)]
+        for _ in range(2):
+            result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+            self.assert_ok(result)
+            self.assertEqual(header.read_text(), "#define Z_DIRECT_FRAME_LOCAL_LIMIT_BYTES 16777216u\n")
+        header.write_text("#define Z_DIRECT_FRAME_LOCAL_LIMIT_BYTES 1u\n")
+        result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("definition changed", result.stderr)
+        self.assertEqual(header.read_text(), "#define Z_DIRECT_FRAME_LOCAL_LIMIT_BYTES 1u\n")
 
     def test_piped_installer_downloads_requested_revision(self):
         source, setup_log, _ = self.source_fixture()
@@ -178,7 +199,7 @@ exit 1
         result = self.install("--ref", "v0.1.0", binary=None,
                               input=(ROOT / "install.sh").read_text())
         self.assert_ok(result)
-        self.assertIn("https://codeload.github.com/Protocol-Lattice/zero-code/tar.gz/v0.1.0",
+        self.assertIn("https://codeload.github.com/Protocol-Lattice/ZeroCode/tar.gz/v0.1.0",
                       download_log.read_text())
         self.assertTrue(setup_log.exists())
         self.assert_ok(self.run_installed("--version"))

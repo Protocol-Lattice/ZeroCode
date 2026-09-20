@@ -150,6 +150,11 @@ make setup build
 The build creates `dist/zero-code` for the host OS/architecture. The compiler
 itself is stored at `.tools/bin/zero`.
 
+Setup applies an exact patch to the pinned compiler's per-function fixed-buffer
+limit (16 MiB) for large file-tool arguments. The application reserves up to 64 MiB of
+stack before entering its buffer frames; buffer bounds checks remain enabled.
+After updating an older checkout, rerun `make setup build` to refresh the compiler.
+
 ### Running
 
 ```bash
@@ -170,6 +175,11 @@ In the provider picker, **↑ / ↓** select a provider.
 make test
 # or
 python3 -m unittest discover -s tests -v
+```
+
+The slow-provider regression waits 105 seconds before returning a file write:
+```bash
+ZERO_TEST_SLOW=1 python3 -m unittest tests.test_streaming.StreamingTests.test_provider_reply_after_100_seconds_still_writes_and_edits -v
 ```
 
 CI runs the build, tests, and an installation smoke test on Linux and macOS.
@@ -296,8 +306,15 @@ SSE events; tools run only after the response completes successfully. `Esc`
 cancels the worker and restores the conversation to the beginning of the task.
 Providers that return ordinary JSON are also supported. An incomplete stream,
 invalid JSON, or an HTTP/transport error ends the task without executing partial
-tool calls. The transport allows 8 MiB of incoming data, with 64 KiB per SSE event
-and a 96 KiB assembled response buffer.
+tool calls. The transport allows 64 MiB of incoming data, with 64 KiB per SSE event
+and a 14 MiB assembled response buffer, including JSON escaping of file content.
+Each HTTP request has a 360-second deadline. The application allows ten additional
+seconds for worker cleanup, so slow responses are not cut off after 100 seconds.
+`Esc` still cancels immediately; shell commands retain their 60-second limit.
+File content is copied in bounded blocks, and stream events without new usage or
+finish metadata skip the extra message merge. Local edits prefer small exact
+replacements; long translations proceed section by section to reach the first
+write sooner while preserving the full document.
 
 `read_file` accepts optional byte `offset` and `limit` arguments. Small files keep
 the original plain-text result when these arguments are omitted. Large files or
@@ -307,11 +324,21 @@ boundaries preserve UTF-8 characters. The default range is 8,192 bytes; `limit`
 accepts 4–12,000 bytes. Heavily escaped content may require a smaller range.
 
 `edit_file` can replace one unique text fragment in a UTF-8 file up to 64 MiB.
+Both `old_text` and `new_text` accept up to **1000 KB (1,000,000 UTF-8 bytes)** each.
 It previews the old and new fragment, checks a fingerprint of the entire file
 again after approval, and writes through an adjacent temporary file before an
 atomic rename. Existing permissions are preserved. Changes elsewhere in the file
-invalidate the preview. `write_file` still accepts at most 12 KiB of complete file
-content; existing per-call argument and result limits apply. Workspace path,
+invalidate the preview. `write_file` can replace existing UTF-8 files up to 64 MiB,
+with a bounded preview of the old content, a fingerprint check, preserved
+permissions, and atomic replacement. It accepts up to **1000 KB (1,000,000 UTF-8
+bytes)** of complete new content; use `edit_file` in fragments for larger rewrites
+without dropping content. Large proposed fragments have explicitly truncated
+previews; the complete supplied text is used when the operation is approved.
+Previews and successful write summaries show the full proposed content's line
+count, including lines beyond the preview. For translations, Zero is instructed
+to preserve every section and example and to edit in sections when the complete
+replacement cannot fit in one model response.
+Existing per-call argument and result limits apply. Workspace path,
 symlink, secret-file, and ignore checks apply to both small and large files.
 
 Before history fills its buffer, the client shortens older tool results. If that
@@ -321,8 +348,17 @@ paired with their results, including during multi-tool batches. A
 `CONTEXT COMPACTED` notice marks this operation. This is deterministic, lossy
 compaction based on byte budgets, without an extra model request: omitted details
 may need to be read again. It does not calculate a provider-specific token window.
+The normal working budget is 64 KiB, with up to 1 MiB available for a large active
+exchange. Provider reasoning blocks and signatures are retained intact while
+tools run. Completed exchanges may be summarized to make room for the next
+response; the transport accepts the larger history together with system context
+and tool definitions.
 If the active request, tool batch, or tool catalog alone exceeds the available
 space, the client reports an error and asks for a smaller task or catalog.
+Large file arguments remain intact for execution but their text is replaced by an
+explicit omission notice in subsequent model history. Paths, call IDs, metadata,
+and results are retained. Calls whose arguments exceed the worker batch buffer
+run sequentially. Provider output-token limits still apply independently.
 
 ## Project memory
 

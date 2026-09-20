@@ -28,7 +28,13 @@ fi
 if [ ! -d "$source_dir" ]; then
     tar -xzf "$archive" -C "$project_dir/.tools"
 fi
+# The pinned backend supports these frame offsets, but caps individual fixed
+# buffers at 128 KiB. File tools need bounded JSON buffers for two 1000 KB
+# fragments (up to 14 MiB with escaping). Keep the patch exact and repeatable;
+# the application reserves a 64 MiB stack before entering its buffer frames.
+node "$project_dir/scripts/configure-zero-buffers.mjs" "$source_dir/native/zero-c/include/zero.h"
 make -C "$source_dir/native/zero-c"
 cp "$source_dir/.zero/bin/zero" "$project_dir/.tools/bin/zero"
 printf '%s\n' "$revision" > "$project_dir/.tools/compiler-revision"
+printf '%s\n' '16777216' > "$project_dir/.tools/compiler-frame-limit"
 printf '\nCompiler ready. Run ./scripts/build.sh, then ./dist/zero-code.\n'

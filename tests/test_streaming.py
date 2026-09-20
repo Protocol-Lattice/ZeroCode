@@ -45,6 +45,97 @@ def claude_events(blocks, stop="end_turn"):
 class StreamingTests(unittest.TestCase):
     run_agent = agent.AgentTests.run_agent
 
+    def test_many_small_file_deltas_preserve_full_write_and_edit(self):
+        content = 'Wiersz: "żółw" i ścieżka C:\\tmp\\plik.\n' * 500
+        for provider in ("openrouter", "claude"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as folder:
+                path = Path(folder, "README.md")
+                path.write_text("Original content\n" * 1200)
+                responses = []
+                for index, (name, args) in enumerate([
+                    ("write_file", {"path": "README.md", "content": content}),
+                    ("edit_file", {"path": "README.md", "old_text": content, "new_text": content + "Koniec.\n"}),
+                ]):
+                    encoded = json.dumps(args, ensure_ascii=False)
+                    pieces = [encoded[i:i + 16] for i in range(0, len(encoded), 16)]
+                    if provider == "claude":
+                        events = claude_events([({"type": "tool_use", "id": f"dense_{index}", "name": name, "input": {}},
+                                                [{"type": "input_json_delta", "partial_json": part} for part in pieces])], "tool_use")
+                    else:
+                        events = [chunk({"role": "assistant", "tool_calls": [{"index": 0, "id": f"dense_{index}", "type": "function",
+                                   "function": {"name": name, "arguments": ""}}]})]
+                        events += [chunk({"tool_calls": [{"index": 0, "function": {"arguments": part}}]}) for part in pieces]
+                        events += [chunk(finish="tool_calls"), {"choices": [], "usage": {"total_tokens": 42}}, "[DONE]"]
+                    responses.append(StreamReply([sse(event) for event in events]))
+                with MockAPI([*responses, reply(provider, "Saved every line.")]) as api:
+                    result = self.run_agent(api, provider, folder, extra=("--approve",), timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(path.read_text(), content + "Koniec.\n")
+                    self.assertEqual(len(api.requests), 3)
+                    self.assertNotIn("_input_json", json.dumps(api.requests[-1][1]))
+
+    def test_argument_deltas_do_not_modify_identical_metadata(self):
+        first = '{"path":"note.txt",'
+        last = '"content":"Saved żółw\\n"}'
+        for provider in ("openrouter", "claude"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as folder:
+                if provider == "claude":
+                    events = claude_events([
+                        ({"type": "thinking", "thinking": "", "signature": "unchanged"}, [{"type": "thinking_delta", "thinking": first}]),
+                        ({"type": "tool_use", "id": "write", "name": "write_file", "input": {}},
+                         [{"type": "input_json_delta", "partial_json": part} for part in (first, last)])], "tool_use")
+                else:
+                    events = [chunk({"role": "assistant", "reasoning_details": [{"type": "reasoning.text", "text": first}],
+                        "tool_calls": [{"index": 0, "id": "write", "type": "function", "function": {"name": "write_file", "arguments": first}}]}),
+                        chunk({"tool_calls": [{"index": 0, "function": {"arguments": last}}]}, "tool_calls"), "[DONE]"]
+                with MockAPI([StreamReply([sse(event) for event in events]), reply(provider, "Done.")]) as api:
+                    result = self.run_agent(api, provider, folder, extra=("--approve",))
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(Path(folder, "note.txt").read_text(), "Saved żółw\n")
+                    message = next(m for m in api.requests[-1][1]["messages"] if m["role"] == "assistant")
+                    if provider == "claude":
+                        self.assertEqual(message["content"][0]["thinking"], first)
+                        self.assertEqual(message["content"][0]["signature"], "unchanged")
+                    else:
+                        self.assertEqual(message["reasoning_details"][0]["text"], first)
+
+    @unittest.skipUnless(os.environ.get("ZERO_TEST_SLOW") == "1", "set ZERO_TEST_SLOW=1 for the 105-second timeout regression")
+    def test_provider_reply_after_100_seconds_still_writes_and_edits(self):
+        release = threading.Event()
+        waited = []
+
+        def delayed_write():
+            yield b": waiting for the provider\r\n\r\n"
+            started = time.monotonic()
+            if release.wait(105):
+                return
+            waited.append(time.monotonic() - started)
+            yield sse(chunk({"role": "assistant", "tool_calls": [{"index": 0, "id": "delayed_write", "type": "function",
+                "function": {"name": "write_file", "arguments": json.dumps({"path": "README.md", "content": "Translated README\n"})}}]}, "tool_calls"))
+            yield sse("[DONE]")
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder, "README.md")
+            original = "Original README line.\n" * 1100
+            path.write_text(original)
+            reads = [reply("openrouter", calls=[("read_file", {"path": "README.md", "offset": offset, "limit": 8192})])
+                     for offset in range(0, len(original.encode()), 8192)]
+            responses = [*reads, StreamReply(delayed_write()),
+                reply("openrouter", calls=[("edit_file", {"path": "README.md", "old_text": "Translated", "new_text": "Edited"})]),
+                reply("openrouter", "Completed after the delayed response.")]
+            with MockAPI(responses) as api:
+                try:
+                    result = self.run_agent(api, directory=folder, extra=("--approve",), max_turns=8, timeout=130)
+                finally:
+                    release.set()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(len(waited), 1)
+                self.assertGreaterEqual(waited[0], 105)
+                self.assertEqual(path.read_text(), "Edited README\n")
+                self.assertEqual(len(api.requests), len(reads) + 3)
+                self.assertNotIn("timed out", result.stdout)
+                self.assertIn("Completed after the delayed response.", result.stdout)
+
     def test_headless_text_is_flushed_before_stream_finishes(self):
         release = threading.Event()
 

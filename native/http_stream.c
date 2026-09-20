@@ -11,12 +11,36 @@
 #include <stdint.h>
 #include <limits.h>
 #include <sys/types.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 /* A nested HTTP worker belongs to its model worker's group, so cancelling the
  * model worker also reaches the transport. Root HTTP workers keep their group. */
 static pid_t zero_expected_parent;
 static int zero_join_attempted;
+
+/* Shared with the application watchdog so it cannot cancel a valid request
+ * before libcurl's deadline. The watchdog adds time for worker cleanup. */
+int zero_http_timeout_seconds(void) {
+    return 360;
+}
+
+/* The pinned Zero backend uses explicit fixed buffers on the stack. Reserve
+ * enough per-process address space for two 1000 KB JSON-escaped edit fragments;
+ * the HTTP-only worker does not enter the application or need this stack. */
+int zero_prepare_stack(void) {
+    struct rlimit limit;
+    rlim_t needed = 64 * 1024 * 1024;
+    if (getrlimit(RLIMIT_STACK, &limit)) return 0;
+    if (limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur >= needed) return 1;
+    if (limit.rlim_max != RLIM_INFINITY && limit.rlim_max < needed) {
+        /* Darwin reserves guard pages below its nominal 64 MiB hard limit. */
+        if (limit.rlim_max < 63 * 1024 * 1024) return 0;
+        needed = limit.rlim_max;
+    }
+    limit.rlim_cur = needed;
+    return setrlimit(RLIMIT_STACK, &limit) == 0;
+}
 
 static int zero_stream_parent_alive(void) {
     return !zero_join_attempted || (zero_expected_parent > 1
@@ -94,7 +118,7 @@ static size_t zero_stream_body(char *data, size_t size, size_t count, void *opaq
     if (size && count > SIZE_MAX / size) return 0;
     size_t length = size * count;
     ZeroStreamTransport *state = opaque;
-    if (length > 8 * 1024 * 1024 - state->received) return 0;
+    if (length > 64 * 1024 * 1024 - state->received) return 0;
     state->received += length;
     if (!zero_stream_prefix(state)) return 0;
     if (fwrite(data, 1, length, stdout) != length || fflush(stdout)) return 0;
@@ -102,7 +126,7 @@ static size_t zero_stream_body(char *data, size_t size, size_t count, void *opaq
 }
 
 int zero_http_stream(unsigned int expected) {
-    if (!zero_stream_parent_alive() || !expected || expected > 122880) return 1;
+    if (!zero_stream_parent_alive() || !expected || expected > 1310720) return 1;
     char *request = calloc((size_t)expected + 1, 1);
     if (!request) return 1;
     if (fread(request, 1, expected, stdin) != expected || memchr(request, 0, expected)) {
@@ -152,7 +176,7 @@ int zero_http_stream(unsigned int expected) {
     ZERO_CURL_SET(CURLOPT_WRITEDATA, &state);
     ZERO_CURL_SET(CURLOPT_ACCEPT_ENCODING, "");
     ZERO_CURL_SET(CURLOPT_CONNECTTIMEOUT, 15L);
-    ZERO_CURL_SET(CURLOPT_TIMEOUT, 90L);
+    ZERO_CURL_SET(CURLOPT_TIMEOUT, (long)zero_http_timeout_seconds());
     ZERO_CURL_SET(CURLOPT_NOSIGNAL, 1L);
     ZERO_CURL_SET(CURLOPT_FOLLOWLOCATION, 0L);
     ZERO_CURL_SET(CURLOPT_NOPROGRESS, 0L);

@@ -110,11 +110,14 @@ fn toolResultSummary(output: MutSpan<u8>, name: Span<u8>, args: Span<u8>, result
     if std.mem.eql(name, "read_file") {
         readResultSummary(output, args, result)
     } else if std.mem.eql(name, "write_file") {
-        var writeStorage: [16400]u8 = [0_u8; 16400]
+        var writeStorage: [1000016]u8 = [0_u8; 1000016]
         let content: MutSpan<u8> = buffer(writeStorage)
         if decode(content, field(args, "content")) {
             append(output, "wrote ")
             displayBytes(output, bufLen(content))
+            append(output, " · ")
+            number(output, textLineCount(bytes(content)))
+            append(output, " lines")
         } else {
             append(output, "file written")
         }
@@ -187,7 +190,7 @@ fn toolDisplayTests() -> Void raises {
     check assertTrue(std.mem.eql(bytes(summary), "✓ notes.txt · 29.1 KB · 1 lines in range (bytes 0–4)"))
     clear(summary)
     toolResultSummary(summary, "write_file", "{\"content\":\"żółw\"}", "Saved file")
-    check assertTrue(std.mem.eql(bytes(summary), "✓ wrote 7 B"))
+    check assertTrue(std.mem.eql(bytes(summary), "✓ wrote 7 B · 1 lines"))
     clear(summary)
     toolResultSummary(summary, "search", "{}", "{\"matches\":[1,2,3]}")
     check assertTrue(std.mem.eql(bytes(summary), "✓ 3 matches"))

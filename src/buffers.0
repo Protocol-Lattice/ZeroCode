@@ -45,16 +45,14 @@ fn append(value: MutSpan<u8>, text: Span<u8>) -> Void {
         return
     }
     let count: usize = std.mem.len(text)
-    if count > capacity(value) - bufLen(value) {
+    let length: usize = bufLen(value)
+    if count > capacity(value) - length {
         setOk(value, false)
         return
     }
-    var index: usize = 0
-    while index < count {
-        value[bufLen(value) + index] = text[index]
-        index = index + 1
-    }
-    setLen(value, bufLen(value) + count)
+    let copied: usize = std.mem.copy(value[length..length + count], text)
+    setLen(value, length + copied)
+    if copied != count { setOk(value, false) }
 }
 
 fn put(value: MutSpan<u8>, byte: u8) -> Void {
@@ -92,21 +90,25 @@ fn slice(value: Span<u8>, start: usize, end: usize) -> Span<u8> {
 fn quoted(value: MutSpan<u8>, text: Span<u8>) -> Void {
     put(value, 34_u8)
     var i: usize = 0
+    var start: usize = 0
     let hex: Span<u8> = "0123456789abcdef"
     while i < std.mem.len(text) {
         let c: u8 = text[i]
         if c == 34 || c == 92 {
+            append(value, slice(text, start, i))
             put(value, 92_u8)
             put(value, c)
+            start = i + 1
         } else if c < 32 {
+            append(value, slice(text, start, i))
             append(value, "\\u00")
             put(value, hex[(c / 16) as usize])
             put(value, hex[(c % 16) as usize])
-        } else {
-            put(value, c)
+            start = i + 1
         }
         i = i + 1
     }
+    append(value, std.mem.dropPrefix(text, start))
     put(value, 34_u8)
 }
 
