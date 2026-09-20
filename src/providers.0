@@ -338,12 +338,13 @@ fn startRequest(app: mutref<App>) -> Void {
     app.streamVisible = false
     clear(app.streamLine)
     clear(app.streamEvent)
+    clear(responseData)
+    resetStreamArguments(app)
     if app.provider == 2 {
         setText(app.streamMessage, "{}")
     } else {
         setText(app.streamMessage, "{\"role\":\"assistant\"}")
     }
-    clear(responseData)
     clear(app.result)
     clear(errorsData)
 }

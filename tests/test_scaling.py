@@ -278,6 +278,30 @@ class ScalingTests(unittest.TestCase):
                     self.assertEqual(len(api.requests), 2)
                     assert_tool_pairs(self, api.requests[-1][1]["messages"], provider)
 
+    def test_streamed_worst_case_escaping_preserves_argument_capacity(self):
+        old = "\x01" * 1000000
+        new = "\x02" * 1000000
+        args = json.dumps({"path": "file.txt", "old_text": old, "new_text": new})
+        pieces = [args[i:i + 12000] for i in range(0, len(args), 12000)]
+        for provider in ("openrouter", "claude"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as folder:
+                file = Path(folder, "file.txt")
+                file.write_text(old)
+                if provider == "claude":
+                    events = claude_events([({"type": "tool_use", "id": "escaped", "name": "edit_file", "input": {}},
+                        [{"type": "input_json_delta", "partial_json": part} for part in pieces])], "tool_use")
+                else:
+                    events = [chunk({"tool_calls": [{"index": 0, "id": "escaped", "type": "function",
+                        "function": {"name": "edit_file", "arguments": ""}}]})]
+                    events += [chunk({"tool_calls": [{"index": 0, "function": {"arguments": part}}]}) for part in pieces]
+                    events += [chunk(finish="tool_calls"), "[DONE]"]
+                with MockAPI([StreamReply([sse(event) for event in events]), reply(provider, "Saved escaped edit.")]) as api:
+                    result = self.run_agent(api, provider, folder, extra=("--approve",), timeout=60)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(file.read_text(), new)
+                    self.assertEqual(len(api.requests), 2)
+                    assert_tool_pairs(self, api.requests[-1][1]["messages"], provider)
+
     def test_large_file_paging_preserves_unicode_and_boundaries(self):
         content = ("line: żółw 🐢\n" * 10000).encode()
         with tempfile.TemporaryDirectory() as folder:

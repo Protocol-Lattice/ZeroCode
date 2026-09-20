@@ -1,0 +1,207 @@
+// A response's tool arguments grow independently of its provider metadata.
+// While HTTP is active, pending is a bounded page arena rather than a tool
+// queue. Each of 128 call/block indices owns a head and tail in streamArguments.
+// Pages hold next (offset + 1), used bytes, and 4096 bytes of decoded JSON text.
+fn streamArgumentOffset(data: Span<u8>, at: usize) -> usize {
+    return data[at] as usize + data[at + 1] as usize * 256 + data[at + 2] as usize * 65536 + data[at + 3] as usize * 16777216
+}
+
+fn setStreamArgumentOffset(data: MutSpan<u8>, at: usize, value: usize) -> Void {
+    data[at] = (value % 256) as u8
+    data[at + 1] = (value / 256 % 256) as u8
+    data[at + 2] = (value / 65536 % 256) as u8
+    data[at + 3] = (value / 16777216 % 256) as u8
+}
+
+fn resetStreamArguments(app: mutref<App>) -> Void {
+    clear(app.pending)
+    clear(app.streamArguments)
+    var index: usize = 0
+    while index < 1024 {
+        put(app.streamArguments, 0_u8)
+        index = index + 1
+    }
+    app.streamArgumentBytes = 0
+}
+
+fn hasStreamArgument(app: ref<App>, index: usize) -> Bool {
+    return index < 128 && streamArgumentOffset(bytes(app.streamArguments), index * 8) != 0
+}
+
+fn storeStreamArgument(app: mutref<App>, index: usize, raw: Span<u8>) -> Bool {
+    if index >= 128 { return false }
+    var storage: [65552]u8 = [0_u8; 65552]
+    let decoded: MutSpan<u8> = buffer(storage)
+    if !decode(decoded, raw) { return false }
+    let encodedBytes: usize = quotedSize(bytes(decoded)) - 2
+    if app.streamArgumentBytes + encodedBytes > capacity(app.response) { return false }
+    let arena: MutSpan<u8> = app.pending
+    let slots: MutSpan<u8> = app.streamArguments
+    var tail: usize = streamArgumentOffset(bytes(slots), index * 8 + 4)
+    var offset: usize = 0
+    // An empty first fragment still records that the metadata owns a placeholder.
+    while offset < bufLen(decoded) || tail == 0 {
+        var used: usize = 4096
+        if tail != 0 { used = streamArgumentOffset(bytes(arena), tail - 1 + 4) }
+        if used == 4096 {
+            if bufLen(arena) + 4104 > capacity(arena) { return false }
+            let next: usize = bufLen(arena) + 1
+            setLen(arena, bufLen(arena) + 4104)
+            setStreamArgumentOffset(arena, next - 1, 0_usize)
+            setStreamArgumentOffset(arena, next - 1 + 4, 0_usize)
+            if tail == 0 { setStreamArgumentOffset(slots, index * 8, next) }
+            else { setStreamArgumentOffset(arena, tail - 1, next) }
+            setStreamArgumentOffset(slots, index * 8 + 4, next)
+            tail = next
+            used = 0
+        }
+        var count: usize = bufLen(decoded) - offset
+        if count > 4096 - used { count = 4096 - used }
+        let copied: usize = std.mem.copy(arena[tail - 1 + 8 + used..], slice(bytes(decoded), offset, offset + count))
+        if copied != count { return false }
+        setStreamArgumentOffset(arena, tail - 1 + 4, used + count)
+        offset = offset + count
+    }
+    app.streamArgumentBytes = app.streamArgumentBytes + encodedBytes
+    return true
+}
+
+fn writeStreamArgument(app: ref<App>, output: MutSpan<u8>, index: usize, encode: Bool) -> Void {
+    if !hasStreamArgument(app, index) { setOk(output, false)
+        return }
+    let arena: Span<u8> = bytes(app.pending)
+    var page: usize = streamArgumentOffset(bytes(app.streamArguments), index * 8)
+    var storage: [24594]u8 = [0_u8; 24594]
+    let escaped: MutSpan<u8> = buffer(storage)
+    if encode { put(output, 34_u8) }
+    while page != 0 {
+        let used: usize = streamArgumentOffset(arena, page - 1 + 4)
+        let part: Span<u8> = slice(arena, page - 1 + 8, page - 1 + 8 + used)
+        if encode {
+            clear(escaped)
+            quoted(escaped, part)
+            if !bufOk(escaped) { setOk(output, false)
+                return }
+            append(output, slice(bytes(escaped), 1_usize, bufLen(escaped) - 1))
+        } else { append(output, part) }
+        if !bufOk(output) { return }
+        page = streamArgumentOffset(arena, page - 1)
+    }
+    if encode { put(output, 34_u8) }
+}
+
+// Filter only structural argument fields. Identical text in reasoning,
+// signatures or another call must retain its original meaning.
+fn streamArgumentObject(app: mutref<App>, output: MutSpan<u8>, object: Span<u8>, index: usize, function: Bool) -> Void {
+    let count: Maybe<usize> = std.json.objectFieldCount(object)
+    if !count.has || count.value > 128 { setOk(output, false)
+        return }
+    put(output, 123_u8)
+    var i: usize = 0
+    while i < count.value {
+        var keyStorage: [256]u8 = [0_u8; 256]
+        let key: Maybe<Span<u8>> = std.json.objectKey(keyStorage, object, i)
+        if !key.has { setOk(output, false)
+            return }
+        if i > 0 { put(output, 44_u8) }
+        quoted(output, key.value)
+        put(output, 58_u8)
+        let value: Span<u8> = field(object, key.value)
+        if function && std.mem.eql(key.value, "arguments") || !function && app.provider == 2 && std.mem.eql(key.value, "_input_json") {
+            if std.mem.eql(value, "null") { append(output, value) }
+            else if storeStreamArgument(app, index, value) { append(output, "\"\"") }
+            else { setOk(output, false)
+                return }
+        } else { append(output, value) }
+        i = i + 1
+    }
+    put(output, 125_u8)
+}
+
+fn streamArgumentCall(app: mutref<App>, output: MutSpan<u8>, call: Span<u8>, index: usize) -> Void {
+    if app.provider == 2 { streamArgumentObject(app, output, call, index, false)
+        return }
+    let count: Maybe<usize> = std.json.objectFieldCount(call)
+    if !count.has || count.value > 128 { setOk(output, false)
+        return }
+    put(output, 123_u8)
+    var i: usize = 0
+    while i < count.value {
+        var keyStorage: [256]u8 = [0_u8; 256]
+        let key: Maybe<Span<u8>> = std.json.objectKey(keyStorage, call, i)
+        if !key.has { setOk(output, false)
+            return }
+        if i > 0 { put(output, 44_u8) }
+        quoted(output, key.value)
+        put(output, 58_u8)
+        let value: Span<u8> = field(call, key.value)
+        if std.mem.eql(key.value, "function") && std.str.startsWith(value, "{") { streamArgumentObject(app, output, value, index, true) }
+        else { append(output, value) }
+        i = i + 1
+    }
+    put(output, 125_u8)
+}
+
+fn separateStreamArguments(app: mutref<App>, output: MutSpan<u8>, delta: Span<u8>) -> Void {
+    let count: Maybe<usize> = std.json.objectFieldCount(delta)
+    if !count.has || count.value > 128 { setOk(output, false)
+        return }
+    var callsKey: String = "tool_calls"
+    if app.provider == 2 { callsKey = "content" }
+    put(output, 123_u8)
+    var i: usize = 0
+    while i < count.value {
+        var keyStorage: [256]u8 = [0_u8; 256]
+        let key: Maybe<Span<u8>> = std.json.objectKey(keyStorage, delta, i)
+        if !key.has { setOk(output, false)
+            return }
+        if i > 0 { put(output, 44_u8) }
+        quoted(output, key.value)
+        put(output, 58_u8)
+        let value: Span<u8> = field(delta, key.value)
+        if std.mem.eql(key.value, callsKey) && std.str.startsWith(value, "[") {
+            let length: Maybe<usize> = std.json.arrayCount(value)
+            if !length.has || length.value > 128 { setOk(output, false)
+                return }
+            put(output, 91_u8)
+            var position: usize = 0
+            while position < length.value {
+                let call: Span<u8> = arrayItem(value, position)
+                let index: Maybe<u32> = std.json.u32(call, "index")
+                var at: usize = position
+                if index.has { at = index.value as usize }
+                else if !std.mem.eql(field(call, "index"), "null") { setOk(output, false)
+                    return }
+                if at >= 128 { setOk(output, false)
+                    return }
+                if position > 0 { put(output, 44_u8) }
+                streamArgumentCall(app, output, call, at)
+                position = position + 1
+            }
+            put(output, 93_u8)
+        } else { append(output, value) }
+        i = i + 1
+    }
+    put(output, 125_u8)
+}
+
+fn streamFunctionObject(app: ref<App>, output: MutSpan<u8>, object: Span<u8>, index: usize) -> Void {
+    let count: Maybe<usize> = std.json.objectFieldCount(object)
+    if !count.has { setOk(output, false)
+        return }
+    put(output, 123_u8)
+    var i: usize = 0
+    while i < count.value {
+        var keyStorage: [256]u8 = [0_u8; 256]
+        let key: Maybe<Span<u8>> = std.json.objectKey(keyStorage, object, i)
+        if !key.has { setOk(output, false)
+            return }
+        if i > 0 { put(output, 44_u8) }
+        quoted(output, key.value)
+        put(output, 58_u8)
+        if std.mem.eql(key.value, "arguments") && hasStreamArgument(app, index) { writeStreamArgument(app, output, index, true) }
+        else { append(output, field(object, key.value)) }
+        i = i + 1
+    }
+    put(output, 125_u8)
+}

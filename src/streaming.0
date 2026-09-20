@@ -50,43 +50,34 @@ fn appendStreamToolArguments(app: mutref<App>, delta: Span<u8>) -> Bool {
     let callFields: Maybe<usize> = std.json.objectFieldCount(incomingCall)
     let index: Maybe<u32> = std.json.u32(incomingCall, "index")
     if !callFields.has || callFields.value != 2 || !index.has || index.value >= 128 { return false }
-    let message: Span<u8> = bytes(app.streamMessage)
-    let previousCall: Span<u8> = streamArrayItem(field(message, key), index.value as usize)
-    var previous: Span<u8> = field(previousCall, "_input_json")
+    if !hasStreamArgument(app, index.value as usize) { return false }
     var incoming: Span<u8> = field(incomingCall, "_input_json")
     if app.provider != 2 {
         let function: Span<u8> = field(incomingCall, "function")
         let functionFields: Maybe<usize> = std.json.objectFieldCount(function)
         if !functionFields.has || functionFields.value != 1 { return false }
-        previous = field(field(previousCall, "function"), "arguments")
         incoming = field(function, "arguments")
     }
-    if std.mem.len(previous) < 2 || std.mem.len(incoming) < 2 || previous[0] != 34 || incoming[0] != 34 { return false }
-    if previous[std.mem.len(previous) - 1] != 34 || incoming[std.mem.len(incoming) - 1] != 34 { return false }
-    // Locate the exact JSON string only when its bytes are unique. Identical
-    // metadata or multiple matching calls use the general structural merger.
-    if std.str.count(message, previous) != 1 { return false }
-    let start: usize = std.str.indexOf(message, previous)
-    if start >= std.mem.len(message) { return false }
-    let at: usize = start + std.mem.len(previous) - 1
-    clear(app.scratch)
-    append(app.scratch, std.mem.prefix(message, at))
-    append(app.scratch, slice(incoming, 1_usize, std.mem.len(incoming) - 1))
-    append(app.scratch, std.mem.dropPrefix(message, at))
-    if !bufOk(app.scratch) {
-        failTurn(app, "Streamed response exceeded the message limit.")
-        return true
+    if std.mem.eql(incoming, "null") { return false }
+    if !storeStreamArgument(app, index.value as usize, incoming) || app.streamArgumentBytes + bufLen(app.streamMessage) > capacity(app.response) {
+        failTurn(app, "Streamed tool arguments are invalid or exceed the message limit.")
     }
-    setText(app.streamMessage, bytes(app.scratch))
-    if !bufOk(app.streamMessage) { failTurn(app, "Streamed response exceeded the message limit.") }
     return true
 }
 
 fn updateStreamMessage(app: mutref<App>, delta: Span<u8>) -> Void {
+    if std.mem.eql(delta, "null") { return }
     if appendStreamToolArguments(app, delta) { return }
+    var storage: [65552]u8 = [0_u8; 65552]
+    let metadata: MutSpan<u8> = buffer(storage)
+    separateStreamArguments(app, metadata, delta)
+    if !bufOk(metadata) {
+        failTurn(app, "Streamed tool arguments are invalid or exceed the message limit.")
+        return
+    }
     clear(app.scratch)
-    mergeStreamJson(app.scratch, bytes(app.streamMessage), delta, false, 0_usize)
-    if !bufOk(app.scratch) {
+    mergeStreamJson(app.scratch, bytes(app.streamMessage), bytes(metadata), false, 0_usize)
+    if !bufOk(app.scratch) || bufLen(app.scratch) + app.streamArgumentBytes > capacity(app.response) {
         failTurn(app, "Streamed response exceeded the message limit or nesting limit.")
         return
     }
@@ -251,7 +242,7 @@ fn consumeHttp(app: mutref<App>, data: Span<u8>) -> Void {
     }
 }
 
-fn streamBlockObject(output: MutSpan<u8>, object: Span<u8>, block: Bool, input: MutSpan<u8>) -> Void {
+fn streamBlockObject(app: ref<App>, output: MutSpan<u8>, object: Span<u8>, index: usize) -> Void {
     let count: Maybe<usize> = std.json.objectFieldCount(object)
     if !count.has {
         setOk(output, false)
@@ -267,19 +258,24 @@ fn streamBlockObject(output: MutSpan<u8>, object: Span<u8>, block: Bool, input: 
             setOk(output, false)
             return
         }
-        if !std.mem.eql(key.value, "_finish_reason") && !std.mem.eql(key.value, "_input_json") && !(block && std.mem.eql(key.value, "index")) && !(!block && std.mem.eql(key.value, "usage")) {
+        if !std.mem.eql(key.value, "_finish_reason") && !std.mem.eql(key.value, "_input_json") && !std.mem.eql(key.value, "index") {
             if written > 0 {
                 put(output, 44_u8)
             }
             quoted(output, key.value)
             put(output, 58_u8)
             let value: Span<u8> = field(object, key.value)
-            if std.mem.eql(key.value, "input") && !std.mem.eql(field(object, "_input_json"), "null") {
-                if !decode(input, field(object, "_input_json")) || !std.json.validateBytes(bytes(input)) || !std.str.startsWith(bytes(input), "{") {
+            if app.provider == 2 && std.mem.eql(key.value, "input") && hasStreamArgument(app, index) {
+                let input: MutSpan<u8> = app.arguments
+                clear(input)
+                writeStreamArgument(app, input, index, false)
+                if !bufOk(input) || !std.json.validateBytes(bytes(input)) || !std.str.startsWith(bytes(input), "{") {
                     setOk(output, false)
                     return
                 }
                 append(output, bytes(input))
+            } else if app.provider != 2 && std.mem.eql(key.value, "function") && hasStreamArgument(app, index) {
+                streamFunctionObject(app, output, value, index)
             } else {
                 append(output, value)
             }
@@ -290,7 +286,7 @@ fn streamBlockObject(output: MutSpan<u8>, object: Span<u8>, block: Bool, input: 
     put(output, 125_u8)
 }
 
-fn streamObject(output: MutSpan<u8>, object: Span<u8>, block: Bool, input: MutSpan<u8>) -> Void {
+fn streamObject(app: ref<App>, output: MutSpan<u8>, object: Span<u8>) -> Void {
     let count: Maybe<usize> = std.json.objectFieldCount(object)
     if !count.has {
         setOk(output, false)
@@ -306,20 +302,14 @@ fn streamObject(output: MutSpan<u8>, object: Span<u8>, block: Bool, input: MutSp
             setOk(output, false)
             return
         }
-        if !std.mem.eql(key.value, "_finish_reason") && !std.mem.eql(key.value, "_input_json") && !(block && std.mem.eql(key.value, "index")) && !(!block && std.mem.eql(key.value, "usage")) {
+        if !std.mem.eql(key.value, "_finish_reason") && !std.mem.eql(key.value, "_input_json") && !std.mem.eql(key.value, "usage") {
             if written > 0 {
                 put(output, 44_u8)
             }
             quoted(output, key.value)
             put(output, 58_u8)
             let value: Span<u8> = field(object, key.value)
-            if std.mem.eql(key.value, "input") && !std.mem.eql(field(object, "_input_json"), "null") {
-                if !decode(input, field(object, "_input_json")) || !std.json.validateBytes(bytes(input)) || !std.str.startsWith(bytes(input), "{") {
-                    setOk(output, false)
-                    return
-                }
-                append(output, bytes(input))
-            } else if std.mem.eql(key.value, "tool_calls") || std.mem.eql(key.value, "content") && std.str.startsWith(value, "[") {
+            if std.mem.eql(key.value, "tool_calls") || std.mem.eql(key.value, "content") && std.str.startsWith(value, "[") {
                 put(output, 91_u8)
                 let length: usize = streamArrayLength(value)
                 var index: usize = 0
@@ -327,7 +317,7 @@ fn streamObject(output: MutSpan<u8>, object: Span<u8>, block: Bool, input: MutSp
                     if index > 0 {
                         put(output, 44_u8)
                     }
-                    streamBlockObject(output, arrayItem(value, index), true, input)
+                    streamBlockObject(app, output, arrayItem(value, index), index)
                     index = index + 1
                 }
                 put(output, 93_u8)
@@ -355,10 +345,10 @@ fn finishHttp(app: mutref<App>) -> Void {
     append(app.scratch, "200\n")
     let message: Span<u8> = bytes(app.streamMessage)
     if app.provider == 2 {
-        streamObject(app.scratch, message, false, app.arguments)
+        streamObject(app, app.scratch, message)
     } else {
         append(app.scratch, "{\"choices\":[{\"message\":")
-        streamObject(app.scratch, message, false, app.arguments)
+        streamObject(app, app.scratch, message)
         append(app.scratch, ",\"finish_reason\":")
         append(app.scratch, field(message, "_finish_reason"))
         append(app.scratch, "}],\"usage\":")

@@ -45,6 +45,86 @@ def claude_events(blocks, stop="end_turn"):
 class StreamingTests(unittest.TestCase):
     run_agent = agent.AgentTests.run_agent
 
+    def test_interleaved_arguments_with_mixed_metadata_and_empty_fragments(self):
+        contents = [('First "żółw" \\ path\n' * 1400), ('Second 🐢\tline\n' * 1300)]
+        args = [json.dumps({"path": f"file{i}.txt", "content": text}, ensure_ascii=False)
+                for i, text in enumerate(contents)]
+        pieces = [[text[i:i + 37] for i in range(0, len(text), 37)] for text in args]
+        for provider in ("openrouter", "openai", "gemini"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as folder:
+                events = [chunk({"role": "assistant", "reasoning_details": [
+                    {"index": 0, "type": "reasoning.text", "text": pieces[0][0]}],
+                    "tool_calls": [{"index": i, "id": f"write_{i}", "type": "function",
+                                    "function": {"name": "write_", "arguments": ""}} for i in (1, 0)]})]
+                events.append(chunk({"tool_calls": [{"index": 0, "function": {"name": "file"}}]}))
+                for part in range(max(map(len, pieces))):
+                    calls = []
+                    for i in (1, 0):
+                        if part < len(pieces[i]):
+                            function = {"arguments": pieces[i][part]}
+                            if part == 0 and i == 1:
+                                function["name"] = "file"
+                            calls.append({"index": i, "function": function})
+                    delta = {"tool_calls": calls}
+                    if part == 10:
+                        delta["tool_calls"][0]["extra_content"] = {"google": {"thought_signature": "preserved"}}
+                    events.append(chunk(delta))
+                    if part % 100 == 0:
+                        events.append(chunk({"tool_calls": [{"index": 0, "function": {"arguments": ""}}]}))
+                        events.append(chunk({"tool_calls": [{"index": 1, "function": {"arguments": None}}]}))
+                events.extend([chunk(finish="tool_calls"), "[DONE]"])
+                with MockAPI([StreamReply([sse(event) for event in events]), reply(provider, "Saved.")]) as api:
+                    result = self.run_agent(api, provider, folder, extra=("--approve",), timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    for i, content in enumerate(contents):
+                        self.assertEqual(Path(folder, f"file{i}.txt").read_text(), content)
+                    message = next(m for m in api.requests[1][1]["messages"] if m["role"] == "assistant")
+                    self.assertEqual([call["id"] for call in message["tool_calls"]], ["write_0", "write_1"])
+                    self.assertEqual(message["reasoning_details"][0]["text"], pieces[0][0])
+                    self.assertEqual(message["tool_calls"][1]["extra_content"]["google"]["thought_signature"], "preserved")
+
+    def test_cancelled_tool_arguments_do_not_leak_into_next_stream(self):
+        release = threading.Event()
+
+        def pending():
+            yield sse(chunk({"content": "Arguments buffered", "tool_calls": [{"index": 0,
+                "id": "cancelled", "type": "function", "function": {"name": "write_file",
+                "arguments": '{"path":"cancelled.txt","content":"' + "old data" * 700}}]}))
+            release.wait(8)
+
+        args = json.dumps({"path": "fresh.txt", "content": "Only the new stream."})
+        events = [chunk({"tool_calls": [{"index": 0, "id": "fresh", "type": "function",
+            "function": {"name": "write_file", "arguments": args[:20]}}]}),
+            chunk({"tool_calls": [{"index": 0, "function": {"arguments": args[20:]}}]}, "tool_calls"), "[DONE]"]
+        with tempfile.TemporaryDirectory() as folder, MockAPI([
+                StreamReply(pending()), StreamReply([sse(event) for event in events]), reply("openrouter", "Fresh stream completed.")]) as api:
+            terminal = Terminal(["--cwd", folder, "--approve"], environment(api.url), rows=40, columns=140)
+            try:
+                terminal.wait_for("Your terminal.")
+                terminal.send("start the old edit\r")
+                terminal.wait_for("Arguments buffered")
+                terminal.send(b"\x1b")
+                terminal.wait_for("Cancelled.")
+                release.set()
+                terminal.send("start a new edit\r")
+                terminal.wait_for("Fresh stream completed.")
+                self.assertFalse(Path(folder, "cancelled.txt").exists())
+                self.assertEqual(Path(folder, "fresh.txt").read_text(), "Only the new stream.")
+                self.assertNotIn("old data", json.dumps(api.requests[-1][1]))
+            finally:
+                release.set()
+                self.assertEqual(terminal.close(), terminal.original)
+
+    def test_invalid_argument_types_and_indices_fail_before_tools_execute(self):
+        for function, index in (({"arguments": {}}, 0), ({"arguments": "{}"}, 128), ({"arguments": "{}"}, "bad")):
+            with self.subTest(function=function, index=index), tempfile.TemporaryDirectory() as folder:
+                events = [chunk({"tool_calls": [{"index": index, "id": "invalid", "type": "function",
+                    "function": {"name": "write_file", **function}}]}, "tool_calls"), "[DONE]"]
+                with MockAPI([StreamReply([sse(event) for event in events])]) as api:
+                    result = self.run_agent(api, directory=folder, extra=("--approve",))
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(len(api.requests), 1)
+
     def test_many_small_file_deltas_preserve_full_write_and_edit(self):
         content = 'Wiersz: "żółw" i ścieżka C:\\tmp\\plik.\n' * 500
         for provider in ("openrouter", "claude"):

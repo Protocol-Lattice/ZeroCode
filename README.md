@@ -31,6 +31,7 @@ zero-code/
 ├── src/workspace.0     # Path checks, range reads and atomic file edits
 ├── src/providers.0     # Provider configuration and request/response mapping
 ├── src/streaming.0     # SSE parsing and incremental message assembly
+├── src/stream_arguments.0 # Separate buffers for streamed tool arguments
 ├── src/context.0       # History, tool results and automatic compaction
 ├── src/memory.0         # Persistent project facts, approvals and atomic storage
 ├── src/logs.0           # Automatic local session journals and key redaction
@@ -312,8 +313,10 @@ and a 14 MiB assembled response buffer, including JSON escaping of file content.
 Each HTTP request has a 360-second deadline. The application allows ten additional
 seconds for worker cleanup, so slow responses are not cut off after 100 seconds.
 `Esc` still cancels immediately; shell commands retain their 60-second limit.
-File content is copied in bounded blocks, and stream events without new usage or
-finish metadata skip the extra message merge. Local edits prefer small exact
+Tool argument fragments accumulate in separate buffers for each call; the final
+response JSON is assembled once when the stream ends. File content is copied in
+bounded blocks, and events without new usage or finish metadata skip the extra
+message merge. Local edits prefer small exact
 replacements; long translations proceed section by section to reach the first
 write sooner while preserving the full document.
 
