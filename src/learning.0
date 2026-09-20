@@ -344,6 +344,9 @@ fn learningStartGraph(app: mutref<App>, prompt: Span<u8>) -> Void {
     app.learningTestsFailed = 0
     app.learningTraversals = 0
     app.learningRequests = 0
+    app.learningUsageReports = 0
+    app.learningInputTokens = 0
+    app.learningOutputTokens = 0
     app.learningTools = 0
     app.learningRepeatedInvalid = 0
     app.learningPreviousFailed = false
@@ -371,8 +374,28 @@ fn learningStartGraph(app: mutref<App>, prompt: Span<u8>) -> Void {
     quoted(record, providerSlug(app.provider))
     append(record, ",\"model\":")
     quoted(record, bytes(app.model))
+    append(record, ",\"policy\":")
+    number(record, app.learningSelectedPolicy)
+    append(record, ",\"mode\":")
+    if hasArg("--learning-frozen") { quoted(record, "frozen") } else { quoted(record, "adaptive") }
+    append(record, ",\"max_requests\":")
+    number(record, app.maxTurns)
     append(record, "}")
     learningEvent(app, "task", bytes(record))
+}
+
+// Keep missing usage distinct from zero. These counters cover coordinator
+// requests only; worker trajectories and their total tokens remain separate.
+fn learningObserveUsage(app: mutref<App>, usage: Span<u8>) -> Void {
+    if !app.learningActive || app.workerMode > 0 { return }
+    var input: Maybe<u32> = std.json.u32(usage, "prompt_tokens")
+    var output: Maybe<u32> = std.json.u32(usage, "completion_tokens")
+    if !input.has { input = std.json.u32(usage, "input_tokens") }
+    if !output.has { output = std.json.u32(usage, "output_tokens") }
+    if !input.has || !output.has { return }
+    app.learningUsageReports = app.learningUsageReports + 1
+    app.learningInputTokens = app.learningInputTokens + input.value as usize
+    app.learningOutputTokens = app.learningOutputTokens + output.value as usize
 }
 
 fn learningObserveTool(app: mutref<App>, result: Span<u8>) -> Void {
@@ -612,6 +635,16 @@ fn learningExperience(app: mutref<App>, status: Span<u8>, summary: Span<u8>) -> 
     quoted(record, bytes(app.learningHead))
     append(record, ",\"global_version\":")
     quoted(record, bytes(app.learningGlobalHead))
+    append(record, ",\"selected_policy\":")
+    number(record, app.learningSelectedPolicy)
+    append(record, ",\"provider\":")
+    quoted(record, providerSlug(app.provider))
+    append(record, ",\"model\":")
+    quoted(record, bytes(app.model))
+    append(record, ",\"mode\":")
+    if hasArg("--learning-frozen") { quoted(record, "frozen") } else { quoted(record, "adaptive") }
+    append(record, ",\"max_requests\":")
+    number(record, app.maxTurns)
     append(record, ",\"complete\":")
     if app.learningComplete {
         append(record, "true")
@@ -624,6 +657,15 @@ fn learningExperience(app: mutref<App>, status: Span<u8>, summary: Span<u8>) -> 
     number(record, app.learningRequests)
     append(record, ",\"tokens\":")
     number(record, app.tokens - app.learningTokenStart)
+    append(record, ",\"usage_scope\":\"coordinator\",\"usage_reports\":")
+    number(record, app.learningUsageReports)
+    let usageComplete: Bool = app.learningRequests > 0 && app.learningRequests == app.learningUsageReports
+    append(record, ",\"usage_complete\":")
+    if usageComplete { append(record, "true") } else { append(record, "false") }
+    append(record, ",\"input_tokens\":")
+    if usageComplete { number(record, app.learningInputTokens) } else { append(record, "null") }
+    append(record, ",\"output_tokens\":")
+    if usageComplete { number(record, app.learningOutputTokens) } else { append(record, "null") }
     append(record, ",\"elapsed_ms\":")
     number(record, std.time.asMsFloor(std.time.between(app.learningStarted, std.time.monotonic())) as usize)
     append(record, ",\"failures\":")
@@ -688,7 +730,7 @@ fn learningEvidenceCount(app: ref<App>, read: Bool) -> usize {
     while i < 4096 && count < 3 {
         let node: Span<u8> = arrayItem(nodes, i)
         if std.mem.eql(node, "null") { break }
-        if std.mem.eql(field(node, "kind"), "\"experience\"") && std.mem.eql(field(node, "complete"), "true") {
+        if std.mem.eql(field(node, "kind"), "\"experience\"") && std.mem.eql(field(node, "complete"), "true") && !std.mem.eql(field(node, "mode"), "\"frozen\"") {
             let qualifies: Bool = read && learningNumber(node, "read_total") > 16384 || !read && learningNumber(node, "invalid_repeats") >= 3
             if qualifies && decode(pattern, field(node, "pattern")) && bufLen(pattern) == 64 {
                 if !std.str.contains(bytes(seen), bytes(pattern)) {
@@ -703,8 +745,59 @@ fn learningEvidenceCount(app: ref<App>, read: Bool) -> usize {
     return count
 }
 
+// Admission suite independent of the triggering experience. Seven full ASCII
+// reads share a six-request budget; permanent and transient retry cases retain
+// their failed outcome. A final model response also consumes one request.
+// Cost here is a request unit, never a dollar or a predicted provider token.
+fn learningReplaySize(index: usize) -> usize {
+    if index == 0 { return 0 }
+    if index == 1 { return 12000 }
+    if index == 2 { return 17000 }
+    if index == 3 { return 33000 }
+    if index == 4 { return 55000 }
+    if index == 5 { return 65000 }
+    return 95000
+}
+
+fn learningReplayMetric(policy: usize, metric: usize) -> usize {
+    var result: usize = 0
+    var i: usize = 0
+    while i < 7 {
+        let calls: usize = learningReadCost(learningReplaySize(i), policy)
+        if metric == 2 {
+            if calls + 1 <= 6 { result = result + 1 }
+        } else {
+            var used: usize = calls
+            if metric == 1 { used = used + 1 }
+            if used > 6 { used = 6 }
+            result = result + used
+        }
+        i = i + 1
+    }
+    if metric < 2 { result = result + learningRetryLimit(policy, true) + learningRetryLimit(policy, false) }
+    return result
+}
+
+fn learningReplayGate(baseline: usize, candidate: usize) -> Bool {
+    return learningPolicyValid(baseline) && learningRegressions(candidate) && learningReplayMetric(candidate, 0_usize) <= learningReplayMetric(baseline, 0_usize) && learningReplayMetric(candidate, 1_usize) <= learningReplayMetric(baseline, 1_usize) && learningReplayMetric(candidate, 2_usize) >= learningReplayMetric(baseline, 2_usize)
+}
+
+fn learningReplaySummary(output: MutSpan<u8>, policy: usize) -> Void {
+    append(output, "{\"tools\":")
+    number(output, learningReplayMetric(policy, 0_usize))
+    append(output, ",\"request_units\":")
+    number(output, learningReplayMetric(policy, 1_usize))
+    append(output, ",\"successes\":")
+    number(output, learningReplayMetric(policy, 2_usize))
+    append(output, "}")
+}
+
+fn learningReplaySummaryValid(summary: Span<u8>, policy: usize) -> Bool {
+    return learningNumber(summary, "tools") == learningReplayMetric(policy, 0_usize) && learningNumber(summary, "request_units") == learningReplayMetric(policy, 1_usize) && learningNumber(summary, "successes") == learningReplayMetric(policy, 2_usize)
+}
+
 fn learningEvaluate(app: ref<App>, baseline: usize, candidate: usize, total: usize, repeats: usize) -> Bool {
-    if !learningRegressions(candidate) || !app.learningComplete {
+    if !learningReplayGate(baseline, candidate) || !app.learningComplete {
         return false
     }
     var before: usize = 0
@@ -801,7 +894,7 @@ fn learningCandidate(app: mutref<App>, read: Bool, total: usize, index: usize) -
     clear(record)
     append(record, "{\"kind\":\"evaluation\",\"id\":")
     quoted(record, bytes(evaluation))
-    append(record, ",\"evaluator\":\"deterministic-policy-replay-v1\",\"isolated\":true,\"regressions_passed\":")
+    append(record, ",\"evaluator\":\"deterministic-policy-replay-v2\",\"isolated\":true,\"regressions_passed\":")
     if learningRegressions(candidate) {
         append(record, "true")
     } else {
@@ -819,7 +912,15 @@ fn learningCandidate(app: mutref<App>, read: Bool, total: usize, index: usize) -
     } else {
         number(record, learningRetryLimit(candidate, true))
     }
-    append(record, ",\"content_loss\":0,\"accepted\":")
+    append(record, ",\"baseline_policy\":")
+    number(record, baseline)
+    append(record, ",\"candidate_policy\":")
+    number(record, candidate)
+    append(record, ",\"benchmark\":{\"suite\":\"bounded-read-retry-v1\",\"cases\":9,\"max_requests\":6,\"cost_model\":\"one-unit-per-model-request\",\"baseline\":")
+    learningReplaySummary(record, baseline)
+    append(record, ",\"candidate\":")
+    learningReplaySummary(record, candidate)
+    append(record, "},\"content_loss\":0,\"accepted\":")
     if accepted {
         append(record, "true")
     } else {
@@ -827,7 +928,7 @@ fn learningCandidate(app: mutref<App>, read: Bool, total: usize, index: usize) -
     }
     append(record, ",\"reason\":")
     if accepted {
-        quoted(record, "Strictly fewer replayed requests, unchanged coverage and no regression in retained fixtures or immutable checks.")
+        quoted(record, "Strictly fewer trigger replay calls, unchanged coverage, and no tool, request-cost or success regression in the independent admission suite and retained fixtures.")
     } else {
         quoted(record, "No measurable improvement, incomplete experience, or regression failure. Candidate discarded.")
     }
@@ -992,7 +1093,7 @@ fn learningFinishGraph(app: mutref<App>, status: Span<u8>, summary: Span<u8>) ->
         }
         let decoded: Bool = decode(app.learningHead, field(bytes(app.learningGraph), "head"))
         let experienceLength: usize = bufLen(app.learningNodes)
-        if evidenceRecorded && !std.mem.eql(status, "cancelled") && !std.mem.eql(status, "interrupted") {
+        if evidenceRecorded && !hasArg("--learning-frozen") && !std.mem.eql(status, "cancelled") && !std.mem.eql(status, "interrupted") {
             if total > 16384 {
                 learningCandidate(app, true, total, 0_usize)
             }
@@ -1291,7 +1392,8 @@ fn learningVersionValid(graph: Span<u8>, version: Span<u8>) -> Bool {
     if !decode(id, field(version, "evaluation")) { return false }
     let evaluation: Span<u8> = learningNode(graph, bytes(id))
     if !std.mem.eql(field(evaluation, "kind"), "\"evaluation\"") || !std.mem.eql(field(evaluation, "accepted"), "true") || !std.mem.eql(field(evaluation, "regressions_passed"), "true") { return false }
-    if !std.mem.eql(field(evaluation, "evaluator"), "\"deterministic-policy-replay-v1\"") { return false }
+    let legacy: Bool = std.mem.eql(field(evaluation, "evaluator"), "\"deterministic-policy-replay-v1\"")
+    if !legacy && !std.mem.eql(field(evaluation, "evaluator"), "\"deterministic-policy-replay-v2\"") { return false }
     if learningNumber(evaluation, "candidate_cost") >= learningNumber(evaluation, "baseline_cost") { return false }
     if !decode(id, field(version, "experience")) { return false }
     let experience: Span<u8> = learningNode(graph, bytes(id))
@@ -1302,12 +1404,22 @@ fn learningVersionValid(graph: Span<u8>, version: Span<u8>) -> Bool {
     if count.value == 0 || count.value > 64 { return false }
     let last: Span<u8> = arrayItem(rules, count.value - 1)
     let candidate: usize = learningDecodePolicy(last)
+    let baseline: usize = learningNumber(evaluation, "baseline_policy")
     if !learningRegressions(candidate) { return false }
+    if !legacy {
+        let benchmark: Span<u8> = field(evaluation, "benchmark")
+        if learningNumber(evaluation, "candidate_policy") != candidate || !learningReplayGate(baseline, candidate) { return false }
+        if !std.mem.eql(field(benchmark, "suite"), "\"bounded-read-retry-v1\"") || learningNumber(benchmark, "cases") != 9 || learningNumber(benchmark, "max_requests") != 6 { return false }
+        if !std.mem.eql(field(benchmark, "cost_model"), "\"one-unit-per-model-request\"") || !std.mem.eql(field(evaluation, "content_loss"), "0") { return false }
+        if !learningReplaySummaryValid(field(benchmark, "baseline"), baseline) || !learningReplaySummaryValid(field(benchmark, "candidate"), candidate) { return false }
+    }
     if std.mem.eql(field(last, "operation"), "\"read_window\"") {
         let total: usize = learningNumber(experience, "read_total")
         if total <= 16384 || learningReadCost(total, candidate) != learningNumber(evaluation, "candidate_cost") { return false }
+        if !legacy && learningReadCost(total, baseline) != learningNumber(evaluation, "baseline_cost") { return false }
     } else if std.mem.eql(field(last, "operation"), "\"invalid_retry_limit\"") {
         if learningNumber(experience, "invalid_repeats") < 3 || learningRetryValue(candidate) != learningNumber(evaluation, "candidate_cost") { return false }
+        if !legacy && learningRetryValue(baseline) != learningNumber(evaluation, "baseline_cost") { return false }
     } else { return false }
     if !decode(id, field(version, "parent")) { return false }
     if !std.mem.eql(bytes(id), "base") {

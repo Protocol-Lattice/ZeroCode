@@ -239,6 +239,7 @@ The application supports four LLM providers:
 - `--no-session-logs` – Disable automatic session logging for this run
 - `--no-learning` – Disable experience capture and automatic policy learning
 - `--no-global-learning` – Keep learning local to this project
+- `--learning-frozen` – Capture measurements and use existing strategies without mutation or promotion
 
 ## Example Usage
 

@@ -56,9 +56,19 @@ the next request's context. Experience text cannot become a system instruction.
 Replay uses the same pure policy functions used by the executor. Candidates are
 evaluated in detached scalar state, without filesystem, shell, network, model,
 or `App` capabilities. The evaluator also checks retained experience fixtures and
-fixed regressions. Its metric is deterministic tool-request cost and coverage,
-not a claim about improved general reasoning or live model accuracy. End-to-end
-tests verify the predicted savings against actual tool execution.
+fixed regressions. Evaluator `deterministic-policy-replay-v2` additionally runs an
+independent nine-case admission suite: seven ASCII file sizes and two permanent
+or transient retry failures. Every case has the same six-request budget,
+including the final model response. A candidate must reduce calls on its
+triggering experience and must not increase tool calls or request cost, or reduce
+successful completions, across this suite. A retry failure remains a failure;
+ending it sooner cannot increase the success count. Snapshots retain both policies,
+the suite identity, counts and outcomes. Loading a v2 version recomputes this
+evidence; previously accepted v1 snapshots remain compatible.
+
+Admission cost is explicitly one unit per model request. It does not predict
+provider token costs or general reasoning accuracy. The end-to-end benchmark
+below separately measures real tool execution, accumulated context and outcome.
 
 There is no arbitrary source-code self-rewrite admission path. Changing ZeroCode's
 implementation beyond these declared policy slots requires extending the trusted
@@ -73,6 +83,7 @@ pretending that an untested code patch is a validated improvement.
 A first accepted strategy is bound to the task fingerprint (SHA-256 of the
 prompt). Project promotion requires qualifying evidence from three distinct task
 fingerprints. Repeating the same prompt does not count as independent evidence.
+Experiences captured with `--learning-frozen` do not count toward promotion.
 
 Global promotion requires project-validated evidence from three distinct
 workspace fingerprints and another replay/regression gate. Only scalar evidence,
@@ -132,3 +143,60 @@ calls. A no-op candidate is rejected. Rollback restores seven calls. Additional
 tests exercise promotion, corruption, credentials, concurrent publication,
 permanent and transient failures, and symlink confinement. No paid model calls
 are used.
+
+## Measure improvement over N tasks
+
+```sh
+make benchmark-learning
+# Or choose a reproducible workload and report location:
+python3 scripts/learning_benchmark.py --tasks 100 --holdout 40 --seed 20260920 \
+  --require-improvement --output .zero/learning-benchmark.json
+```
+
+The benchmark runs 100 online tasks in each of two isolated workspaces. One
+workspace learns normally; the other starts at `base` and uses
+`--learning-frozen`. Both execute identical task content, prompts and request
+budgets, and restart the real binary for every task. Frozen mode captures
+experience and applies existing policies but creates no candidates or promotions.
+It works with an empty store and requires no prepared policy file.
+
+After training, both arms use frozen policies on 40 held-out tasks. Their prompt
+fingerprints, contents and size ranges are separate from training. Holdout
+observations cannot promote a strategy. The harness checks that the baseline
+remains at `base` and the learned version does not change during evaluation.
+
+Workloads include full ASCII reads, reads under a six-request budget, Unicode and
+escaping, explicit read limits, small files and repeated invalid arguments. Only
+the local model transport is scripted: it follows `next_offset` and never inspects
+the arm, policy, system guidance or learned version. The executable performs the
+actual reads, guards, experience capture, mutation, replay, promotion and restart.
+
+Success requires exit zero **and exact, contiguous fixture-byte coverage**.
+Invalid-argument tasks remain failures in both arms. A textual claim of success
+cannot pass the oracle. Budgeted successes measure the ability to finish the
+same work within fewer requests, not improved model reasoning.
+
+The cost model uses `ceil(UTF-8 JSON bytes / 4)` as synthetic token usage, weighted
+1 for input and 4 for output. It includes accumulated request context, tool
+definitions, policy guidance and failed attempts. These are reproducible cost
+units, **not billed provider tokens or dollars**. No real provider is called.
+Normal experiences also record input/output token counts when the provider
+supplies both, with explicit `usage_reports`, `usage_complete` and
+`usage_scope: coordinator`. Missing or partial usage produces `null` token counts,
+never a zero-cost claim; delegated worker costs are not included in these split
+coordinator counters. Total session tokens retain their existing meaning.
+
+The JSON and Markdown reports contain paired totals, success rates, cost per
+successful task including failed attempts, windows of up to 20 online tasks,
+per-family results and admission records. JSON retains every pair, fixture hash,
+policy/version attribution and failure. `--require-improvement` exits nonzero
+unless held-out tool calls and modeled cost decrease, verified success increases,
+there are no success regressions or oracle errors, and a strategy was promoted.
+Elapsed time is diagnostic because machine load makes it noisy. A run without
+enough evidence fails these gates rather than reporting an improvement.
+
+This protocol demonstrates the declared read/retry policies. A result on these
+fixtures is not evidence of improvement on arbitrary coding tasks or paid models;
+that requires a separate representative task suite with live provider usage and
+independent acceptance tests. Runtime policies remain bounded to their existing
+mutation vocabulary.
