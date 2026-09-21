@@ -21,6 +21,7 @@ A terminal coding assistant built with **Zero**, with native file tools, streami
 - **Bounded context** – automatic shortening of old tool output and a digest of older exchanges
 - **Project memory** – automatic task recaps and saved facts persist across sessions, with commands to inspect and forget them
 - **Validated learning** – structured task experience, isolated policy replay, immutable strategy versions, and rollback are part of the normal prompt lifecycle
+- **Executable evolution** – rewrite strategy functions in staged `zero.graph` generations, compile and compare both programs, then select improvements for the next launch
 - **Host builds** – Linux and macOS builds using the pinned Zero compiler and system libcurl
 
 See [continuous learning](docs/learning.md) for the mutation gates, scope
@@ -64,6 +65,7 @@ zero-code/
 
 - **Node.js ≥ 24** (required by Zero's standard library)
 - A C compiler, libcurl development headers, `make`, Git, `curl`, `tar`, and a SHA-256 checksum tool
+- Python 3.10+ for the installed executable-evolution bundle and its replay validator
 
 ### Compile
 
@@ -91,6 +93,10 @@ After updating an older checkout, rerun `make setup build` to refresh the compil
 
 # Or use the development launcher
 ./zero-code --help
+
+# Evolve executable graph functions through build/replay validation.
+# Requires the source checkout, pinned compiler and Python 3.10+.
+./zero-code --self-evolve --prompt "Read the complete large file"
 ```
 
 Use **↑ / ↓** to scroll the conversation and logs one line at a time, including
@@ -124,6 +130,11 @@ CI runs the build, tests, and an installation smoke test on Linux and macOS.
    ```bash
    make install
    ```
+
+   Source installs include a graph/compiler bundle. Use `zero-code --self-evolve`
+   from any workspace to run validated executable generations. Inspect them with
+   `zero-code --self-evolve --learning-history` and restore the original with
+   `zero-code --self-evolve --learning-rollback base`.
 
 3. **Run the TUI**
    ```bash

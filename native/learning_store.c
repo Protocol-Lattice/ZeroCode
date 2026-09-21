@@ -89,7 +89,8 @@ int zero_learning_open(unsigned int scope) {
     int state = private_dir(root, scope ? "zero-code-learning" : ".zero-agent");
     close(root);
     if (state < 0) return 0;
-    int dir = private_dir(state, "learning");
+    const char *program = getenv("ZERO_LEARNING_PROGRAM_ROOT");
+    int dir = private_dir(state, !scope && program && *program ? "program-learning" : "learning");
     close(state);
     if (dir < 0) return 0;
     stores[scope].dir = dir;

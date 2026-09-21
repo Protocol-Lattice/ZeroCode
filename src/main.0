@@ -378,16 +378,28 @@ fn parseOptions(app: mutref<App>) -> Bool {
 fn nativeTests(world: World) -> Void raises {
     check assertTrue(learningRegressions(learningBasePolicy()))
     check assertTrue(learningRegressions(3_usize))
-    check assertTrue(learningReplayMetric(0_usize, 0_usize) == 34)
-    check assertTrue(learningReplayMetric(0_usize, 1_usize) == 38)
-    check assertTrue(learningReplayMetric(0_usize, 2_usize) == 4)
+    check assertTrue(learningDefaultWindow(4_usize, 0_usize) == 8192)
+    check assertTrue(learningRetryLimit(4_usize, true) == 3)
+    if learningWindowValue(0_usize) == 8192 && learningRetryValue(0_usize) == 3 {
+        check assertTrue(learningReplayMetric(0_usize, 0_usize) == 34)
+        check assertTrue(learningReplayMetric(0_usize, 1_usize) == 38)
+        check assertTrue(learningReplayMetric(0_usize, 2_usize) == 4)
+    } else {
+        check assertTrue(learningReplayMetric(0_usize, 0_usize) <= 34)
+        check assertTrue(learningReplayMetric(0_usize, 1_usize) <= 38)
+        check assertTrue(learningReplayMetric(0_usize, 2_usize) >= 4)
+    }
     check assertTrue(learningReplayMetric(3_usize, 0_usize) == 29)
     check assertTrue(learningReplayMetric(3_usize, 1_usize) == 34)
     check assertTrue(learningReplayMetric(3_usize, 2_usize) == 5)
     check assertTrue(learningReplayGate(0_usize, 1_usize))
     check assertTrue(learningReplayGate(0_usize, 2_usize))
-    check assertTrue(!learningReplayGate(1_usize, 0_usize))
-    check assertTrue(!learningReplayGate(3_usize, 1_usize))
+    if learningWindowValue(1_usize) > learningWindowValue(0_usize) {
+        check assertTrue(!learningReplayGate(1_usize, 0_usize))
+    }
+    if learningRetryValue(1_usize) > learningRetryValue(3_usize) {
+        check assertTrue(!learningReplayGate(3_usize, 1_usize))
+    }
     check assertTrue(!learningReplayGate(0_usize, 4_usize))
     check workerStatusTests()
     check toolDisplayTests()

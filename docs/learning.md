@@ -1,6 +1,110 @@
 # Continuous learning
 
-Normal prompts follow this path automatically:
+## Executable graph evolution
+
+Source installs bundle the canonical graph, sources, validator and pinned Zero
+compiler so the global command can evolve from any workspace. Python 3.10+, a C
+compiler and libcurl development files are needed when building generations:
+
+```sh
+make install
+zero-code --self-evolve --prompt "Read the complete large file"
+zero-code --self-evolve --learning-history
+zero-code --self-evolve --learning-rollback base
+```
+
+Each installation bundle has its own lineage in
+`PREFIX/libexec/zero-code/programs/p-.../.zero-agent/evolution/`. It is independent
+of the original checkout and task directory. Reinstalling identical sources keeps
+the same bundle and history; upgraded sources create a new bundle and retain old
+generations. Uninstall removes the command and retains program history. Installs
+using `--binary` alone do not contain a program bundle.
+
+The development launcher also supports evolution within its source checkout:
+
+```sh
+make setup build
+./zero-code --self-evolve --cwd /path/to/workspace --prompt "Read the complete large file"
+./zero-code --self-evolve --learning-history
+./zero-code --self-evolve --learning-rollback base
+# Restore a g-... generation ID from history with --learning-rollback.
+```
+
+`--self-evolve` is a launcher option and must come first. The first launch builds
+a baseline from the bundle or checkout's canonical `zero.graph`. Later launches run the
+selected generation's compiled executable. Qualifying experience drives:
+
+```
+task → experience → function replacement → staged zero.graph
+     → native build + self-test → paired executable replay → atomic HEAD
+     → next launch runs the accepted program
+```
+
+`src/learning.0` authors function replacements from measured experience.
+`scripts/learning_program.py` invokes the compiler, manages isolated working
+directories, validates the executables, and publishes generations. It runs
+`zero patch --replace-fn`, exports the readable projection, verifies consistency,
+builds the entire program, and runs its native self-test.
+
+The initial mutation targets are `learningWindowValue(policy)` and
+`learningRetryValue(policy)`. Complete default-window ASCII reads can propose a
+12000-byte implementation; three identical permanent argument errors can propose
+a two-attempt implementation. These replace executable function bodies in a real
+compiler graph. The body vocabulary permits pure scalar expressions and branches
+over `policy`. Calls, loops, declarations, imports and other target functions are
+rejected before compilation. Additional targets require extending the trusted
+target list and independent acceptance cases.
+
+Both executables run the same 33 held-out cases in fresh temporary workspaces,
+with frozen learning and a local scripted model transport. Cases cover sizes and
+request budgets, exact contiguous byte coverage, Unicode, escaping, explicit
+limits, small files, and invalid arguments. No paid provider is called. Every
+previously successful case must still succeed, and no case may increase tool
+calls or requests. Aggregate tool calls and modeled request cost must both
+strictly decrease. No-ops, compiler failures, timeouts, incomplete experience,
+failed test observations, and replay regressions cannot advance HEAD. Costs are
+synthetic, not provider bills or evidence of improved general reasoning.
+
+The strategy functions have no filesystem, shell, model or network capabilities.
+Read bounds, error classification, path checks, approvals and the evaluator stay
+outside the mutation targets. Validation children receive a fresh home directory
+and an environment without provider credentials or inherited process hooks.
+Child process groups have time limits. The trusted compiler and validation tools
+themselves are ordinary local processes.
+
+Program history lives in the **program bundle or checkout's** `.zero-agent/evolution/`.
+Each generation retains its complete `zero.graph`, readable projection, native
+sources, manifest, compiled executable, hashes and paired evaluation report.
+Publication holds an OS lock and checks the expected parent and source identity
+again before moving `head.json`. A running session keeps its executable; the next
+launcher selects the new graph and binary together through that single pointer.
+Artifact hashes are checked before execution. Rollback selects an archived
+generation without deleting later history. At most 32 generations are retained;
+reaching that limit stops publication rather than pruning history.
+
+The program bundle or checkout remains the baseline; evolution never overwrites it.
+Editing its graph, projection, native sources or validation driver invalidates
+the lineage; use a fresh checkout to start a new lineage. Program-mode experience
+lives in the **task workspace's** `.zero-agent/program-learning/` and records the
+executable generation. This mode does not import or mutate the older policy
+overlay. `--learning-frozen` records experience and executes the selected program
+without proposing changes. `--no-learning` disables capture and uses the original
+read/retry defaults even in an evolved binary. Workers inherit the selected
+strategy and cannot evolve programs.
+
+The integration test checks a global source install, operation after deleting the
+original checkout, real graph rewrites, compilation, a restart from seven reads
+to five and three invalid attempts to two, rejection of a compiled regression,
+integrity checks, and rollback:
+
+```sh
+python3 -m unittest tests.test_learning_program -v
+```
+
+## Standalone binary policy learning
+
+Without the source-checkout launcher mode, normal prompts retain this compatible
+policy-learning path:
 
 ```
 prompt → solve → structured experience → candidate → isolated replay
@@ -70,13 +174,10 @@ Admission cost is explicitly one unit per model request. It does not predict
 provider token costs or general reasoning accuracy. The end-to-end benchmark
 below separately measures real tool execution, accumulated context and outcome.
 
-There is no arbitrary source-code self-rewrite admission path. Changing ZeroCode's
-implementation beyond these declared policy slots requires extending the trusted
-mutation vocabulary and supplying an evaluator with appropriate isolated build,
-replay and regression checks. Free-form patches, tool permissions, path checks,
-approval policy, credential handling, and evaluation thresholds are outside the
-automatic mutation vocabulary. The graph and evaluator are extensible without
-pretending that an untested code patch is a validated improvement.
+This standalone mode changes the runtime policy overlay. Executable graph
+rewrites use the program mode above. Free-form patches, tool permissions,
+path checks, approvals, credential handling, and evaluation thresholds remain
+outside both automatic mutation vocabularies.
 
 ## Scope and promotion
 

@@ -31,6 +31,8 @@ By default a checkout is built locally; a standalone or piped installer download
 the main branch. Builds need Node.js 24+, a C compiler, libcurl headers, make,
 curl, tar, and Git.
 The installed application does not need Node.js or the Zero compiler.
+Source installs also bundle the program graph and compiler for optional
+zero-code --self-evolve (requires Python 3.10+, cc and libcurl development files).
 USAGE
 }
 
@@ -86,6 +88,7 @@ configure_path() {
 main() {
     prefix=${PREFIX:-"${HOME:?HOME must be set}/.local"}
     binary=
+    project_dir=
     ref=
     modify_path=yes
     uninstall=no
@@ -130,6 +133,9 @@ main() {
         rm -f "$launcher" "$installed_binary"
         rmdir "$lib_dir" 2>/dev/null || :
         printf 'Removed zero-code from %s. Shell PATH entries were kept.\n' "$prefix"
+        if [ -d "$lib_dir/programs" ]; then
+            printf 'Program bundles and evolution history were kept in %s/programs.\n' "$lib_dir"
+        fi
         return
     fi
     [ -z "$binary" ] || [ -z "$ref" ] || fail '--binary and --ref cannot be combined.'
@@ -144,7 +150,6 @@ main() {
     if [ -z "$binary" ]; then
         require cc
         require git
-        project_dir=
         if [ -z "$ref" ] && [ -f "$0" ]; then
             candidate=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
             if [ -f "$candidate/zero.toml" ] && [ -f "$candidate/zero.graph" ] && [ -f "$candidate/scripts/build.sh" ]; then
@@ -179,12 +184,28 @@ main() {
     "$binary" --version || fail 'The binary cannot run on this machine.'
     [ ! -d "$launcher" ] && [ ! -d "$installed_binary" ] || fail 'An installation destination is a directory.'
     mkdir -p "$bin_dir" "$lib_dir"
+    program_root=
+    if [ -n "${project_dir:-}" ] && [ -f "$project_dir/scripts/learning_program.py" ]; then
+        require python3
+        program_root=$(python3 "$project_dir/scripts/learning_program.py" --root "$project_dir" --bundle "$lib_dir/programs")
+    fi
     staged_binary=$(mktemp "$lib_dir/.zero-code.XXXXXX")
     cp "$binary" "$staged_binary"
     chmod 755 "$staged_binary"
     staged_launcher=$(mktemp "$bin_dir/.zero-code.XXXXXX")
     {
         printf '#!/bin/sh\n# Installed by zero-code-tui/install.sh.\n'
+        printf 'if [ "${1:-}" = "--self-evolve" ]; then\n    shift\n'
+        if [ -n "$program_root" ]; then
+            printf '    exec python3 %s --root %s --run -- "$@"\n' "$(shell_quote "$program_root/scripts/learning_program.py")" "$(shell_quote "$program_root")"
+        else
+            printf '    printf '\''Self-evolution requires a source install with the program graph and compiler.\\n'\'' >&2\n    exit 1\n'
+        fi
+        printf 'fi\n'
+        if [ -n "$program_root" ]; then
+            printf 'if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then\n'
+            printf '    printf '\''Executable evolution: zero-code --self-evolve [options] (put --self-evolve first).\\n\\n'\''\nfi\n'
+        fi
         # The app re-executes argv[0] for HTTP requests. An absolute path also
         # keeps --cwd and invocation via PATH working without changing directory.
         printf 'exec %s "$@"\n' "$(shell_quote "$installed_binary")"

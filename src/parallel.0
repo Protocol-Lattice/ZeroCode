@@ -525,11 +525,11 @@ fn loadWorker(app: mutref<App>) -> Bool {
         return false
     }
     let learned: usize = learningNumber(config, "learning_policy")
-    if !learningPolicyValid(learned) { return false }
+    if learned > 4 { return false }
     app.learningSelectedPolicy = learned
     app.learningGlobalPolicy = learned
-    app.learningEnabled = learned > 0
-    app.learningActive = learned > 0
+    app.learningEnabled = learned < 4
+    app.learningActive = learned < 4
     setText(app.learningGraph, learningSchema())
     setText(app.learningHead, "delegated-policy-snapshot")
     app.memoryEnabled = std.mem.eql(field(config, "memory_enabled"), "true")

@@ -3,6 +3,7 @@
 import contextlib
 import fcntl
 import http.server
+import itertools
 import json
 import os
 from pathlib import Path
@@ -107,6 +108,8 @@ def environment(endpoint=None, keys=True):
         if keys:
             env[key] = "test-key-never-render-me"
     env.pop("ZERO_API_URL", None)
+    env.pop("ZERO_LEARNING_PROGRAM_ROOT", None)
+    env.pop("ZERO_LEARNING_PROGRAM_VERSION", None)
     if endpoint:
         env["ZERO_API_URL"] = endpoint
     env["TERM"] = "xterm-256color"
@@ -558,6 +561,41 @@ class AgentTests(unittest.TestCase):
                 self.assertEqual(len(api.requests), 1)
             finally:
                 terminal.close()
+
+    def test_completion_does_not_execute_a_command_twice_in_either_learning_mode(self):
+        for program, provider, finish, interactive in itertools.product(
+                (False, True), ("openrouter", "claude"), (False, True), (False, True)):
+            with self.subTest(program=program, provider=provider, finish=finish, interactive=interactive), tempfile.TemporaryDirectory() as folder:
+                action = reply(provider, calls=[("run_command", {"command": "printf 'once\\n' >> executions.txt"})])
+                completed = reply(provider, "Task completed once.")
+                if finish:
+                    completed = reply(provider, text="", calls=[
+                        ("finish_task", {"summary": "Task completed once."}),
+                        ("run_command", {"command": "printf 'extra\\n' >> executions.txt"})])
+                with MockAPI([action, completed, action]) as api:
+                    env = environment(api.url)
+                    if program:
+                        env["ZERO_LEARNING_PROGRAM_ROOT"] = str(ROOT)
+                        env["ZERO_LEARNING_PROGRAM_VERSION"] = "base"
+                    arguments = ["--cwd", folder, "--provider", provider, "--approve",
+                                 "--no-skills", "--max-turns", "5"]
+                    if interactive:
+                        terminal = Terminal(arguments, env)
+                        try:
+                            terminal.wait_for("Your terminal.")
+                            terminal.send("Run the requested command once.\r")
+                            terminal.wait_for("Task completed once.")
+                            checkpoint = len(terminal.output)
+                            terminal.send("/status\r")
+                            terminal.wait_for("Workspace:", after=checkpoint)
+                        finally:
+                            terminal.close()
+                    else:
+                        result = subprocess.run([str(EXE), *arguments, "--prompt", "Run the requested command once."],
+                                                env=env, text=True, capture_output=True, timeout=20)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(len(api.requests), 2)
+                    self.assertEqual(Path(folder, "executions.txt").read_text(), "once\n")
 
 
 if __name__ == "__main__":

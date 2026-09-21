@@ -198,11 +198,13 @@ def graph(root):
     return json.loads(path.read_text()) if path.exists() else {"head": "base", "nodes": []}
 
 
-def run_case(executable, root, case, transport, frozen):
+def run_case(executable, root, case, transport, frozen, env_override=None):
     (root / case.path).write_text(case.content, encoding="utf-8")
     before = graph(root)["head"]
     replay = transport.replay = Replay(case)
-    env = os.environ.copy()
+    env = dict(os.environ if env_override is None else env_override)
+    for key in ("ZERO_LEARNING_PROGRAM_ROOT", "ZERO_LEARNING_PROGRAM_VERSION"):
+        env.pop(key, None)
     for key in (*KEYS, "ZERO_API_URL"):
         env.pop(key, None)
     env["OPENROUTER_API_KEY"] = "offline-replay-no-provider-credentials"

@@ -84,6 +84,12 @@ class InstallTests(unittest.TestCase):
                     self.assertIn("Read hello.txt 'quoted' $literal",
                                   str(api.requests[0][1]["messages"]))
 
+    def test_binary_only_install_reports_missing_evolution_bundle(self):
+        self.assert_ok(self.install())
+        result = self.run_installed("--self-evolve", "--version")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires a source install", result.stderr)
+
     def test_reinstall_and_uninstall_leave_other_commands_and_config(self):
         self.assert_ok(self.install(configure=True))
         self.assert_ok(self.install(configure=True))

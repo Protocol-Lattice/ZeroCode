@@ -1,5 +1,8 @@
-// Runtime graph vocabulary. Source semantics stay in the compiler graph; these
-// records attach measured experience and versioned policy to canonical symbols.
+// Learning has two persistence boundaries: private task experience and executable
+// program generations. With --self-evolve, observations propose function bodies
+// in a staged zero.graph. The host driver builds and replays both executables
+// before atomically selecting a generation for the next launch. Installed
+// binaries without their source checkout retain the legacy scalar policy store.
 enum LearningNodeKind {
     experience,
     task_pattern,
@@ -35,12 +38,15 @@ fn learningDefaultWindow(policy: usize, explicit: usize) -> usize {
     if !learningPolicyValid(policy) {
         return 8192
     }
-    return learningWindowValue(policy)
+    let window: usize = learningWindowValue(policy)
+    if window < 8192 || window > 12000 { return 8192 }
+    return window
 }
 
 fn learningRetryLimit(policy: usize, permanent: Bool) -> usize {
     if permanent && learningPolicyValid(policy) {
-        return learningRetryValue(policy)
+        let retries: usize = learningRetryValue(policy)
+        if retries >= 2 && retries <= 3 { return retries }
     }
     return 3
 }
@@ -80,7 +86,7 @@ fn learningRegressions(policy: usize) -> Bool {
     if learningReadCost(0_usize, policy) != 1 || learningReadCost(16384_usize, policy) != 1 {
         return false
     }
-    if learningRetryLimit(policy, false) != 3 || learningRetryLimit(policy, true) < 2 {
+    if learningRetryLimit(policy, false) != 3 || learningRetryLimit(policy, true) < 2 || learningRetryLimit(policy, true) > 3 {
         return false
     }
     if learningPermanentError("Error: file is missing or unreadable.") || learningPermanentError("Error: action denied.") {
@@ -228,8 +234,86 @@ fn learningLoad(app: mutref<App>) -> Bool {
 }
 
 fn learningPolicy(app: ref<App>) -> usize {
-    if !app.learningActive || !app.learningEnabled { return 0 }
+    // Invalid is the immutable baseline, including in an evolved executable.
+    if !app.learningActive || !app.learningEnabled { return 4 }
     return app.learningSelectedPolicy
+}
+
+fn learningProgramEnabled() -> Bool {
+    return std.mem.len(std.env.getOr("ZERO_LEARNING_PROGRAM_ROOT", "")) > 0
+}
+
+fn learningProgramVersion() -> Span<u8> {
+    return std.env.getOr("ZERO_LEARNING_PROGRAM_VERSION", "base")
+}
+
+// The only automatically authored function bodies are pure strategy functions.
+// Read bounds, permanent-error classification, replay, publication, and approval
+// logic stay outside these targets. The driver independently enforces the list.
+fn learningProgramCandidate(output: MutSpan<u8>, read: Bool, total: usize, repeats: usize) -> Bool {
+    clear(output)
+    if read {
+        if total <= 16384 || learningWindowValue(0_usize) >= 12000 { return false }
+        let before: usize = learningReadCost(total, 0_usize)
+        let after: usize = (total + 11999) / 12000
+        if after >= before { return false }
+        append(output, "{\"function\":\"learningWindowValue\",\"body\":\"return 12000\"}")
+    } else {
+        if repeats < 3 || learningRetryValue(0_usize) <= 2 { return false }
+        append(output, "{\"function\":\"learningRetryValue\",\"body\":\"return 2\"}")
+    }
+    return true
+}
+
+fn learningEvolveProgram(app: mutref<App>, total: usize) -> Void {
+    if !learningProgramEnabled() || !app.learningComplete || hasArg("--learning-frozen") || hasArg("--no-learning") || app.workerMode > 0 { return }
+    var patchStorage: [512]u8 = [0_u8; 512]
+    var requestStorage: [8192]u8 = [0_u8; 8192]
+    var argumentsStorage: [16384]u8 = [0_u8; 16384]
+    var resultStorage: [16384]u8 = [0_u8; 16384]
+    let patch: MutSpan<u8> = buffer(patchStorage)
+    let request: MutSpan<u8> = buffer(requestStorage)
+    let arguments: MutSpan<u8> = buffer(argumentsStorage)
+    let root: Span<u8> = std.env.getOr("ZERO_LEARNING_PROGRAM_ROOT", "")
+    if !headerSafe(root) { return }
+    append(request, "{\"action\":\"evolve\",\"parent\":")
+    quoted(request, learningProgramVersion())
+    append(request, ",\"workspace\":")
+    quoted(request, bytes(app.workspace))
+    append(request, ",\"experience\":")
+    quoted(request, bytes(app.learningIdentity))
+    append(request, ",\"patches\":[")
+    let read: Bool = learningProgramCandidate(patch, true, total, app.learningRepeatedInvalid)
+    if read { append(request, bytes(patch)) }
+    let retry: Bool = learningProgramCandidate(patch, false, total, app.learningRepeatedInvalid)
+    if retry {
+        if read { put(request, 44_u8) }
+        append(request, bytes(patch))
+    }
+    if !read && !retry { return }
+    append(request, "]}")
+    if !bufOk(request) { return }
+    learningEvent(app, "program_candidate", bytes(request))
+    if !app.learningComplete { return }
+    append(arguments, root)
+    append(arguments, "/scripts/learning_program.py\n--root\n")
+    append(arguments, root)
+    append(arguments, "\n--request\n")
+    append(arguments, bytes(request))
+    if !bufOk(arguments) { return }
+    logEntry(app, "  EVOLVING", "Building a staged zero.graph and comparing both executables on independent replay tasks.")
+    let captured: Maybe<usize> = std.proc.captureArgs("python3", bytes(arguments), resultStorage)
+    if !captured.has {
+        logEntry(app, "  EVOLUTION", "Validation driver unavailable; active program unchanged.")
+        return
+    }
+    let result: Span<u8> = std.str.trimAscii(std.mem.prefix(resultStorage, captured.value))
+    if !std.json.validateBytes(result) {
+        logEntry(app, "  EVOLUTION", "Invalid validation result; inspect the program history.")
+        return
+    }
+    learningEvent(app, "program_evaluation", result)
+    logEntry(app, "  EVOLUTION", result)
 }
 
 fn learningText(app: ref<App>, output: MutSpan<u8>, value: Span<u8>, budget: usize) -> Void {
@@ -324,7 +408,10 @@ fn learningStartGraph(app: mutref<App>, prompt: Span<u8>) -> Void {
         logEntry(app, "  LEARNING", "Experience storage unavailable; validated policies remain unchanged.")
         return
     }
-    learningImportGlobal(app)
+    if learningProgramEnabled() {
+        app.learningGlobalPolicy = 0
+        setText(app.learningGlobalHead, "base")
+    } else { learningImportGlobal(app) }
     app.learningEnabled = learningLoad(app)
     let count: i32 = process.zero_learning_experience_open()
     if count <= 0 {
@@ -356,7 +443,8 @@ fn learningStartGraph(app: mutref<App>, prompt: Span<u8>) -> Void {
     learningHash(app.learningTask, prompt)
     learningHash(app.learningProject, bytes(app.workspace))
     let decoded: Bool = decode(app.learningHead, field(bytes(app.learningGraph), "head"))
-    app.learningSelectedPolicy = learningPolicyFor(app, true)
+    if learningProgramEnabled() { app.learningSelectedPolicy = 0 }
+    else { app.learningSelectedPolicy = learningPolicyFor(app, true) }
     var textStorage: [8208]u8 = [0_u8; 8208]
     var recordStorage: [16400]u8 = [0_u8; 16400]
     let text: MutSpan<u8> = buffer(textStorage)
@@ -376,6 +464,8 @@ fn learningStartGraph(app: mutref<App>, prompt: Span<u8>) -> Void {
     quoted(record, bytes(app.model))
     append(record, ",\"policy\":")
     number(record, app.learningSelectedPolicy)
+    append(record, ",\"program_version\":")
+    quoted(record, learningProgramVersion())
     append(record, ",\"mode\":")
     if hasArg("--learning-frozen") { quoted(record, "frozen") } else { quoted(record, "adaptive") }
     append(record, ",\"max_requests\":")
@@ -637,6 +727,8 @@ fn learningExperience(app: mutref<App>, status: Span<u8>, summary: Span<u8>) -> 
     quoted(record, bytes(app.learningGlobalHead))
     append(record, ",\"selected_policy\":")
     number(record, app.learningSelectedPolicy)
+    append(record, ",\"program_version\":")
+    quoted(record, learningProgramVersion())
     append(record, ",\"provider\":")
     quoted(record, providerSlug(app.provider))
     append(record, ",\"model\":")
@@ -1093,7 +1185,7 @@ fn learningFinishGraph(app: mutref<App>, status: Span<u8>, summary: Span<u8>) ->
         }
         let decoded: Bool = decode(app.learningHead, field(bytes(app.learningGraph), "head"))
         let experienceLength: usize = bufLen(app.learningNodes)
-        if evidenceRecorded && !hasArg("--learning-frozen") && !std.mem.eql(status, "cancelled") && !std.mem.eql(status, "interrupted") {
+        if evidenceRecorded && !learningProgramEnabled() && !hasArg("--learning-frozen") && !std.mem.eql(status, "cancelled") && !std.mem.eql(status, "interrupted") {
             if total > 16384 {
                 learningCandidate(app, true, total, 0_usize)
             }
@@ -1126,6 +1218,9 @@ fn learningFinishGraph(app: mutref<App>, status: Span<u8>, summary: Span<u8>) ->
         learningEvent(app, "persistent_version", field(bytes(app.learningGraph), "head"))
     }
     if committed && (app.learningPromoteRead || app.learningPromoteRetry) { learningPromoteGlobal(app, total) }
+    if committed && evidenceRecorded && !std.mem.eql(status, "cancelled") && !std.mem.eql(status, "interrupted") && !std.mem.eql(status, "control") {
+        learningEvolveProgram(app, total)
+    }
     process.zero_learning_experience_close()
     app.learningActive = false
 }
@@ -1135,6 +1230,9 @@ fn appendLearningContext(app: mutref<App>) -> Void {
         return
     }
     let policy: usize = learningPolicy(app)
+    // Compiled strategies already execute without model guidance. Keep their
+    // admission measurements free of unrelated system-prompt changes.
+    if policy == 0 { return }
     if learningWindowValue(policy) == 8192 && learningRetryValue(policy) == 3 {
         return
     }
