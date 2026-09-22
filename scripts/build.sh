@@ -13,3 +13,6 @@ fi
 cd "$project_dir"
 mkdir -p dist
 "$compiler" build --target host --out "$project_dir/dist/zero-code"
+# Graph patches do not rewrite their readable projections. Keep the source
+# package coherent before an installer snapshots it for executable evolution.
+"$compiler" export "$project_dir"

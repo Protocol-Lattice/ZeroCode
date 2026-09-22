@@ -1,7 +1,3 @@
-// Raw results are never changed here. File ranges describe only the lines that
-
-// were returned; total_bytes is the full file size, not a full-file line count.
-
 fn textLineCount(text: Span<u8>) -> usize {
     if std.mem.len(text) == 0 {
         return 0
@@ -47,6 +43,9 @@ fn toolLabel(output: MutSpan<u8>, name: Span<u8>, args: Span<u8>) -> Void {
     if decode(target, field(args, "path")) {
         append(output, " ")
         workerLabel(output, bytes(target), 160_usize)
+    } else if decode(target, field(args, "function")) {
+        append(output, " ")
+        workerLabel(output, bytes(target), 128_usize)
     } else if decode(target, field(args, "query")) {
         append(output, " \"")
         workerLabel(output, bytes(target), 100_usize)
@@ -103,11 +102,28 @@ fn toolResultSummary(output: MutSpan<u8>, name: Span<u8>, args: Span<u8>, result
     }
     if std.str.startsWith(result, "Error:") {
         append(output, "✗ ")
-        workerLabel(output, result, 240_usize)
+        if std.mem.eql(name, "self_patch") {
+            workerLabel(output, result, 3000_usize)
+        } else {
+            workerLabel(output, result, 240_usize)
+        }
         return
     }
     append(output, "✓ ")
-    if std.mem.eql(name, "read_file") {
+    if std.mem.eql(name, "self_patch") {
+        append(output, "zero.graph saved")
+        var savedStorage: [2048]u8 = [0_u8; 2048]
+        let saved: MutSpan<u8> = buffer(savedStorage)
+        if decode(saved, field(result, "version")) {
+            append(output, " · ")
+            append(output, bytes(saved))
+        }
+        append(output, " · restart to activate")
+        if decode(saved, field(result, "graph_path")) {
+            put(output, 10_u8)
+            append(output, bytes(saved))
+        }
+    } else if std.mem.eql(name, "read_file") {
         readResultSummary(output, args, result)
     } else if std.mem.eql(name, "write_file") {
         var writeStorage: [1000016]u8 = [0_u8; 1000016]

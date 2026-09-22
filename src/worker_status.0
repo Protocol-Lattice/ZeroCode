@@ -1,9 +1,3 @@
-// Presentation state is owned exclusively by the coordinator event loop. Pipe
-
-// slots are stable task identities, independent of scheduler/commit state.
-
-// Named scalar states match the pinned backend's flat shape ABI.
-
 const workerQueued: usize = 0
 
 const workerRunning: usize = 1
@@ -46,10 +40,6 @@ type WorkerStatus {
     startedAt: Duration,
     finishedAt: Duration,
 }
-
-// The pinned native backend requires flat App fields and literal record
-
-// locals. Load a typed view for the reducer without changing scheduler state.
 
 fn workerData(app: ref<App>, index: usize) -> MutSpan<u8> {
     if index == 0 {
@@ -200,10 +190,6 @@ fn workerEventName(event: usize) -> String {
     return "WorkerCancelled"
 }
 
-// Tool completions carry a cumulative count: duplicates cannot double count.
-
-// Terminal state ignores late lifecycle updates, except a verified process error.
-
 fn reduceWorker(status: mutref<WorkerStatus>, event: usize, message: Span<u8>, now: Duration) -> Void {
     if event == eventWorkerQueued {
         status.state = workerQueued
@@ -282,8 +268,6 @@ fn workerElapsed(status: ref<WorkerStatus>, now: Duration) -> usize {
     }
     return std.time.asMsFloor(std.time.between(status.startedAt, end)) as usize
 }
-
-// Clip by terminal cells, remove controls and keep every field on one row.
 
 fn workerLabel(output: MutSpan<u8>, text: Span<u8>, width: usize) -> Void {
     var storage: [2064]u8 = [0_u8; 2064]

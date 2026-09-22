@@ -25,5 +25,15 @@ int zero_learning_experience_write(void);
 void zero_learning_experience_close(void);
 void zero_learning_close(void);
 
+void zero_peer_reset(void);
+void zero_peer_byte(unsigned int value);
+int zero_peer_field(unsigned int key);
+int zero_peer_start(unsigned int port, unsigned int ephemeral);
+void zero_peer_stop(void);
+unsigned int zero_peer_status(unsigned int field);
+unsigned int zero_peer_origin(unsigned int index);
+int zero_peer_has(unsigned int rule);
+int zero_peer_record(unsigned int rule);
+
 
 #endif

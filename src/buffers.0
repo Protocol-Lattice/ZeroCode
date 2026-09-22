@@ -52,7 +52,9 @@ fn append(value: MutSpan<u8>, text: Span<u8>) -> Void {
     }
     let copied: usize = std.mem.copy(value[length..length + count], text)
     setLen(value, length + copied)
-    if copied != count { setOk(value, false) }
+    if copied != count {
+        setOk(value, false)
+    }
 }
 
 fn put(value: MutSpan<u8>, byte: u8) -> Void {
@@ -318,4 +320,52 @@ fn utf8Prefix(text: Span<u8>, limit: usize) -> Span<u8> {
         end = end - 1
     }
     return std.mem.prefix(text, end)
+}
+
+fn inspectSelfGraph(app: mutref<App>) -> Void {
+    if !learningProgramEnabled() || app.workerMode > 0 {
+        toolResult(app, "Error: self_inspect requires launching this peer with --self-evolve.")
+        return
+    }
+    if bufLen(app.arguments) > 4000 {
+        toolResult(app, "Error: graph inspection arguments are too large.")
+        return
+    }
+    let root: Span<u8> = std.env.getOr("ZERO_LEARNING_PROGRAM_ROOT", "")
+    if !headerSafe(root) {
+        toolResult(app, "Error: invalid program root.")
+        return
+    }
+    var requestStorage: [8192]u8 = [0_u8; 8192]
+    let request: MutSpan<u8> = buffer(requestStorage)
+    append(request, "{\"version\":")
+    quoted(request, learningProgramVersion())
+    append(request, ",\"arguments\":")
+    append(request, bytes(app.arguments))
+    put(request, 125_u8)
+    clear(app.packet)
+    compactJson(app.packet, bytes(request))
+    clear(app.scratch)
+    append(app.scratch, root)
+    append(app.scratch, "/scripts/learning_program.py\n--root\n")
+    append(app.scratch, root)
+    append(app.scratch, "\n--inspect\n")
+    append(app.scratch, bytes(app.packet))
+    if !bufOk(request) || !bufOk(app.packet) || !bufOk(app.scratch) {
+        toolResult(app, "Error: graph inspection request is too large.")
+        return
+    }
+    app.child = std.proc.spawnChildArgs("python3", bytes(app.scratch), bytes(app.workspace), "")
+    if !std.proc.childValid(app.child) {
+        toolResult(app, "Error: could not start the graph inspection driver.")
+        return
+    }
+    let closed: Bool = std.proc.closeStdin(app.child)
+    clear(app.packet)
+    clear(app.result)
+    clear(app.errors)
+    app.sent = 0
+    app.phase = 3
+    app.view = 0
+    app.started = std.time.monotonic()
 }

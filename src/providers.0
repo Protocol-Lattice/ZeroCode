@@ -66,6 +66,7 @@ fn defaultEndpoint(provider: usize) -> String {
 fn usageCount(app: mutref<App>, payload: Span<u8>) -> Void {
     let usage: Span<u8> = field(payload, "usage")
     learningObserveUsage(app, usage)
+    contextUsage(app, usage)
     let total: Maybe<u32> = std.json.u32(usage, "total_tokens")
     if total.has {
         app.tokens = app.tokens + total.value as usize
@@ -97,6 +98,9 @@ fn configureProvider(app: mutref<App>, provider: usize) -> Void {
     rememberLogKey(app, bytes(keyData))
     clear(historyData)
     app.turn = 0
+    app.contextTokenMicros = 333334
+    app.contextLastInputTokens = 0
+    app.contextRequestBytes = 0
 }
 
 fn selectedSystem(enabled: Bool) -> String {
@@ -116,15 +120,18 @@ fn requestBody(app: mutref<App>) -> Void {
     append(scratchData, "{\"model\":")
     quoted(scratchData, bytes(modelData))
     if app.provider == 2 {
-        append(scratchData, ",\"max_tokens\":4096,\"system\":")
+        append(scratchData, ",\"max_tokens\":")
+        number(scratchData, outputTokenLimit(app))
+        append(scratchData, ",\"system\":")
         quoted(scratchData, bytes(system))
         append(scratchData, ",\"messages\":[")
     } else {
         if app.provider == 1 {
-            append(scratchData, ",\"max_completion_tokens\":8192")
+            append(scratchData, ",\"max_completion_tokens\":")
         } else {
-            append(scratchData, ",\"max_tokens\":8192")
+            append(scratchData, ",\"max_tokens\":")
         }
+        number(scratchData, outputTokenLimit(app))
         append(scratchData, ",\"messages\":[{\"role\":\"system\",\"content\":")
         quoted(scratchData, bytes(system))
         append(scratchData, "},")
@@ -177,6 +184,10 @@ fn receiveResponse(app: mutref<App>) -> Void {
             failTurn(app, "Claude response did not contain content.")
             return
         }
+        if std.mem.eql(field(payload, "stop_reason"), "\"max_tokens\"") {
+            recoverOutputLimit(app, payload)
+            return
+        }
         if !appendAssistantHistory(app, payload) {
             failAssistantHistory(app, payload)
             return
@@ -207,10 +218,6 @@ fn receiveResponse(app: mutref<App>) -> Void {
             index = index + 1
         }
         put(pendingData, 93_u8)
-        if std.mem.eql(field(payload, "stop_reason"), "\"max_tokens\"") {
-            failTurn(app, "Claude hit its output limit. Retry with a smaller task.")
-            return
-        }
     } else {
         let firstChoice: Span<u8> = arrayItem(field(payload, "choices"), 0_usize)
         let message: Span<u8> = field(firstChoice, "message")
@@ -219,7 +226,7 @@ fn receiveResponse(app: mutref<App>) -> Void {
             return
         }
         if std.mem.eql(field(firstChoice, "finish_reason"), "\"length\"") {
-            failTurn(app, "Model reached its output limit. Retry with a smaller task or another model.")
+            recoverOutputLimit(app, message)
             return
         }
         if !appendAssistantHistory(app, message) {
@@ -234,7 +241,10 @@ fn receiveResponse(app: mutref<App>) -> Void {
             append(pendingData, calls)
         }
     }
-    if bufLen(scratchData) > 0 { learningEventText(app, "assistant", bytes(scratchData)) }
+    app.outputTruncations = 0
+    if bufLen(scratchData) > 0 {
+        learningEventText(app, "assistant", bytes(scratchData))
+    }
     if bufLen(scratchData) > 0 && !app.streamVisible {
         logEntry(app, "  ZERO", bytes(scratchData))
     }
@@ -244,6 +254,9 @@ fn receiveResponse(app: mutref<App>) -> Void {
     }
     app.toolIndex = 0
     if std.mem.eql(arrayItem(bytes(pendingData), 0_usize), "null") {
+        if continueWorkflow(app) {
+            return
+        }
         if bufLen(scratchData) > 0 {
             learningFinish(app, "completed", bytes(scratchData))
         } else {
@@ -269,7 +282,7 @@ fn startRequest(app: mutref<App>) -> Void {
     let endpointData: MutSpan<u8> = app.endpoint
     let workspaceData: MutSpan<u8> = app.workspace
     let executableData: MutSpan<u8> = app.executable
-    let packetData: MutSpan<u8> = app.packet
+    let packetData: MutSpan<u8> = app.arguments
     let responseData: MutSpan<u8> = app.response
     let errorsData: MutSpan<u8> = app.errors
     let scratchData: MutSpan<u8> = app.scratch
@@ -289,7 +302,21 @@ fn startRequest(app: mutref<App>) -> Void {
         failTurn(app, "Endpoints must use HTTPS. Plain HTTP is supported only on localhost for testing.")
         return
     }
+    if !ensureHistorySpace(app, 0_usize, true) {
+        failTurn(app, "The active exchange exceeds the configured context budget. Increase --context-window for a capable model or start a new task.")
+        return
+    }
     requestBody(app)
+    if bufOk(scratchData) && bufLen(scratchData) >= bufLen(historyData) {
+        app.contextOverheadBytes = bufLen(scratchData) - bufLen(historyData)
+    }
+    if contextEstimate(app) > app.contextWindow {
+        if !ensureHistorySpace(app, 0_usize, true) {
+            failTurn(app, "System instructions, tools and the active exchange exceed the context budget.")
+            return
+        }
+        requestBody(app)
+    }
     if !bufOk(scratchData) && ensureHistorySpace(app, 65536_usize, true) {
         requestBody(app)
     }
@@ -314,6 +341,7 @@ fn startRequest(app: mutref<App>) -> Void {
             append(headers, "\nHTTP-Referer: https://zerolang.ai\nX-Title: Zero Coding TUI")
         }
     }
+    app.contextRequestBytes = bufLen(scratchData)
     clear(packetData)
     let envelope: Maybe<Span<u8>> = std.http.writeJsonRequestWithHeaders(packetData, bytes(target), bytes(headers), bytes(scratchData))
     if !envelope.has {

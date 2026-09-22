@@ -126,7 +126,8 @@ static size_t zero_stream_body(char *data, size_t size, size_t count, void *opaq
 }
 
 int zero_http_stream(unsigned int expected) {
-    if (!zero_stream_parent_alive() || !expected || expected > 1310720) return 1;
+    /* Matches the reusable tool-argument arena used for request upload. */
+    if (!zero_stream_parent_alive() || !expected || expected > 12032768) return 1;
     char *request = calloc((size_t)expected + 1, 1);
     if (!request) return 1;
     if (fread(request, 1, expected, stdin) != expected || memchr(request, 0, expected)) {

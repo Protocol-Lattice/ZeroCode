@@ -182,6 +182,10 @@ main() {
     binary=$(CDPATH= cd -- "$(dirname -- "$binary")" && pwd)/$(basename -- "$binary")
     # Detect a wrong-platform or broken build before replacing an existing install.
     "$binary" --version || fail 'The binary cannot run on this machine.'
+    # --version exits before the native buffer frames are allocated. Enter the
+    # real application as well, without network, model calls or persistent state.
+    "$binary" --no-peers --no-learning --no-memory --no-session-logs --no-skills \
+        --demo --snapshot >/dev/null || fail 'The application cannot initialize its runtime buffers.'
     [ ! -d "$launcher" ] && [ ! -d "$installed_binary" ] || fail 'An installation destination is a directory.'
     mkdir -p "$bin_dir" "$lib_dir"
     program_root=

@@ -112,24 +112,27 @@ fn logEntry(app: mutref<App>, title: Span<u8>, text: Span<u8>) -> Void {
     displayEntry(app, title, text)
 }
 
-// The journal and worker transport retain raw results. Only the coordinator's
-// normal transcript uses summaries; model history receives the original bytes.
 fn logToolResult(app: mutref<App>, result: Span<u8>) -> Void {
     sessionLogEntry(app, "  TOOL RESULT", result)
     if app.workerMode > 0 {
-        // Workers write JSON to their private pipe, never to the terminal. Keep
-        // raw bytes here so the coordinator's journal also retains controls.
-        if bufLen(app.transcript) + std.mem.len(result) + 32 > capacity(app.transcript) { clear(app.transcript) }
+        if bufLen(app.transcript) + std.mem.len(result) + 32 > capacity(app.transcript) {
+            clear(app.transcript)
+        }
         append(app.transcript, "  TOOL RESULT\n")
         append(app.transcript, result)
         append(app.transcript, "\n\n")
         return
     }
-    if app.jobsMode > 0 { return }
+    if app.jobsMode > 0 {
+        return
+    }
     var storage: [4112]u8 = [0_u8; 4112]
     let summary: MutSpan<u8> = buffer(storage)
-    if app.commandResult { commandResultSummary(summary, app, result) }
-    else { toolResultSummary(summary, bytes(app.toolName), bytes(app.arguments), result) }
+    if app.commandResult {
+        commandResultSummary(summary, app, result)
+    } else {
+        toolResultSummary(summary, bytes(app.toolName), bytes(app.arguments), result)
+    }
     displayEntry(app, "  TOOL RESULT", bytes(summary))
 }
 
@@ -260,7 +263,9 @@ fn handleKey(app: mutref<App>, key: u32) -> Void {
                 approveTool(app)
             }
             if key == 110 || key == 78 {
-                if app.jobsApproval > 0 { answerJobApproval(app, false) } else {
+                if app.jobsApproval > 0 {
+                    answerJobApproval(app, false)
+                } else {
                     toolResult(app, "Error: the user denied this action. Do not retry it without new instructions.")
                 }
             }
@@ -275,6 +280,7 @@ fn handleKey(app: mutref<App>, key: u32) -> Void {
                 sessionLogText(app, "reset", "CLEAR", "Conversation cleared; session log retained.", false)
                 clear(historyData)
                 clear(transcriptData)
+                resetWorkflow(app)
                 eraseInput(app)
                 app.view = 0
             }
@@ -463,10 +469,11 @@ fn renderTranscript(app: mutref<App>, rows: usize, columns: usize) -> Void {
         var statusLines: usize = app.jobsCount + 3
         var worker: usize = 0
         while worker < app.jobsCount {
-            if workerState(app, worker) == workerError { statusLines = statusLines + 1 }
+            if workerState(app, worker) == workerError {
+                statusLines = statusLines + 1
+            }
             worker = worker + 1
         }
-        // Preserve the historical viewport when an error adds a detail line.
         if app.scroll > 0 && statusLines > app.workerDisplayLines {
             app.scroll = app.scroll + statusLines - app.workerDisplayLines
         }
@@ -618,11 +625,11 @@ fn render(world: World, app: mutref<App>) -> Void raises {
         paint(app, 11_usize, 7_usize, "\x1b[38;5;250m", "/tools on|off Enable tools or use a chat-only model")
         paint(app, 12_usize, 7_usize, "\x1b[38;5;250m", "/clear        Start a fresh conversation  ·  Ctrl-L")
         paint(app, 13_usize, 7_usize, "\x1b[38;5;250m", "/status /logs  Connection details / session log path")
-        paint(app, 14_usize, 7_usize, "\x1b[38;5;250m", "/quit         Exit  ·  Ctrl-D")
+        paint(app, 14_usize, 7_usize, "\x1b[38;5;250m", "/workflow     Inspect stages; agentic|off selects mode")
         paint(app, 15_usize, 7_usize, "\x1b[38;5;250m", "/mcp          Connect and manage MCP tool servers")
         paint(app, 16_usize, 7_usize, "\x1b[38;5;250m", "/skills       List skills  ·  /skills fetch REPO imports")
         paint(app, 17_usize, 7_usize, "\x1b[38;5;250m", "/memory       View, set or forget saved project facts")
-        paint(app, 7_usize, 7_usize, "\x1b[38;5;245m", "↑/↓ scroll · PgUp/PgDn page · Esc cancel · Paste supported")
+        paint(app, 7_usize, 7_usize, "\x1b[38;5;245m", "↑/↓ scroll · PgUp/PgDn page · Esc cancel · /quit or Ctrl-D exit")
     } else if bufLen(transcriptData) == 0 && !app.workersVisible {
         renderWelcome(app, rows, columns)
     } else {
@@ -670,6 +677,13 @@ fn render(world: World, app: mutref<App>) -> Void raises {
         }
         paint(app, rows - 2, 4_usize, color, "● ")
         append(frameData, status)
+        if peerActive() && columns >= 112 {
+            append(frameData, " · P2P ")
+            number(frameData, process.zero_peer_status(3_u32) as usize)
+            append(frameData, " peers / ")
+            number(frameData, process.zero_peer_status(1_u32) as usize)
+            append(frameData, " lessons")
+        }
         if app.phase == 1 || app.phase == 3 || app.phase == 5 || app.phase == 7 {
             append(frameData, " · ")
             number(frameData, std.time.asSecondsFloor(std.time.between(app.started, std.time.monotonic())) as usize)
@@ -686,16 +700,17 @@ fn render(world: World, app: mutref<App>) -> Void raises {
     append(frameData, "\x1b[38;5;244m")
     number(frameData, app.toolCount)
     append(frameData, " tools · ")
-    number(frameData, app.tokens)
-    append(frameData, " tokens")
+    append(frameData, "ctx ~")
+    number(frameData, contextEstimate(app) / 1000)
+    put(frameData, 47_u8)
+    number(frameData, app.contextWindow / 1000)
+    append(frameData, "k")
     append(frameData, "\x1b[0m\x1b[?25l")
     if bufOk(frameData) {
         check writeFrame(world, app, rows, columns)
     }
 }
 
-// Record row boundaries while composing the frame. Rendering never needs to
-// inspect transcript text or infer worker state from terminal escape sequences.
 fn framePosition(app: mutref<App>, row: usize, col: usize) -> Void {
     let offset: usize = bufLen(app.frame)
     put(app.frameIndex, row as u8)
@@ -711,7 +726,9 @@ fn frameRow(output: MutSpan<u8>, frame: Span<u8>, index: Span<u8>, row: usize) -
         if index[at] as usize == row {
             let start: usize = index[at + 1] as usize + index[at + 2] as usize * 256
             var end: usize = std.mem.len(frame)
-            if at + 5 < std.mem.len(index) { end = index[at + 4] as usize + index[at + 5] as usize * 256 }
+            if at + 5 < std.mem.len(index) {
+                end = index[at + 4] as usize + index[at + 5] as usize * 256
+            }
             append(output, slice(frame, start, end))
         }
         at = at + 3
@@ -719,7 +736,9 @@ fn frameRow(output: MutSpan<u8>, frame: Span<u8>, index: Span<u8>, row: usize) -
 }
 
 fn writeFrame(world: World, app: mutref<App>, rows: usize, columns: usize) -> Void raises {
-    if !bufOk(app.frameIndex) { return }
+    if !bufOk(app.frameIndex) {
+        return
+    }
     if bufLen(app.previousFrame) == 0 || rows != app.frameRows || columns != app.frameColumns {
         check world.out.write(bytes(app.frame))
     } else if !std.mem.eql(bytes(app.frame), bytes(app.previousFrame)) {

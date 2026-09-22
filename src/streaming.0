@@ -40,25 +40,39 @@ fn streamArrayLength(array: Span<u8>) -> usize {
 
 fn appendStreamToolArguments(app: mutref<App>, delta: Span<u8>) -> Bool {
     let fields: Maybe<usize> = std.json.objectFieldCount(delta)
-    if !fields.has || fields.value != 1 { return false }
+    if !fields.has || fields.value != 1 {
+        return false
+    }
     var key: String = "tool_calls"
-    if app.provider == 2 { key = "content" }
+    if app.provider == 2 {
+        key = "content"
+    }
     let incomingCalls: Span<u8> = field(delta, key)
     let count: Maybe<usize> = std.json.arrayCount(incomingCalls)
-    if !count.has || count.value != 1 { return false }
+    if !count.has || count.value != 1 {
+        return false
+    }
     let incomingCall: Span<u8> = arrayItem(incomingCalls, 0_usize)
     let callFields: Maybe<usize> = std.json.objectFieldCount(incomingCall)
     let index: Maybe<u32> = std.json.u32(incomingCall, "index")
-    if !callFields.has || callFields.value != 2 || !index.has || index.value >= 128 { return false }
-    if !hasStreamArgument(app, index.value as usize) { return false }
+    if !callFields.has || callFields.value != 2 || !index.has || index.value >= 128 {
+        return false
+    }
+    if !hasStreamArgument(app, index.value as usize) {
+        return false
+    }
     var incoming: Span<u8> = field(incomingCall, "_input_json")
     if app.provider != 2 {
         let function: Span<u8> = field(incomingCall, "function")
         let functionFields: Maybe<usize> = std.json.objectFieldCount(function)
-        if !functionFields.has || functionFields.value != 1 { return false }
+        if !functionFields.has || functionFields.value != 1 {
+            return false
+        }
         incoming = field(function, "arguments")
     }
-    if std.mem.eql(incoming, "null") { return false }
+    if std.mem.eql(incoming, "null") {
+        return false
+    }
     if !storeStreamArgument(app, index.value as usize, incoming) || app.streamArgumentBytes + bufLen(app.streamMessage) > capacity(app.response) {
         failTurn(app, "Streamed tool arguments are invalid or exceed the message limit.")
     }
@@ -66,8 +80,12 @@ fn appendStreamToolArguments(app: mutref<App>, delta: Span<u8>) -> Bool {
 }
 
 fn updateStreamMessage(app: mutref<App>, delta: Span<u8>) -> Void {
-    if std.mem.eql(delta, "null") { return }
-    if appendStreamToolArguments(app, delta) { return }
+    if std.mem.eql(delta, "null") {
+        return
+    }
+    if appendStreamToolArguments(app, delta) {
+        return
+    }
     var storage: [65552]u8 = [0_u8; 65552]
     let metadata: MutSpan<u8> = buffer(storage)
     separateStreamArguments(app, metadata, delta)
@@ -161,9 +179,9 @@ fn handleStreamEvent(app: mutref<App>) -> Void {
     }
     let finish: Span<u8> = field(firstChoice, "finish_reason")
     let usage: Span<u8> = field(event, "usage")
-    // Most deltas carry neither field. Avoid copying the accumulated file text
-    // a second time for an update that would preserve both existing values.
-    if std.mem.eql(finish, "null") && std.mem.eql(usage, "null") { return }
+    if std.mem.eql(finish, "null") && std.mem.eql(usage, "null") {
+        return
+    }
     var updateStorage: [4096]u8 = [0_u8; 4096]
     let update: MutSpan<u8> = buffer(updateStorage)
     append(update, "{\"_finish_reason\":")
@@ -344,6 +362,14 @@ fn finishHttp(app: mutref<App>) -> Void {
     clear(app.scratch)
     append(app.scratch, "200\n")
     let message: Span<u8> = bytes(app.streamMessage)
+    if std.mem.eql(field(message, "_finish_reason"), "\"length\"") || std.mem.eql(field(message, "stop_reason"), "\"max_tokens\"") {
+        usageCount(app, message)
+        if app.streamVisible {
+            append(app.transcript, "\n\n")
+        }
+        recoverOutputLimit(app, message)
+        return
+    }
     if app.provider == 2 {
         streamObject(app, app.scratch, message)
     } else {
@@ -481,13 +507,13 @@ fn streamConcatKey(key: Span<u8>) -> Bool {
 }
 
 fn streamFrameValue(root: Span<u8>, start: usize, length: usize) -> Span<u8> {
-    if length == 0 { return "null" }
+    if length == 0 {
+        return "null"
+    }
     return slice(root, start, start + length)
 }
 
 fn mergeStreamJson(output: MutSpan<u8>, left: Span<u8>, right: Span<u8>, concatenate: Bool, initialDepth: usize) -> Void {
-    // Explicit frames avoid recursive mutable borrows and use a fixed 13-level
-    // budget. The direct ARM64 backend also limits this signature to eight slots.
     var leftStart: [13]usize = [0_usize; 13]
     var leftLength: [13]usize = [0_usize; 13]
     var rightStart: [13]usize = [0_usize; 13]
@@ -499,7 +525,9 @@ fn mergeStreamJson(output: MutSpan<u8>, left: Span<u8>, right: Span<u8>, concate
     var depth: usize = 0
     leftLength[0] = std.mem.len(left)
     rightLength[0] = std.mem.len(right)
-    if concatenate { joins[0] = 1 }
+    if concatenate {
+        joins[0] = 1
+    }
     while true {
         let previous: Span<u8> = streamFrameValue(left, leftStart[depth], leftLength[depth])
         let incoming: Span<u8> = streamFrameValue(right, rightStart[depth], rightLength[depth])
@@ -522,34 +550,48 @@ fn mergeStreamJson(output: MutSpan<u8>, left: Span<u8>, right: Span<u8>, concate
                 if joins[depth] == 1 && std.str.startsWith(previous, "\"") && std.str.startsWith(incoming, "\"") {
                     append(output, slice(previous, 0_usize, std.mem.len(previous) - 1))
                     append(output, std.mem.dropPrefix(incoming, 1_usize))
-                } else { append(output, incoming) }
+                } else {
+                    append(output, incoming)
+                }
                 finished = true
             }
         }
         if !finished && states[depth] == 1 {
             let oldFields: Maybe<usize> = std.json.objectFieldCount(previous)
             let newFields: Maybe<usize> = std.json.objectFieldCount(incoming)
-            if !newFields.has { setOk(output, false)
- return }
+            if !newFields.has {
+                setOk(output, false)
+                return
+            }
             var oldCount: usize = 0
-            if oldFields.has { oldCount = oldFields.value }
-            if oldCount > 128 || newFields.value > 128 { setOk(output, false)
- return }
+            if oldFields.has {
+                oldCount = oldFields.value
+            }
+            if oldCount > 128 || newFields.value > 128 {
+                setOk(output, false)
+                return
+            }
             if cursors[depth] >= oldCount + newFields.value {
                 put(output, 125_u8)
                 finished = true
             } else {
                 var object: Span<u8> = previous
                 var index: usize = cursors[depth]
-                if index >= oldCount { object = incoming
- index = index - oldCount }
+                if index >= oldCount {
+                    object = incoming
+                    index = index - oldCount
+                }
                 var keyStorage: [256]u8 = [0_u8; 256]
                 let key: Maybe<Span<u8>> = std.json.objectKey(keyStorage, object, index)
-                if !key.has { setOk(output, false)
- return }
+                if !key.has {
+                    setOk(output, false)
+                    return
+                }
                 let existing: Maybe<Span<u8>> = std.json.field(previous, key.value)
                 if cursors[depth] < oldCount || !existing.has {
-                    if written[depth] > 0 { put(output, 44_u8) }
+                    if written[depth] > 0 {
+                        put(output, 44_u8)
+                    }
                     quoted(output, key.value)
                     put(output, 58_u8)
                     written[depth] = written[depth] + 1
@@ -563,14 +605,20 @@ fn mergeStreamJson(output: MutSpan<u8>, left: Span<u8>, right: Span<u8>, concate
         } else if !finished && states[depth] == 2 {
             var length: usize = streamArrayLength(previous)
             let newLength: usize = streamArrayLength(incoming)
-            if newLength > length { length = newLength }
-            if length > 128 { setOk(output, false)
- return }
+            if newLength > length {
+                length = newLength
+            }
+            if length > 128 {
+                setOk(output, false)
+                return
+            }
             if cursors[depth] >= length {
                 put(output, 93_u8)
                 finished = true
             } else {
-                if cursors[depth] > 0 { put(output, 44_u8) }
+                if cursors[depth] > 0 {
+                    put(output, 44_u8)
+                }
                 childLeft = streamArrayItem(previous, cursors[depth])
                 childRight = streamArrayItem(incoming, cursors[depth])
                 childJoin = joins[depth] == 1
@@ -578,24 +626,36 @@ fn mergeStreamJson(output: MutSpan<u8>, left: Span<u8>, right: Span<u8>, concate
                 cursors[depth] = cursors[depth] + 1
             }
         }
-        if !bufOk(output) { return }
+        if !bufOk(output) {
+            return
+        }
         if descend {
-            if depth + initialDepth >= 12 { setOk(output, false)
- return }
+            if depth + initialDepth >= 12 {
+                setOk(output, false)
+                return
+            }
             depth = depth + 1
             leftStart[depth] = std.str.indexOf(left, childLeft)
             leftLength[depth] = std.mem.len(childLeft)
-            if leftStart[depth] >= std.mem.len(left) { leftLength[depth] = 0 }
+            if leftStart[depth] >= std.mem.len(left) {
+                leftLength[depth] = 0
+            }
             rightStart[depth] = std.str.indexOf(right, childRight)
             rightLength[depth] = std.mem.len(childRight)
-            if rightStart[depth] >= std.mem.len(right) { rightLength[depth] = 0 }
+            if rightStart[depth] >= std.mem.len(right) {
+                rightLength[depth] = 0
+            }
             states[depth] = 0
             cursors[depth] = 0
             written[depth] = 0
             joins[depth] = 0
-            if childJoin { joins[depth] = 1 }
+            if childJoin {
+                joins[depth] = 1
+            }
         } else if finished {
-            if depth == 0 { return }
+            if depth == 0 {
+                return
+            }
             depth = depth - 1
         }
     }

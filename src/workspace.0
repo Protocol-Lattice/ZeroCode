@@ -106,6 +106,10 @@ fn readTool(app: mutref<App>) -> Void {
     }
     let fullPath: Maybe<String> = resolvedPath(app, bytes(path), absolute)
     if !fullPath.has {
+        if learningProgramEnabled() && app.workerMode == 0 {
+            toolResult(app, "Error: path is outside the workspace, ignored, secret or a symlink. For your own executable graph use self_inspect with a function name, e.g. helpText; installed program paths are outside read_file scope.")
+            return
+        }
         toolResult(app, "Error: path is outside the workspace, ignored by .gitignore, a secret file, or contains a symlink. Git is required for ignore checks.")
         return
     }
@@ -197,7 +201,6 @@ fn readTool(app: mutref<App>) -> Void {
 }
 
 fn fileByteSize(path: String) -> Maybe<usize> {
-    // readBytesAt returns the total size and is supported by the direct backend.
     var probe: [1]u8 = [0_u8; 1]
     return std.fs.readBytesAt(path, 0_usize, probe)
 }
@@ -335,7 +338,9 @@ fn prepareLargeFile(app: mutref<App>, path: String) -> Bool {
             return false
         }
         var count: usize = size.value
-        if count > std.mem.len(preview) { count = std.mem.len(preview) }
+        if count > std.mem.len(preview) {
+            count = std.mem.len(preview)
+        }
         clear(app.scratch)
         append(app.scratch, "Replacing the entire file (")
         number(app.scratch, size.value)

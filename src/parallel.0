@@ -169,8 +169,6 @@ fn setJobFailed(app: mutref<App>, index: usize, value: Bool) -> Void {
     app.jobFailed3 = value
 }
 
-// Worker processes own private App buffers. Only the coordinator modifies history
-// and the Zero graph. Slot states: queued, running, approval, result, done, committed.
 fn foldedByte(value: u8) -> u8 {
     if value >= 65 && value <= 90 {
         return value + 32_u8
@@ -198,8 +196,6 @@ fn graphPath(path: Span<u8>) -> Bool {
 }
 
 fn overlappingPath(left: Span<u8>, right: Span<u8>) -> Bool {
-    // macOS may treat Unicode case or normalization variants as one path.
-    // Conservatively serialize non-ASCII owners when a writer is involved.
     var byte: usize = 0
     while byte < std.mem.len(left) {
         if left[byte] >= 128 {
@@ -322,7 +318,15 @@ fn workerToolAllowed(app: ref<App>) -> Bool {
 
 fn builtinAllowed(app: ref<App>, index: usize) -> Bool {
     if app.workerMode == 0 {
-        if index == 8 { return app.memoryEnabled }
+        if index == 10 || index == 11 {
+            return learningProgramEnabled()
+        }
+        if index == 9 {
+            return workflowActive(app)
+        }
+        if index == 8 {
+            return app.memoryEnabled
+        }
         return index != 6 || app.skillCount > 0
     }
     if index == 0 || index == 5 {
@@ -413,17 +417,21 @@ fn queueWorkerEvent(app: mutref<App>, kind: String, text: Span<u8>) -> Void {
 }
 
 fn finishWorkerTool(app: mutref<App>, result: Span<u8>) -> Void {
-    if app.workerMode == 0 || !app.workerToolActive { return }
+    if app.workerMode == 0 || !app.workerToolActive {
+        return
+    }
     app.workerToolActive = false
     app.workerCompletedTools = app.workerCompletedTools + 1
     queueWorkerEvent(app, "tool_finished", "")
-    // Single file workers do not append results to their own conversation.
-    // Preserve full detail in the same worker log stream as delegated tools.
-    if app.workerMode == 1 { logToolResult(app, result) }
+    if app.workerMode == 1 {
+        logToolResult(app, result)
+    }
 }
 
 fn workerFlush(world: World, app: mutref<App>) -> Void raises {
-    if !bufOk(app.workerEvents) { raise WorkerProtocolLimit }
+    if !bufOk(app.workerEvents) {
+        raise WorkerProtocolLimit
+    }
     if bufLen(app.workerEvents) > 0 {
         check world.out.write(bytes(app.workerEvents))
         clear(app.workerEvents)
@@ -518,6 +526,33 @@ fn loadWorker(app: mutref<App>) -> Bool {
         return false
     }
     app.provider = provider.value as usize
+    let window: Maybe<u32> = std.json.u32(config, "context_window")
+    if window.has {
+        if window.value < 16384 || window.value > 1000000 {
+            return false
+        }
+        app.contextWindow = window.value as usize
+    }
+    var seedStorage: [256]u8 = [0_u8; 256]
+    let seed: MutSpan<u8> = buffer(seedStorage)
+    if !std.mem.eql(field(config, "peer_seed"), "null") {
+        if !decode(seed, field(config, "peer_seed")) {
+            return false
+        }
+        if bufLen(seed) > 0 && !peerBoot(app, bytes(seed)) {
+            return false
+        }
+    }
+    let outputLimit: Maybe<u32> = std.json.u32(config, "max_output_tokens")
+    if outputLimit.has {
+        if outputLimit.value != 0 && (outputLimit.value < 256 || outputLimit.value > 65536) {
+            return false
+        }
+        app.maxOutputTokens = outputLimit.value as usize
+    }
+    if app.contextWindow <= outputTokenLimit(app) + 4096 {
+        return false
+    }
     if !decode(app.model, field(config, "model")) || !decode(app.key, field(config, "key")) || !decode(app.endpoint, field(config, "endpoint")) {
         return false
     }
@@ -525,7 +560,9 @@ fn loadWorker(app: mutref<App>) -> Bool {
         return false
     }
     let learned: usize = learningNumber(config, "learning_policy")
-    if learned > 4 { return false }
+    if learned > 4 {
+        return false
+    }
     app.learningSelectedPolicy = learned
     app.learningGlobalPolicy = learned
     app.learningEnabled = learned < 4
@@ -561,6 +598,7 @@ fn loadWorker(app: mutref<App>) -> Bool {
         if !userMessage(app, bytes(app.input)) {
             return false
         }
+        startWorkflow(app, bytes(app.input))
         startRequest(app)
     }
     return true
@@ -632,6 +670,25 @@ fn startJob(app: mutref<App>, index: usize) -> Void {
     clear(output)
     append(output, "{\"provider\":")
     number(output, app.provider)
+    append(output, ",\"max_output_tokens\":")
+    number(output, app.maxOutputTokens)
+    append(output, ",\"context_window\":")
+    number(output, app.contextWindow)
+    append(output, ",\"peer_seed\":")
+    var seedStorage: [256]u8 = [0_u8; 256]
+    let seed: MutSpan<u8> = buffer(seedStorage)
+    if peerActive() {
+        append(seed, "http://")
+        let bindOption: Maybe<String> = std.args.valueAfter("--peer-bind")
+        if bindOption.has && !std.mem.eql(bindOption.value, "0.0.0.0") {
+            append(seed, bindOption.value)
+        } else {
+            append(seed, "127.0.0.1")
+        }
+        put(seed, 58_u8)
+        number(seed, process.zero_peer_status(4_u32) as usize)
+    }
+    quoted(output, bytes(seed))
     append(output, ",\"model\":")
     quoted(output, bytes(app.model))
     append(output, ",\"key\":")
@@ -755,7 +812,6 @@ fn pollJob(app: mutref<App>, index: usize) -> Void {
         return
     }
     let child: ProcChild = jobChild(app, index)
-    // Drain after observing exit before closing, so final pipe bytes cannot race us.
     let running: Bool = std.proc.running(child)
     let tx: MutSpan<u8> = jobTx(app, index)
     if state == 1 && jobSent(app, index) < bufLen(tx) {
@@ -806,7 +862,6 @@ fn pollJob(app: mutref<App>, index: usize) -> Void {
     if running {
         return
     }
-    // Wait one extra poll when the drain bound was reached, to consume all pipes.
     if drain == 16 {
         return
     }
@@ -829,8 +884,11 @@ fn answerJobApproval(app: mutref<App>, approved: Bool) -> Void {
         return
     }
     let index: usize = app.jobsApproval - 1
-    if approved { sessionLogText(app, "approval", "WORKER", "approved", false) }
-    else { sessionLogText(app, "approval", "WORKER", "denied", false) }
+    if approved {
+        sessionLogText(app, "approval", "WORKER", "approved", false)
+    } else {
+        sessionLogText(app, "approval", "WORKER", "denied", false)
+    }
     let tx: MutSpan<u8> = jobTx(app, index)
     clear(app.packet)
     append(app.packet, "{\"id\":")
@@ -995,7 +1053,9 @@ fn beginJobs(app: mutref<App>, mode: usize, count: usize) -> Void {
         setJobFailed(app, i, false)
         clear(jobRx(app, i))
         clear(jobTx(app, i))
-        if i < count { updateWorker(app, i, eventWorkerQueued, "") }
+        if i < count {
+            updateWorker(app, i, eventWorkerQueued, "")
+        }
         i = i + 1
     }
     app.phase = 6
@@ -1062,7 +1122,7 @@ fn startDelegation(app: mutref<App>) -> Void {
 }
 
 fn tryFileBatch(app: mutref<App>) -> Bool {
-    if app.workerMode != 0 || app.parallelLimit < 2 {
+    if peerActive() || app.workerMode != 0 || app.parallelLimit < 2 {
         return false
     }
     clear(app.jobsPlan)
@@ -1080,6 +1140,9 @@ fn tryFileBatch(app: mutref<App>) -> Bool {
             args = bytes(app.scratch)
         }
         if !std.mem.eql(name, "\"read_file\"") && !std.mem.eql(name, "\"write_file\"") && !std.mem.eql(name, "\"edit_file\"") {
+            break
+        }
+        if workflowActive(app) && app.workflowStage != 2 && !std.mem.eql(name, "\"read_file\"") {
             break
         }
         if !std.json.validateBytes(args) || std.mem.len(args) > capacity(app.arguments) {

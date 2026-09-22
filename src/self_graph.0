@@ -1,0 +1,75 @@
+fn prepareSelfPatch(app: mutref<App>) -> Bool {
+    if !learningProgramEnabled() || app.workerMode > 0 {
+        toolResult(app, "Error: self_patch requires launching this peer with --self-evolve.")
+        return false
+    }
+    if app.selfPatchSelected {
+        toolResult(app, "Error: a graph update is already saved for the next launch. Inspect target selected and finish_task; restart before another self_patch.")
+        return false
+    }
+    let patches: Span<u8> = field(bytes(app.arguments), "patches")
+    let count: Maybe<usize> = std.json.arrayCount(patches)
+    if !count.has {
+        toolResult(app, "Error: patches must be an array of function replacements.")
+        return false
+    }
+    if count.value < 1 || count.value > 8 || bufLen(app.arguments) > 48000 {
+        toolResult(app, "Error: self_patch accepts 1–8 function replacements and up to 48 KiB of arguments.")
+        return false
+    }
+    logEntry(app, "  PROPOSED ZERO.GRAPH CHANGE", bytes(app.arguments))
+    logEntry(app, "  ACTIVATION", "Compile the replacement function bodies and select a new executable for the next launch. The compiler checks the graph; runtime behavior is not evaluated. Previous generations remain available for rollback.")
+    return true
+}
+
+fn applySelfPatch(app: mutref<App>) -> Void {
+    if !learningProgramEnabled() || app.workerMode > 0 {
+        toolResult(app, "Error: self-evolution is unavailable.")
+        return
+    }
+    let root: Span<u8> = std.env.getOr("ZERO_LEARNING_PROGRAM_ROOT", "")
+    if !headerSafe(root) {
+        toolResult(app, "Error: invalid program root.")
+        return
+    }
+    var requestStorage: [65552]u8 = [0_u8; 65552]
+    let request: MutSpan<u8> = buffer(requestStorage)
+    append(request, "{\"action\":\"patch\",\"parent\":")
+    quoted(request, learningProgramVersion())
+    append(request, ",\"patches\":")
+    append(request, field(bytes(app.arguments), "patches"))
+    put(request, 125_u8)
+    clear(app.packet)
+    compactJson(app.packet, bytes(request))
+    clear(app.scratch)
+    append(app.scratch, root)
+    append(app.scratch, "/scripts/learning_program.py\n--root\n")
+    append(app.scratch, root)
+    append(app.scratch, "\n--request-stdin\n")
+    if !bufOk(request) || !bufOk(app.packet) || !bufOk(app.scratch) {
+        toolResult(app, "Error: graph patch request is too large.")
+        return
+    }
+    app.child = std.proc.spawnChildArgs("python3", bytes(app.scratch), bytes(app.workspace), "")
+    if !std.proc.childValid(app.child) {
+        toolResult(app, "Error: could not start the graph compiler driver.")
+        return
+    }
+    clear(app.result)
+    clear(app.errors)
+    app.sent = 0
+    app.phase = 3
+    app.view = 0
+    app.started = std.time.monotonic()
+}
+
+fn appendProgramContext(app: mutref<App>) -> Void {
+    if !learningProgramEnabled() || app.workerMode > 0 {
+        return
+    }
+    append(app.systemContext, "\nOwn-program tools: self_inspect reads a function from your executable zero.graph even outside the workspace. Read every page via next_offset while truncated. self_patch compiles replacements after approval. For systemPrompt use return_text with the complete prompt; the driver generates valid Zero code. For other code, body contains Zero statements, with no function wrapper, Markdown or trailing semicolon. On failure read the diagnostic and correct the cause; three failures stop the task. Only accepted:true confirms a saved generation. Then self_inspect with target selected reads the next-launch graph; target running still reads this process. Call finish_task after confirming the change and tell the user to restart. Further self_patch calls require restart. Sealed generations remain available for rollback; never edit them directly.\nRunning generation: ")
+    append(app.systemContext, learningProgramVersion())
+    append(app.systemContext, "\nGeneration directory (metadata, not a workspace path): ")
+    append(app.systemContext, std.env.getOr("ZERO_LEARNING_PROGRAM_GRAPH_DIR", ""))
+    append(app.systemContext, "\n")
+}

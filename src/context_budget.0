@@ -1,0 +1,66 @@
+fn parseContextBudget(app: mutref<App>) -> Bool {
+    let option: Maybe<String> = std.args.valueAfter("--context-window")
+    if !hasArg("--context-window") {
+        return true
+    }
+    if !option.has {
+        return false
+    }
+    let value: Maybe<u32> = std.parse.parseU32(option.value)
+    if !value.has {
+        return false
+    }
+    if value.value < 16384 || value.value > 1000000 {
+        return false
+    }
+    app.contextWindow = value.value as usize
+    return app.contextWindow > outputTokenLimit(app) + 4096
+}
+
+fn contextHistoryBudget(app: ref<App>) -> usize {
+    let reserve: usize = outputTokenLimit(app) + 2048
+    if app.contextWindow <= reserve {
+        return 0
+    }
+    let bytesBudget: usize = (app.contextWindow - reserve) * 1000000 / app.contextTokenMicros
+    if bytesBudget <= app.contextOverheadBytes {
+        return 0
+    }
+    return bytesBudget - app.contextOverheadBytes
+}
+
+fn contextEstimate(app: ref<App>) -> usize {
+    return ((bufLen(app.history) + app.contextOverheadBytes) * app.contextTokenMicros + 999999) / 1000000 + outputTokenLimit(app) + 2048
+}
+
+fn contextUsage(app: mutref<App>, usage: Span<u8>) -> Void {
+    var tokens: usize = learningNumber(usage, "prompt_tokens")
+    if tokens == 0 {
+        tokens = learningNumber(usage, "input_tokens") + learningNumber(usage, "cache_creation_input_tokens") + learningNumber(usage, "cache_read_input_tokens")
+    }
+    if tokens == 0 || app.contextRequestBytes == 0 {
+        return
+    }
+    app.contextLastInputTokens = tokens
+    let observed: usize = (tokens * 1100000 + app.contextRequestBytes - 1) / app.contextRequestBytes
+    if observed >= 62500 && observed <= 4000000 {
+        app.contextTokenMicros = observed
+    }
+}
+
+fn showContext(app: mutref<App>) -> Void {
+    var storage: [1024]u8 = [0_u8; 1024]
+    let out: MutSpan<u8> = buffer(storage)
+    append(out, "Configured window: ")
+    number(out, app.contextWindow)
+    append(out, " tokens\nEstimated next request + output reserve: ")
+    number(out, contextEstimate(app))
+    append(out, " tokens\nLast provider-reported input: ")
+    number(out, app.contextLastInputTokens)
+    append(out, " tokens (0 = unavailable)\nHistory: ")
+    number(out, bufLen(app.history))
+    append(out, " / ")
+    number(out, capacity(app.history))
+    append(out, " bytes\nToken estimation is not an exact tokenizer. Select a model that supports this window, or lower --context-window. Output, instructions and tool schemas share the same budget.")
+    logEntry(app, "  CONTEXT", bytes(out))
+}

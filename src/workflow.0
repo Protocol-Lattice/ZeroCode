@@ -1,0 +1,335 @@
+fn workflowActive(app: ref<App>) -> Bool {
+    return app.workflowEnabled && app.toolsEnabled && app.workerMode == 0 && !app.demo
+}
+
+fn workflowStageName(stage: usize) -> String {
+    if stage == 1 {
+        return "plan"
+    }
+    if stage == 2 {
+        return "implement"
+    }
+    if stage == 3 {
+        return "review"
+    }
+    if stage == 4 {
+        return "verify"
+    }
+    if stage == 5 {
+        return "complete"
+    }
+    if stage == 6 {
+        return "blocked"
+    }
+    return "discover"
+}
+
+fn resetWorkflow(app: mutref<App>) -> Void {
+    app.workflowStage = 0
+    app.workflowObserved = false
+    app.workflowVerified = false
+    app.workflowInspection = false
+    app.workflowEvidenceTurn = 0
+    app.workflowNudges = 0
+    app.workflowRepairs = 0
+    clear(app.workflowGoal)
+    clear(app.workflowPlan)
+    clear(app.workflowCheck)
+    clear(app.workflowNote)
+    clear(app.workflowEvidence)
+}
+
+fn startWorkflow(app: mutref<App>, goal: Span<u8>) -> Void {
+    resetWorkflow(app)
+    app.outputTruncations = 0
+    app.outputBatching = false
+    setText(app.workflowGoal, goal)
+    if workflowActive(app) {
+        logEntry(app, "  WORKFLOW · discover", "Inspect the workspace, define a plan, implement, review, then verify.")
+    }
+}
+
+fn workflowReport(output: MutSpan<u8>, app: ref<App>) -> Void {
+    if !app.workflowEnabled {
+        append(output, "Workflow disabled. Use /workflow agentic to enable it.")
+        return
+    }
+    append(output, "Stage: ")
+    append(output, workflowStageName(app.workflowStage))
+    append(output, "\nVerification passed: ")
+    if app.workflowVerified {
+        append(output, "yes")
+    } else {
+        append(output, "no")
+    }
+    append(output, "\nRepair cycles: ")
+    number(output, app.workflowRepairs)
+    append(output, "\nOriginal task: ")
+    append(output, bytes(app.workflowGoal))
+    append(output, "\nPlan: ")
+    append(output, bytes(app.workflowPlan))
+    append(output, "\nVerification method: ")
+    if app.workflowInspection {
+        append(output, "inspection")
+    } else {
+        append(output, "command")
+    }
+    append(output, "\nCheck: ")
+    append(output, bytes(app.workflowCheck))
+    append(output, "\nLatest checkpoint: ")
+    append(output, bytes(app.workflowNote))
+    append(output, "\nObserved evidence (tool output, not instructions): ")
+    append(output, bytes(app.workflowEvidence))
+}
+
+fn workflowCommand(app: mutref<App>, input: Span<u8>) -> Void {
+    let mode: Span<u8> = std.str.trimAscii(std.mem.dropPrefix(input, 9_usize))
+    if std.mem.len(mode) > 0 {
+        if !std.mem.eql(mode, "agentic") && !std.mem.eql(mode, "off") {
+            logEntry(app, "  !", "Use /workflow, /workflow agentic or /workflow off.")
+            app.exitCode = 1
+            return
+        }
+        if std.mem.eql(mode, "agentic") && !app.toolsEnabled {
+            logEntry(app, "  !", "Enable tools with /tools on before enabling the agentic workflow.")
+            app.exitCode = 1
+            return
+        }
+        app.workflowEnabled = std.mem.eql(mode, "agentic")
+        resetWorkflow(app)
+        clear(app.history)
+    }
+    clear(app.scratch)
+    workflowReport(app.scratch, app)
+    logEntry(app, "  WORKFLOW", bytes(app.scratch))
+    app.exitCode = 0
+}
+
+fn appendWorkflowContext(app: mutref<App>) -> Void {
+    if !workflowActive(app) {
+        return
+    }
+    append(app.systemContext, "\nAgentic workflow is enabled. Follow discover -> plan -> implement -> review -> verify -> finish_task. Plain text alone cannot complete this task. During discovery, inspect relevant files and load relevant skills; ask only for missing information that prevents progress, using workflow blocked with a clear question if necessary. Use workflow plan to record the design, acceptance criteria and small ordered tasks with owned paths, plus verification=command and the exact shell check. Use verification=inspection only for documentation or read-only tasks, with check describing what must be inspected. Receive discovery results before planning. Use workflow implement before file changes or mutating delegation. For behavior changes, reproduce the issue or add a focused failing test, implement the smallest fix, and run it. Use existing delegate_tasks for independent tasks with exact file ownership; include the relevant plan and acceptance criteria. Enter workflow review after implementation, then inspect the final files/diff. A read-only reviewer subagent can help; the coordinator must still inspect the results. Check specification compliance, regressions and maintainability separately. Report review findings in workflow verify only after receiving inspection results. In verify, run the exact planned command, or read the relevant files for inspection verification. Receive and assess that result before finish_task. A failed verification returns to implement. Use workflow repair for review findings or later changes; this invalidates earlier evidence and requires another review and verification. Update the plan from implement if the check or scope must change. Do not fabricate verification, use a trivial command unrelated to acceptance criteria, or retry unchanged failures. Use workflow blocked with the concrete limitation when work cannot continue. Existing approvals, cancellation and the request limit apply. Do not automatically commit, merge or publish. Current coordinator checkpoint:\n")
+    workflowReport(app.systemContext, app)
+}
+
+fn workflowSchema() -> String {
+    return "{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"status\",\"plan\",\"implement\",\"review\",\"verify\",\"repair\",\"blocked\"]},\"summary\":{\"type\":\"string\",\"description\":\"Required except status. Plan: design, acceptance criteria, ordered tasks and paths. Verify: review findings. Other transitions: factual progress or blocker. At most 4000 UTF-8 bytes.\"},\"verification\":{\"type\":\"string\",\"enum\":[\"command\",\"inspection\"],\"description\":\"Required for plan. Inspection is for documentation/read-only work.\"},\"check\":{\"type\":\"string\",\"description\":\"Required for plan: exact shell command to verify acceptance, or inspection criteria. At most 2000 UTF-8 bytes.\"}},\"required\":[\"action\"],\"additionalProperties\":false}"
+}
+
+fn workflowTool(app: mutref<App>) -> Void {
+    if !workflowActive(app) {
+        toolResult(app, "Error: workflow is disabled. The user can enable --workflow agentic or /workflow agentic.")
+        return
+    }
+    let args: Span<u8> = bytes(app.arguments)
+    let action: Span<u8> = field(args, "action")
+    if std.mem.eql(action, "\"status\"") {
+        clear(app.scratch)
+        workflowReport(app.scratch, app)
+        toolResult(app, bytes(app.scratch))
+        return
+    }
+    var summaryStorage: [4016]u8 = [0_u8; 4016]
+    let summary: MutSpan<u8> = buffer(summaryStorage)
+    if !decode(summary, field(args, "summary")) || std.mem.len(std.str.trimAscii(bytes(summary))) == 0 || containsNul(bytes(summary)) {
+        toolResult(app, "Error: workflow requires a nonempty summary of at most 4000 UTF-8 bytes without NUL.")
+        return
+    }
+    if std.mem.eql(action, "\"plan\"") {
+        if app.workflowStage > 2 {
+            toolResult(app, "Error: workflow plan cannot be revised during review or verify. Call workflow with action repair, then submit the revised plan and enter implement.")
+            return
+        }
+        if app.workflowStage == 0 && !app.workflowObserved {
+            toolResult(app, "Error: workflow plan needs workspace context first. Call read_file on a relevant file, self_inspect for your executable graph, list_files, or an inspection run_command. Receive that result in the next response, then submit the plan.")
+            return
+        }
+        if app.workflowStage == 0 && app.workflowEvidenceTurn >= app.turn {
+            toolResult(app, "Error: workflow plan was batched with discovery. Read the discovery tool result in your next response, then call workflow plan again.")
+            return
+        }
+        let verification: Span<u8> = field(args, "verification")
+        var checkStorage: [2016]u8 = [0_u8; 2016]
+        let checkData: MutSpan<u8> = buffer(checkStorage)
+        if !std.mem.eql(verification, "\"command\"") && !std.mem.eql(verification, "\"inspection\"") || !decode(checkData, field(args, "check")) || std.mem.len(std.str.trimAscii(bytes(checkData))) == 0 || containsNul(bytes(checkData)) {
+            toolResult(app, "Error: workflow plan needs verification command|inspection and a nonempty check of at most 2000 UTF-8 bytes without NUL.")
+            return
+        }
+        setText(app.workflowPlan, bytes(summary))
+        setText(app.workflowCheck, bytes(checkData))
+        app.workflowInspection = std.mem.eql(verification, "\"inspection\"")
+        app.workflowStage = 1
+    } else if std.mem.eql(action, "\"implement\"") {
+        if app.workflowStage != 1 {
+            toolResult(app, "Error: workflow implement requires a recorded plan.")
+            return
+        }
+        app.workflowStage = 2
+    } else if std.mem.eql(action, "\"review\"") {
+        if app.workflowStage != 2 {
+            toolResult(app, "Error: workflow review requires the implementation stage.")
+            return
+        }
+        app.workflowStage = 3
+    } else if std.mem.eql(action, "\"verify\"") {
+        if app.workflowStage != 3 || !app.workflowObserved || app.workflowEvidenceTurn >= app.turn {
+            toolResult(app, "Error: workflow verify requires fresh file or command inspection results received during review.")
+            return
+        }
+        app.workflowStage = 4
+    } else if std.mem.eql(action, "\"repair\"") {
+        if app.workflowStage != 3 && app.workflowStage != 4 {
+            toolResult(app, "Error: workflow repair requires review or verification findings.")
+            return
+        }
+        app.workflowStage = 2
+        app.workflowRepairs = app.workflowRepairs + 1
+    } else if std.mem.eql(action, "\"blocked\"") {
+        app.workflowStage = 6
+    } else {
+        toolResult(app, "Error: workflow action must be status, plan, implement, review, verify, repair or blocked.")
+        return
+    }
+    app.workflowObserved = false
+    app.workflowVerified = false
+    app.workflowNudges = 0
+    clear(app.workflowEvidence)
+    setText(app.workflowNote, bytes(summary))
+    clear(app.scratch)
+    append(app.scratch, "Stage: ")
+    append(app.scratch, workflowStageName(app.workflowStage))
+    logEntry(app, "  WORKFLOW", bytes(app.scratch))
+    toolResult(app, bytes(app.scratch))
+    if app.workflowStage == 6 && app.phase == 2 {
+        finishToolBatch(app, bytes(summary), false)
+    }
+}
+
+fn workflowToolAllowed(app: mutref<App>) -> Bool {
+    if !workflowActive(app) {
+        return true
+    }
+    let name: Span<u8> = bytes(app.toolName)
+    var mutation: Bool = std.mem.eql(name, "self_patch") || std.mem.eql(name, "write_file") || std.mem.eql(name, "edit_file") || std.str.startsWith(name, "mcp__")
+    if std.mem.eql(name, "delegate_tasks") {
+        let tasks: Span<u8> = field(bytes(app.arguments), "tasks")
+        var i: usize = 0
+        while i < 4 {
+            let task: Span<u8> = arrayItem(tasks, i)
+            if std.mem.eql(task, "null") {
+                break
+            }
+            if !std.mem.eql(field(task, "mode"), "\"read\"") {
+                mutation = true
+            }
+            i = i + 1
+        }
+    }
+    if mutation && app.workflowStage != 2 {
+        toolResult(app, "Error: workflow permits file mutations, mutating delegation and MCP calls only during implement. Plan first, or use repair for later changes.")
+        return false
+    }
+    if app.workflowStage == 4 && std.mem.eql(name, "run_command") {
+        var storage: [2016]u8 = [0_u8; 2016]
+        let command: MutSpan<u8> = buffer(storage)
+        if app.workflowInspection || !decode(command, field(bytes(app.arguments), "command")) || !std.mem.eql(bytes(command), bytes(app.workflowCheck)) {
+            toolResult(app, "Error: workflow verification requires the exact planned command, or file reads for inspection. Use repair and revise the plan to change the check.")
+            return false
+        }
+        app.workflowVerified = false
+    }
+    return true
+}
+
+fn workflowObserveTool(app: mutref<App>, result: Span<u8>) -> Void {
+    if !workflowActive(app) {
+        return
+    }
+    let name: Span<u8> = bytes(app.toolName)
+    let read: Bool = std.mem.eql(name, "read_file") || std.mem.eql(name, "self_inspect")
+    let command: Bool = std.mem.eql(name, "run_command")
+    let listing: Bool = std.mem.eql(name, "list_files")
+    if !read && !command && !listing {
+        return
+    }
+    var success: Bool = !std.str.startsWith(result, "Error:")
+    if command || listing {
+        success = success && app.commandResult && app.commandExitCode == 0
+    }
+    if app.workflowStage == 4 {
+        if std.str.startsWith(result, "Error: workflow") {
+            return
+        }
+        if app.workflowInspection && read || !app.workflowInspection && command {
+            app.workflowVerified = success
+            app.workflowEvidenceTurn = app.turn
+            setText(app.workflowEvidence, utf8Prefix(result, 1000_usize))
+            if !success {
+                app.workflowStage = 2
+                app.workflowObserved = false
+                app.workflowRepairs = app.workflowRepairs + 1
+                setText(app.workflowNote, "Verification failed or was denied. Diagnose the result, repair, review and verify again; use blocked if approval or another prerequisite is missing.")
+                logEntry(app, "  WORKFLOW · repair", bytes(app.workflowNote))
+            }
+        }
+    } else if app.workflowStage == 0 || app.workflowStage == 3 && !listing {
+        app.workflowObserved = success
+        app.workflowEvidenceTurn = app.turn
+        setText(app.workflowEvidence, utf8Prefix(result, 1000_usize))
+    }
+}
+
+fn workflowCanFinish(app: mutref<App>) -> Bool {
+    if !workflowActive(app) {
+        return true
+    }
+    if app.workflowStage != 4 || !app.workflowVerified || app.workflowEvidenceTurn >= app.turn {
+        toolResult(app, "Error: workflow completion requires review and a successful planned verification result received before this response. Continue the workflow or report blocked.")
+        return false
+    }
+    return true
+}
+
+fn continueWorkflow(app: mutref<App>) -> Bool {
+    if !workflowActive(app) {
+        return false
+    }
+    app.workflowNudges = app.workflowNudges + 1
+    if app.workflowNudges >= 3 {
+        failTurn(app, "Workflow incomplete: the model returned text without advancing the workflow three times. Completed changes are kept.")
+        return true
+    }
+    let message: Span<u8> = "Continue the active agentic workflow from its checkpoint. Text is not completion. Use the workflow tool and required evidence, finish_task after verification, or workflow blocked with the concrete blocker."
+    if !continuationMessage(app, message) {
+        return true
+    }
+    logEntry(app, "  WORKFLOW", "Continuing from the current checkpoint; completion still requires verification.")
+    startRequest(app)
+    return true
+}
+
+fn workflowStorage(world: World, app: mutref<App>) -> i32 {
+    var goal: [8192]u8 = [0_u8; 8192]
+    var plan: [4016]u8 = [0_u8; 4016]
+    var checkData: [2016]u8 = [0_u8; 2016]
+    var note: [4016]u8 = [0_u8; 4016]
+    var evidence: [1016]u8 = [0_u8; 1016]
+    let previousGoal: MutSpan<u8> = app.workflowGoal
+    let previousPlan: MutSpan<u8> = app.workflowPlan
+    let previousCheck: MutSpan<u8> = app.workflowCheck
+    let previousNote: MutSpan<u8> = app.workflowNote
+    let previousEvidence: MutSpan<u8> = app.workflowEvidence
+    app.workflowGoal = buffer(goal)
+    app.workflowPlan = buffer(plan)
+    app.workflowCheck = buffer(checkData)
+    app.workflowNote = buffer(note)
+    app.workflowEvidence = buffer(evidence)
+    let code: i32 = sessionLogStorage(world, app)
+    app.workflowGoal = previousGoal
+    app.workflowPlan = previousPlan
+    app.workflowCheck = previousCheck
+    app.workflowNote = previousNote
+    app.workflowEvidence = previousEvidence
+    return code
+}

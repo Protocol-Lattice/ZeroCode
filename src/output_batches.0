@@ -1,0 +1,138 @@
+fn outputTokenLimit(app: ref<App>) -> usize {
+    if app.maxOutputTokens > 0 {
+        return app.maxOutputTokens
+    }
+    if app.provider == 2 {
+        return 4096
+    }
+    return 8192
+}
+
+fn parseOutputBudget(app: mutref<App>) -> Bool {
+    if !hasArg("--max-output-tokens") {
+        return true
+    }
+    let option: Maybe<String> = std.args.valueAfter("--max-output-tokens")
+    if option.has {
+        let count: Maybe<u32> = std.parse.parseU32(option.value)
+        if count.has {
+            if count.value >= 256 && count.value <= 65536 {
+                app.maxOutputTokens = count.value as usize
+                return true
+            }
+        }
+    }
+    logEntry(app, "  !", "--max-output-tokens requires an integer from 256 to 65536. Example: zero-code --max-output-tokens 4096")
+    return false
+}
+
+fn continuationMessage(app: mutref<App>, message: Span<u8>) -> Bool {
+    if !ensureHistorySpace(app, quotedSize(message) + 128, true) {
+        failTurn(app, "Context is full. The task is incomplete; completed changes are kept.")
+        return false
+    }
+    if bufLen(app.history) > 0 {
+        put(app.history, 44_u8)
+    }
+    append(app.history, "{\"role\":\"user\",\"content\":")
+    quoted(app.history, message)
+    put(app.history, 125_u8)
+    return bufOk(app.history)
+}
+
+fn appendOutputContext(app: mutref<App>) -> Void {
+    append(app.systemContext, "\nEach model response has an output budget of ")
+    number(app.systemContext, outputTokenLimit(app))
+    append(app.systemContext, " tokens, including tool arguments and reasoning. Leave room for complete tool JSON. Long text can continue across responses when the provider reports the output limit. Never shorten the requested content merely to fit one response.")
+    if app.toolsEnabled {
+        append(app.systemContext, " For large generated files, work in small complete tool calls across responses. Edit existing files section by section. For a new large file, write an initial substantive section, then append sections with edit_file matching a unique tail from the preceding successful chunk. Receive each result before continuing. Do not replace existing files with partial content, omit requested sections, repeat an oversized full-file tool call, or declare completion until every chunk is written and checked.")
+    }
+    if app.outputBatching {
+        append(app.systemContext, "\nOutput continuation is active. Continue the original task without repeating completed output. Original user task:\n")
+        append(app.systemContext, bytes(app.workflowGoal))
+    }
+}
+
+fn recoverOutputLimit(app: mutref<App>, message: Span<u8>) -> Void {
+    let textData: MutSpan<u8> = app.arguments
+    clear(textData)
+    var tools: Bool = false
+    if app.provider == 2 {
+        let content: Span<u8> = field(message, "content")
+        var i: usize = 0
+        while i < 128 {
+            let block: Span<u8> = arrayItem(content, i)
+            if std.mem.eql(block, "null") {
+                break
+            }
+            if std.mem.eql(field(block, "type"), "\"tool_use\"") {
+                tools = true
+            }
+            if std.mem.eql(field(block, "type"), "\"text\"") {
+                if !decode(app.pending, field(block, "text")) {
+                    failTurn(app, "Truncated text exceeds the response buffer. Use a smaller output budget.")
+                    return
+                }
+                append(textData, bytes(app.pending))
+            }
+            i = i + 1
+        }
+    } else {
+        tools = !std.mem.eql(arrayItem(field(message, "tool_calls"), 0_usize), "null")
+        let content: Span<u8> = field(message, "content")
+        if !std.mem.eql(content, "null") && !decode(textData, content) {
+            failTurn(app, "Truncated text exceeds the response buffer. Use a smaller output budget.")
+            return
+        }
+    }
+    if !bufOk(textData) {
+        failTurn(app, "Truncated text exceeds the response buffer. Use a smaller output budget.")
+        return
+    }
+    clear(app.pending)
+    app.toolIndex = 0
+    app.outputBatching = true
+    if tools || bufLen(textData) == 0 {
+        app.outputTruncations = app.outputTruncations + 1
+    } else {
+        app.outputTruncations = 0
+    }
+    if app.outputTruncations >= 3 {
+        failTurn(app, "Output limit reached repeatedly without a complete operation. No partial tool calls were executed. Use smaller chunks or a larger --max-output-tokens budget.")
+        return
+    }
+    if bufLen(textData) > 0 {
+        if !app.streamVisible {
+            logEntry(app, "  ZERO", bytes(textData))
+        }
+        learningEventText(app, "assistant", bytes(textData))
+        clear(app.scratch)
+        append(app.scratch, "{\"role\":\"assistant\",\"content\":")
+        if app.provider == 2 {
+            append(app.scratch, "[{\"type\":\"text\",\"text\":")
+        }
+        quoted(app.scratch, bytes(textData))
+        if app.provider == 2 {
+            append(app.scratch, "}]")
+        }
+        put(app.scratch, 125_u8)
+        if !bufOk(app.scratch) || !appendAssistantHistory(app, bytes(app.scratch)) {
+            failTurn(app, "The output batch cannot fit in conversation memory. Use smaller output batches.")
+            return
+        }
+    }
+    var promptStorage: [1024]u8 = [0_u8; 1024]
+    let prompt: MutSpan<u8> = buffer(promptStorage)
+    append(prompt, "The provider reached its per-response output token limit. ")
+    if tools {
+        append(prompt, "The entire tool batch was discarded; NONE of its calls executed. Do not continue partial JSON or assume any of those changes happened. Retry with smaller complete tool calls, using sequential section edits across responses. ")
+    } else {
+        append(prompt, "Continue exactly where the preceding output stopped, without repeating it or restarting the task. ")
+    }
+    append(prompt, "Preserve all requested content. Finish only when the original task is complete. The same request limit and workflow gates still apply.")
+    if !continuationMessage(app, bytes(prompt)) {
+        return
+    }
+    logEntry(app, "  OUTPUT BATCH", "Output limit reached. Continuing in another model response; no partial tools executed.")
+    startRequest(app)
+}

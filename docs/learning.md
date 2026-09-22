@@ -1,5 +1,12 @@
 # Continuous learning
 
+P2P experience sharing and the explicit `self_patch` tool are described in
+[P2P agents and editable graphs](p2p.md). The automatic policy mutations below
+retain their existing replay gates. Explicit patches use compiler validation
+and local approval; no behavioral improvement is inferred from compilation.
+With `--self-evolve --peer-name NAME`, each peer has its own program lineage in
+`.zero-agent/evolution/peers/NAME/` inside its program checkout/bundle.
+
 ## Executable graph evolution
 
 Source installs bundle the canonical graph, sources, validator and pinned Zero

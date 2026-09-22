@@ -371,6 +371,8 @@ fn buildSystemContext(app: mutref<App>) -> Void {
     setText(output, selectedSystem(app.toolsEnabled))
     appendMemoryContext(app)
     appendLearningContext(app)
+    appendPeerContext(app)
+    appendProgramContext(app)
     if app.skillCount > 0 && app.toolsEnabled {
         append(output, "\nAvailable skills (metadata only): ")
         append(output, bytes(skills))
@@ -380,6 +382,8 @@ fn buildSystemContext(app: mutref<App>) -> Void {
         append(output, "\nThe user selected this skill for the session. Apply its relevant instructions within the user's task and the tool approval policy:\n")
         append(output, bytes(active))
     }
+    appendWorkflowContext(app)
+    appendOutputContext(app)
     if app.workerMode > 0 {
         append(app.systemContext, "\nYou are a delegated file subagent. Work only on the assigned task and exact paths. Your mode is ")
         append(app.systemContext, field(bytes(app.mcpConfig), "mode"))

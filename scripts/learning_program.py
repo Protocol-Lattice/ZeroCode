@@ -147,6 +147,10 @@ def copy_package(source, destination):
 def install_bundle(root, destination):
     root = root.resolve(strict=True)
     compiler = Path(os.environ.get("ZERO_COMPILER", root / ".tools/bin/zero")).resolve(strict=True)
+    # Reject an intermediate graph/projection pair before publishing a launcher.
+    # Build/export the source first; never silently import stale projections over
+    # an agent's newer graph patch while preparing an immutable installation.
+    command([compiler, "verify-projection", root], root, os.environ.copy())
     identity = source_identity(root, compiler)
     destination = private_directory(destination)
     target = destination / ("p-" + identity[:24])
@@ -163,6 +167,7 @@ def install_bundle(root, destination):
         (folder / "scripts").mkdir()
         for name in ("learning_program.py", "learning_benchmark.py"):
             shutil.copyfile(root / "scripts" / name, folder / "scripts" / name)
+        command([folder / ".tools/bin/zero", "verify-projection", folder], folder, clean_environment(Path(temporary)))
         if source_identity(folder) != identity or source_identity(root, compiler) != identity:
             raise Rejected("Source changed while preparing the installed program bundle")
         os.rename(folder, target)
@@ -190,6 +195,34 @@ def validate_patches(patches):
         if not names <= {"policy", "return", "if", "else", "true", "false"}:
             raise Rejected("Calls, loops and declarations are outside the evolution vocabulary")
     return patches
+
+
+def validate_graph_patches(patches):
+    """Explicit self_patch capability; separate from automatic scalar learning."""
+    if not isinstance(patches, list) or not 1 <= len(patches) <= 8:
+        raise Rejected("Supply one to eight existing function replacements")
+    seen = set()
+    normalized = []
+    for patch in patches:
+        if not isinstance(patch, dict) or set(patch) not in (
+                {"function", "body"}, {"function", "return_text"}):
+            raise Rejected("Each graph patch needs function and exactly one of body or return_text")
+        name = patch["function"]
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", name) or name in seen:
+            raise Rejected("Invalid or repeated function name")
+        if "return_text" in patch:
+            text = patch["return_text"]
+            if not isinstance(text, str) or any(ord(c) < 32 and c not in "\n\r\t" for c in text):
+                raise Rejected("return_text must be text with no control characters except newline, tab and carriage return")
+            # Zero supports these JSON string escapes, but not JSON's \uXXXX escapes.
+            body = "return " + json.dumps(text, ensure_ascii=False)
+        else:
+            body = patch["body"]
+        if not isinstance(body, str) or not 1 <= len(body.encode()) <= 12000 or "\0" in body:
+            raise Rejected("Function body must contain 1–12000 UTF-8 bytes without NUL")
+        seen.add(name)
+        normalized.append({"function": name, "body": body})
+    return normalized
 
 
 def validation_cases():
@@ -235,6 +268,11 @@ class ProgramStore:
     def __init__(self, root):
         self.root = root.resolve(strict=True)
         self.path = private_directory(private_directory(self.root / ".zero-agent") / "evolution")
+        peer = os.environ.get("ZERO_LEARNING_PROGRAM_PEER", "")
+        if peer:
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", peer):
+                raise Rejected("Invalid program peer name")
+            self.path = private_directory(private_directory(self.path / "peers") / peer)
         self.generations = private_directory(self.path / "generations")
         self.attempts = private_directory(self.path / "attempts")
         self.compiler = regular(self.root / ".tools/bin/zero")
@@ -279,10 +317,11 @@ class ProgramStore:
                 raise Rejected("Program evaluation is missing or changed")
         return folder
 
-    def build(self, folder, env):
+    def build(self, folder, env, execute_checks=True):
         command([self.compiler, "verify-projection", folder], folder, env)
         command([self.compiler, "build", "--target", "host", "--out", folder / "zero-code", folder], folder, env)
-        command([folder / "zero-code", "--self-test"], folder, env, timeout=20)
+        if execute_checks:
+            command([folder / "zero-code", "--self-test"], folder, env, timeout=20)
 
     def seal(self, folder, identity, parent, source, evaluation=None):
         # Compiler caches are reproducible and are not part of an executable
@@ -426,6 +465,108 @@ class ProgramStore:
         atomic_json(self.state_path, {**state, "head": target, "revision": record["revision"]})
         return record
 
+    def patch_graph(self, request):
+        """Compile an approved, explicit program change without executing it.
+
+        Automatic learning still uses the narrower replay-gated evolve path.
+        Compilability is not evidence of behavioral improvement or correctness.
+        """
+        patches = validate_graph_patches(request.get("patches"))
+        state = self.state()
+        if request.get("parent") != state["head"]:
+            raise Rejected("Stale running program; restart before editing the selected graph")
+        parent = self.generation(state["head"])
+        if len(list(self.generations.iterdir())) >= MAX_GENERATIONS:
+            raise Rejected("Program history is full; no generations were pruned")
+        identity = "g-" + uuid.uuid4().hex
+        with tempfile.TemporaryDirectory(prefix=".patch-", dir=self.path) as temporary:
+            temporary = Path(temporary)
+            candidate = temporary / "package"
+            copy_package(parent, candidate)
+            env = clean_environment(temporary)
+            changes = []
+            for index, patch in enumerate(patches):
+                body = temporary / f"body-{index}.0"
+                body.write_text(patch["body"] + "\n")
+                before = command([self.compiler, "view", "--fn", patch["function"], candidate], candidate, env)
+                try:
+                    command([self.compiler, "patch", candidate, "--replace-fn", patch["function"], "--body-file", body], candidate, env)
+                except Rejected as error:
+                    # Keep changing temporary paths out of the diagnostic and put
+                    # the compiler's useful error before its lengthy source row.
+                    diagnostic = str(error).replace(str(candidate), "<candidate>")
+                    marker = "program graph patch failed: "
+                    if marker in diagnostic:
+                        diagnostic = diagnostic.split(marker, 1)[1]
+                    raise Rejected(f"{patch['function']}: {diagnostic}") from None
+                after = command([self.compiler, "view", "--fn", patch["function"], candidate], candidate, env)
+                changes.append({"function": patch["function"], "before": before, "after": after})
+            command([self.compiler, "export", candidate], candidate, env)
+            self.build(candidate, env, execute_checks=False)
+            evaluation = {"accepted": True, "parent": state["head"], "version": identity,
+                          "kind": "explicit-self-patch", "validation": "compiler-only",
+                          "runtime_executed": False, "changes": changes}
+            if self.state() != state:
+                raise Rejected("Program changed during compilation")
+            self.generation(state["head"])
+            self.seal(candidate, identity, state["head"], state["source"], evaluation)
+            atomic_json(self.state_path, {**state, "head": identity, "revision": state["revision"] + 1})
+        return {"accepted": True, "version": identity, "parent": state["head"],
+                "validation": "compiler-only", "runtime_executed": False,
+                "graph_path": str(self.generations / identity / "zero.graph"),
+                "message": "Compiled zero.graph selected for the next launch. Restart to activate; rollback is available."}
+
+    def inspect_graph(self, request):
+        """Read canonical function source from a validated executable generation."""
+        if not isinstance(request, dict):
+            raise Rejected("Invalid graph inspection request")
+        arguments = request.get("arguments")
+        if not isinstance(arguments, dict) or set(arguments) - {"function", "target", "offset", "limit"}:
+            raise Rejected("Supply function and optional target, offset and limit")
+        name = arguments.get("function")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", name):
+            raise Rejected("Supply an existing function name, for example helpText")
+        target = arguments.get("target", "running")
+        if target not in ("running", "selected"):
+            raise Rejected("Graph inspection target must be running or selected")
+        offset, limit = arguments.get("offset", 0), arguments.get("limit", 8000)
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 4 <= limit <= 12000:
+            raise Rejected("Offset must be nonnegative; limit must be from 4 to 12000 bytes")
+        state = self.state()
+        version = state["head"] if target == "selected" else request.get("version")
+        folder = self.generation(version)
+        # Read the graph itself, so this never depends on the task workspace,
+        # .gitignore, source projections, or caller-supplied filesystem paths.
+        with tempfile.TemporaryDirectory(prefix="zero-inspect-") as temporary:
+            source = command([self.compiler, "view", "--fn", name, folder / "zero.graph"],
+                             folder, clean_environment(Path(temporary)), timeout=20)
+        data = source.encode("utf-8")
+        if offset > len(data):
+            raise Rejected("Offset is beyond the function source")
+        try:
+            data[:offset].decode("utf-8")
+        except UnicodeDecodeError:
+            raise Rejected("Offset must be a UTF-8 boundary; use next_offset") from None
+        end = min(offset + limit, len(data))
+        while True:
+            try:
+                content = data[offset:end].decode("utf-8")
+            except UnicodeDecodeError:
+                end -= 1
+                continue
+            result = {"ok": True, "function": name, "version": version,
+                      "selected_version": state["head"], "target": target,
+                      "graph_path": str(folder / "zero.graph"), "content": content,
+                      "offset": offset, "next_offset": end, "total_bytes": len(data),
+                      "truncated": end < len(data)}
+            # Escaping also consumes the TUI's 16 KiB result buffer. Page by the
+            # actual serialized size, retaining complete UTF-8 code points.
+            if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= 14000:
+                return result
+            if end <= offset + 4:
+                raise Rejected("Graph inspection metadata exceeds the result limit")
+            end = offset + (end - offset) * 3 // 4
+
     def history(self):
         state = self.state()
         versions = [read_json(self.generation(path.name) / "generation.json")
@@ -441,24 +582,44 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--run", action="store_true")
     mode.add_argument("--request")
+    mode.add_argument("--request-stdin", action="store_true")
+    mode.add_argument("--inspect")
     mode.add_argument("--bundle", type=Path)
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    is_request = args.request is not None or args.request_stdin
     store = None
     request = None
     try:
         if args.bundle is not None:
             print(install_bundle(args.root, args.bundle))
             return 0
+        if args.run:
+            # Equal peers have separate executable lineages even in one checkout.
+            if "--peer-name" in args.arguments:
+                index = args.arguments.index("--peer-name")
+                if index + 1 >= len(args.arguments):
+                    raise Rejected("--peer-name requires a name")
+                os.environ["ZERO_LEARNING_PROGRAM_PEER"] = args.arguments[index + 1]
         store = ProgramStore(args.root)
+        if is_request:
+            # Function bodies exceed Zero's argv buffer; read bounded input before locking.
+            payload = (sys.stdin.buffer.read(65537) if args.request_stdin
+                       else args.request.encode("utf-8"))
+            if len(payload) > 65536:
+                raise Rejected("Oversized evolution request")
         with store.locked():
-            if args.request:
-                if len(args.request.encode()) > 16384:
-                    raise Rejected("Oversized evolution request")
-                request = json.loads(args.request)
-                if not isinstance(request, dict) or request.get("action") != "evolve":
+            if args.inspect is not None:
+                if len(args.inspect.encode()) > 8192:
+                    raise Rejected("Oversized graph inspection request")
+                result = store.inspect_graph(json.loads(args.inspect))
+                print(json.dumps(result, ensure_ascii=False))
+                return 0
+            if is_request:
+                request = json.loads(payload.decode("utf-8"))
+                if not isinstance(request, dict) or request.get("action") not in ("evolve", "patch"):
                     raise Rejected("Unknown evolution action")
-                result = store.evolve(request)
+                result = store.patch_graph(request) if request["action"] == "patch" else store.evolve(request)
                 atomic_json(store.attempts / ("accepted-" + uuid.uuid4().hex + ".json"), result)
                 print(json.dumps(result))
                 return 0
@@ -479,11 +640,20 @@ def main():
             env = os.environ.copy()
             env["ZERO_LEARNING_PROGRAM_ROOT"] = str(store.root)
             env["ZERO_LEARNING_PROGRAM_VERSION"] = state["head"]
+            env["ZERO_LEARNING_PROGRAM_GRAPH_DIR"] = str(executable.parent)
         # Release the lock before the task; its final experience can now evolve.
         os.execve(executable, [str(executable), *arguments], env)
     except (Rejected, OSError, ValueError, KeyError, TypeError, RuntimeError,
             subprocess.TimeoutExpired) as error:
+        if args.inspect is not None:
+            print(json.dumps({"ok": False, "reason": str(error)[:3500]}))
+            return 1
         result = {"accepted": False, "reason": str(error)[:3500]}
+        if isinstance(request, dict) and request.get("action") == "patch":
+            result["hint"] = ("For a String-returning function such as systemPrompt, use return_text "
+                              "with plain text instead of body. For body, copy Zero syntax from self_inspect: "
+                              "return followed by a quoted string, no trailing semicolon, signature or Markdown fences. "
+                              "Correct the cause before retrying.")
         if request is not None and store is not None:
             result["parent"] = request.get("parent") if isinstance(request, dict) else None
             try:
@@ -493,7 +663,7 @@ def main():
                 pass
         print(json.dumps(result))
         # Rejections are data to the learner; launch errors are CLI failures.
-        return 0 if args.request else 1
+        return 0 if is_request else 1
 
 
 if __name__ == "__main__":

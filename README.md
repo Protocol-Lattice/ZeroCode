@@ -16,28 +16,39 @@ A terminal coding assistant built with **Zero**, with native file tools, streami
 - **Lightweight** – native executable using the system libcurl for HTTP/TLS
 - **Native execution** – compiled directly to native code via the Zero compiler
 - **Agent integration** – supports multiple LLM providers (OpenAI, Claude, Gemini, OpenRouter)
+- **Peer learning** – equal P2P nodes replicate durable failure lessons, apply local guards and show live synchronization in `/peers`
+- **1M context budget** – configurable token budgeting, provider usage calibration and multi-megabyte history; `/context` shows the estimate and actual reported usage
+- **Agentic workflow** – optional discovery, planning, implementation, review and verification stages, with repairs driven by tool results
 - **Streaming** – incremental text and tool-call deltas for all four providers, with cancellation
 - **Large files** – UTF-8 range reads and approved edits of files up to 64 MiB
 - **Bounded context** – automatic shortening of old tool output and a digest of older exchanges
 - **Project memory** – automatic task recaps and saved facts persist across sessions, with commands to inspect and forget them
 - **Validated learning** – structured task experience, isolated policy replay, immutable strategy versions, and rollback are part of the normal prompt lifecycle
 - **Executable evolution** – rewrite strategy functions in staged `zero.graph` generations, compile and compare both programs, then select improvements for the next launch
+- **Explicit self-editing** – read your executable graph with `self_inspect`, including installed bundles outside the task workspace; an approved `self_patch` replaces existing functions, compiles a new generation and selects it for restart; named peers have separate program histories
 - **Host builds** – Linux and macOS builds using the pinned Zero compiler and system libcurl
 
 See [continuous learning](docs/learning.md) for the mutation gates, scope
 promotion, supported policy changes, experience storage, and rollback commands.
+See [P2P agents and editable graphs](docs/p2p.md) for mesh setup, the learning
+protocol, context limits and the distinction between automatic learning and
+explicit program patches.
 
 ## Project Structure
 
 ```
 zero-code/
 ├── src/main.0          # Application state, task loop, approvals, startup
+├── src/workflow.0      # Agentic stages, review/verification gates and repair loop
 ├── src/buffers.0       # Bounded buffers, JSON and UTF-8 helpers
 ├── src/workspace.0     # Path checks, range reads and atomic file edits
 ├── src/providers.0     # Provider configuration and request/response mapping
 ├── src/streaming.0     # SSE parsing and incremental message assembly
 ├── src/stream_arguments.0 # Separate buffers for streamed tool arguments
 ├── src/context.0       # History, tool results and automatic compaction
+├── src/context_budget.0 # 1M token target, provider calibration and context status
+├── src/peers.0         # Collective lessons, local admission and tool guards
+├── src/self_graph.0    # Approved edits of the executable program graph
 ├── src/memory.0         # Persistent project facts, approvals and atomic storage
 ├── src/logs.0           # Automatic local session journals and key redaction
 ├── src/learning.0       # Semantic strategy graph, evidence, replay gates and versions
@@ -48,6 +59,7 @@ zero-code/
 ├── native/http_stream.c # HTTP transport worker
 ├── native/session_log.c # Bounded native append writer
 ├── native/learning_store.c # Private journals and atomic graph transactions
+├── native/peer_network.c # Symmetric authenticated gossip and durable set union
 ├── tests/              # Black-box tests of the compiled binary
 ├── zero.toml           # Package manifest
 ├── zero.graph          # Canonical Zero program graph
@@ -164,6 +176,14 @@ The application supports four LLM providers:
 - `--provider <name>` – Select the AI provider (openai, claude, gemini, openrouter)
 - `--model <model>` – Choose a model (default: provider-specific)
 - `--max-turns <N>` – Maximum conversation turns
+- `--max-output-tokens <N>` – Tokens per model response (256–65536); output that hits the limit continues in another response
+- `--context-window <N>` – Total input/output budget (16384–1000000, default 1000000); choose a model supporting the requested window
+- `--peer-port <N>` / `--peer` – Start the P2P listener on a fixed/available port
+- `--peer-name <NAME>` – Persistent node identity and separate executable lineage
+- `--peers <URL,URL>` – Bootstrap links to equal peers; requires a shared `ZERO_PEER_TOKEN`
+- `--peer-bind <IPv4>` – Listener address (default loopback); use HTTPS proxies for remote seeds
+- `--no-peers` – Disable peer networking for this run
+- `--workflow agentic|off` – Enable the built-in development loop (default: off)
 - `--parallel <N>` – Concurrent file workers or model subagents (1–4, default 4)
 - `--cwd <dir>` – Working directory for the agent
 - `--no-memory` – Disable reading and changing saved project memory for this run
@@ -189,6 +209,14 @@ The application supports four LLM providers:
 ```
 
 ## Parallel work and subagents
+
+For a structured Superpowers-inspired development loop, enable
+`--workflow agentic` or enter `/workflow agentic` in the TUI. The coordinator
+discovers the workspace, records a plan, implements it, reviews the changes and
+verifies the result before finishing. Failed verification returns to
+implementation. `/workflow` shows the current checkpoint; `/workflow off`
+restores direct mode. See [agentic workflow](docs/workflow.md) for the stage gates,
+inspection mode for documentation, request limits and repair behavior.
 
 The coordinator can call `delegate_tasks` to run up to four independent model
 subagents. Each task declares a prompt, a mode (`read`, `write`, or `edit`), and
@@ -246,10 +274,24 @@ Requests enable streaming. Text appears while the model responds, in both the
 TUI and `--prompt` mode. Tool arguments and provider metadata are assembled across
 SSE events; tools run only after the response completes successfully. `Esc`
 cancels the worker and restores the conversation to the beginning of the task.
-Providers that return ordinary JSON are also supported. An incomplete stream,
+Providers that return ordinary JSON are also supported. When a provider reports
+its output token limit, ZeroCode retains completed text and requests the next
+batch automatically. A truncated tool batch is discarded in full and retried
+as smaller complete operations; partial tool arguments never execute. Use
+`--max-output-tokens N` to set the per-response budget (default: 4096 for Claude,
+8192 for the other providers). Continuations share `--max-turns`; three
+consecutive truncated tool or empty responses stop with an error. This works in
+direct, agentic and chat-only modes, and subagents inherit the selected budget.
+Large file generation uses successive small writes/section edits, with each
+tool call completing normally. Older tool history still has its separate
+compaction budget.
+
+An incomplete stream,
 invalid JSON, or an HTTP/transport error ends the task without executing partial
 tool calls. The transport allows 64 MiB of incoming data, with 64 KiB per SSE event
-and a 14 MiB assembled response buffer, including JSON escaping of file content.
+and a 12 MiB response buffer and final assembly arena, including JSON
+escaping of file content. History has a separate 6 MiB storage ceiling and the
+configured token budget; use `/context` for the current values.
 Each HTTP request has a 360-second deadline. The application allows ten additional
 seconds for worker cleanup, so slow responses are not cut off after 100 seconds.
 `Esc` still cancels immediately; shell commands retain their 60-second limit.
