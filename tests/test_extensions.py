@@ -49,8 +49,7 @@ class ExtensionTests(unittest.TestCase):
                     result = self.run_agent(api, provider, root, extra=("--mcp", "all", "--approve", "--no-skills"))
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(len(api.requests), 3)
-                    definitions = api.requests[0][1]["tools"]
-                    names = [(tool if provider == "claude" else tool["function"])["name"] for tool in definitions]
+                    names = [tool["name"] for tool in agent.function_tools(api.requests[0][1], provider)]
                     self.assertIn("mcp__demo__0_echo", names)
                     self.assertIn("mcp__demo__1_path_query", names)
                     history = json.dumps(api.requests[-1][1]["messages"], ensure_ascii=False)
@@ -79,7 +78,7 @@ class ExtensionTests(unittest.TestCase):
             with MockAPI([reply("openrouter", "Builtin only.")]) as api:
                 result = self.run_agent(api, directory=root, extra=("--no-skills",))
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(len(api.requests[0][1]["tools"]), 8)
+                self.assertEqual(len(agent.function_tools(api.requests[0][1], "openrouter")), 9)
                 self.assertFalse((root / "demo.pid").exists())
             with MockAPI([reply("openrouter", calls=[("mcp__demo__0_echo", {"text": "not approved"})]),
                           reply("openrouter", "Denied.")]) as api:
@@ -210,7 +209,7 @@ class ExtensionTests(unittest.TestCase):
                 result = self.run_agent(api, directory=root, extra=("--no-skills",))
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertNotIn("review-docs", json.dumps(api.requests[0][1]))
-                self.assertEqual(len(api.requests[0][1]["tools"]), 8)
+                self.assertEqual(len(agent.function_tools(api.requests[0][1], "openrouter")), 9)
             with MockAPI([reply("openrouter", "TUI skill selected.")]) as api:
                 terminal = Terminal(["--cwd", folder], environment(api.url), rows=40, columns=140)
                 try:

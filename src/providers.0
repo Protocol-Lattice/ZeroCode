@@ -141,6 +141,9 @@ fn requestBody(app: mutref<App>) -> Void {
     if app.toolsEnabled {
         append(scratchData, ",\"tools\":")
         appendTools(scratchData, app.provider, app)
+        if app.provider == 0 && app.workerMode == 0 {
+            append(scratchData, ",\"max_tool_calls\":5")
+        }
     }
     append(scratchData, ",\"stream\":true}")
 }

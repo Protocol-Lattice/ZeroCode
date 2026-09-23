@@ -44,14 +44,14 @@ selected generation's compiled executable. Qualifying experience drives:
 ```
 task → experience → function replacement → staged zero.graph
      → native build + self-test → paired executable replay → atomic HEAD
-     → next launch runs the accepted program
+     → live module activation at the next event-loop boundary
 ```
 
 `src/learning.0` authors function replacements from measured experience.
 `scripts/learning_program.py` invokes the compiler, manages isolated working
 directories, validates the executables, and publishes generations. It runs
 `zero patch --replace-fn`, exports the readable projection, verifies consistency,
-builds the entire program, and runs its native self-test.
+builds the entire program plus a loadable native module, and runs its native self-test.
 
 The initial mutation targets are `learningWindowValue(policy)` and
 `learningRetryValue(policy)`. Complete default-window ASCII reads can propose a
@@ -81,13 +81,25 @@ themselves are ordinary local processes.
 
 Program history lives in the **program bundle or checkout's** `.zero-agent/evolution/`.
 Each generation retains its complete `zero.graph`, readable projection, native
-sources, manifest, compiled executable, hashes and paired evaluation report.
+sources, manifest, compiled executable, live module, hashes and paired evaluation report.
 Publication holds an OS lock and checks the expected parent and source identity
-again before moving `head.json`. A running session keeps its executable; the next
-launcher selects the new graph and binary together through that single pointer.
-Artifact hashes are checked before execution. Rollback selects an archived
-generation without deleting later history. At most 32 generations are retained;
+again before moving `head.json`. The accepting session verifies the module hash,
+loads it, and switches to its event-loop callback before the next tool or model
+request. The process, conversation, approvals, terminal, MCP connections, peer
+listener and session journal stay alive. New workers use the active generation's
+executable; already running workers finish with their original code. Later
+launches select the saved graph and executable through the same pointer.
+Artifact hashes are checked before execution and live activation. Rollback selects
+an archived generation without deleting later history. At most 32 generations are retained;
 reaching that limit stops publication rather than pruning history.
+
+The stable host retains session storage and native resources. Old code images
+remain mapped because session data can reference their constant strings. Function
+replacements take effect on subsequent calls through the new event loop; already
+completed startup work is not replayed. A load or integrity failure leaves the
+running code unchanged and reports that the saved generation was not activated.
+Other sessions do not automatically adopt a changed HEAD, including an external
+rollback; their proposals still have to match their running parent.
 
 The program bundle or checkout remains the baseline; evolution never overwrites it.
 Editing its graph, projection, native sources or validation driver invalidates
@@ -100,12 +112,14 @@ read/retry defaults even in an evolved binary. Workers inherit the selected
 strategy and cannot evolve programs.
 
 The integration test checks a global source install, operation after deleting the
-original checkout, real graph rewrites, compilation, a restart from seven reads
-to five and three invalid attempts to two, rejection of a compiled regression,
-integrity checks, and rollback:
+original checkout, real graph rewrites, compilation, fewer reads and retries,
+rejection of a compiled regression, integrity checks, and rollback. Live-session
+tests also exercise consecutive explicit patches, immediate prompt/tool/UI
+changes, preserved MCP connections, and seven reads becoming five on the next
+task in the same TUI:
 
 ```sh
-python3 -m unittest tests.test_learning_program -v
+python3 -m unittest tests.test_live_program tests.test_learning_program -v
 ```
 
 ## Standalone binary policy learning

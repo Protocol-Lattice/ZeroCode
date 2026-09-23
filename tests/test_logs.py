@@ -187,7 +187,8 @@ class SessionLogTests(unittest.TestCase):
                 self.assertIn("SESSION LOG UNAVAILABLE", result.stdout)
                 self.assertEqual(list(Path(outside).iterdir()), [])
         with tempfile.TemporaryDirectory() as folder:
-            terminal = Terminal(["--cwd", folder], environment(keys=False))
+            # Keep the warning above the complete status/context report visible.
+            terminal = Terminal(["--cwd", folder], environment(keys=False), rows=48)
             try:
                 terminal.wait_for("Your terminal.")
                 path = journals(folder)[0]

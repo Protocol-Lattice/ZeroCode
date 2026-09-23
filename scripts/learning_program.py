@@ -2,8 +2,8 @@
 """Compiler-backed program evolution. The Zero learner supplies the proposals.
 
 Every accepted generation is a complete, independently buildable Zero package.
-Only HEAD is mutable; it selects a graph, projection, executable and evaluation
-as one unit. Candidate code never runs in the user's task workspace.
+Only HEAD is mutable; it selects a graph, projection, executable, live module and
+evaluation as one unit. Accepted code activates at the next session boundary.
 """
 import argparse
 from contextlib import contextmanager
@@ -311,6 +311,8 @@ class ProgramStore:
             raise Rejected("Program graph or projection changed after validation")
         if info.get("executable") != digest(regular(folder / "zero-code")):
             raise Rejected("Program executable changed after validation")
+        if info.get("module") != digest(regular(folder / "zero-live.so")):
+            raise Rejected("Program live module changed after validation")
         if name != "base":
             evaluation = read_json(folder / "evaluation.json")
             if info.get("evaluation") != digest(folder / "evaluation.json") or evaluation.get("accepted") is not True:
@@ -319,7 +321,27 @@ class ProgramStore:
 
     def build(self, folder, env, execute_checks=True):
         command([self.compiler, "verify-projection", folder], folder, env)
-        command([self.compiler, "build", "--target", "host", "--out", folder / "zero-code", folder], folder, env)
+        # Export the host runtime/native services for dynamically loaded Zero
+        # code. They must exist exactly once (MCP children, logs, peers, etc.).
+        # The wrapper is private and shell-free, including installation paths
+        # with whitespace or shell metacharacters.
+        with tempfile.TemporaryDirectory(prefix="zero-link-") as temporary:
+            wrapper = Path(temporary) / "cc"
+            wrapper.write_text("#!/usr/bin/env python3\nimport os, sys\n"
+                               "args = sys.argv[1:]\n"
+                               "flags = ['-fPIC'] if '-c' in args else "
+                               "(['-Wl,-export_dynamic'] if sys.platform == 'darwin' else ['-rdynamic'])\n"
+                               "os.execvp('cc', ['cc', *flags, *args])\n")
+            wrapper.chmod(0o700)
+            command([self.compiler, "build", "--target", "host", "--out", folder / "zero-code", folder],
+                    folder, {**env, "ZERO_CC": str(wrapper)})
+            obj = Path(temporary) / "program.o"
+            command([self.compiler, "build", "--emit", "obj", "--target", "host", "--out", obj, folder], folder, env)
+            flags = (["-dynamiclib", "-Wl,-undefined,dynamic_lookup"] if sys.platform == "darwin"
+                     else ["-shared", "-Wl,-Bsymbolic", "-Wl,-z,notext"])
+            command(["cc", *flags, obj, "-o", folder / "zero-live.so"], folder, env)
+        if (folder / "zero-live.so").stat().st_size >= 4 * 1024 * 1024:
+            raise Rejected("Live module exceeds the 4 MiB activation limit")
         if execute_checks:
             command([folder / "zero-code", "--self-test"], folder, env, timeout=20)
 
@@ -331,13 +353,14 @@ class ProgramStore:
             shutil.rmtree(cache)
         info = {"schema": 1, "id": identity, "parent": parent, "source": source,
                 "files": hashes(folder), "executable": digest(folder / "zero-code"),
+                "module": digest(folder / "zero-live.so"),
                 "created": int(time.time())}
         if evaluation is not None:
             atomic_json(folder / "evaluation.json", evaluation)
             info["evaluation"] = digest(folder / "evaluation.json")
         atomic_json(folder / "generation.json", info)
         # Flush graph, projection and executable before HEAD can refer to them.
-        for path in [*package_files(folder), folder / "zero-code"]:
+        for path in [*package_files(folder), folder / "zero-code", folder / "zero-live.so"]:
             with path.open("rb") as handle:
                 os.fsync(handle.fileno())
         for directory in [path for path in folder.rglob("*") if path.is_dir()] + [folder]:
@@ -421,7 +444,7 @@ class ProgramStore:
         validate_patches(request.get("patches"))
         state = self.state()
         if request.get("parent") != state["head"]:
-            raise Rejected("Stale running program; restart before proposing another generation")
+            raise Rejected("Stale running program; another session changed the selected generation")
         evidence = self.evidence(request)
         parent = self.generation(state["head"])
         if len(list(self.generations.iterdir())) >= MAX_GENERATIONS:
@@ -452,9 +475,15 @@ class ProgramStore:
             self.generation(state["head"])
             self.seal(candidate, identity, state["head"], state["source"], evaluation)
             atomic_json(self.state_path, {**state, "head": identity, "revision": state["revision"] + 1})
-        return {"accepted": True, "version": identity, "parent": state["head"],
-                "message": "Validated executable graph selected for the next launch.",
+        return {**self.activation(identity), "parent": state["head"],
+                "message": "Validated executable graph ready for live activation in this session.",
                 "metrics": report["totals"]}
+
+    def activation(self, identity):
+        folder = self.generation(identity)
+        return {"accepted": True, "version": identity, "activation": "live",
+                "generation_dir": str(folder), "graph_path": str(folder / "zero.graph"),
+                "module_sha256": digest(folder / "zero-live.so")}
 
     def rollback(self, target):
         state = self.state()
@@ -474,7 +503,7 @@ class ProgramStore:
         patches = validate_graph_patches(request.get("patches"))
         state = self.state()
         if request.get("parent") != state["head"]:
-            raise Rejected("Stale running program; restart before editing the selected graph")
+            raise Rejected("Stale running program; another session changed the selected generation")
         parent = self.generation(state["head"])
         if len(list(self.generations.iterdir())) >= MAX_GENERATIONS:
             raise Rejected("Program history is full; no generations were pruned")
@@ -511,10 +540,9 @@ class ProgramStore:
             self.generation(state["head"])
             self.seal(candidate, identity, state["head"], state["source"], evaluation)
             atomic_json(self.state_path, {**state, "head": identity, "revision": state["revision"] + 1})
-        return {"accepted": True, "version": identity, "parent": state["head"],
+        return {**self.activation(identity), "parent": state["head"],
                 "validation": "compiler-only", "runtime_executed": False,
-                "graph_path": str(self.generations / identity / "zero.graph"),
-                "message": "Compiled zero.graph selected for the next launch. Restart to activate; rollback is available."}
+                "message": "Compiled zero.graph ready for live activation in this session; rollback is available."}
 
     def inspect_graph(self, request):
         """Read canonical function source from a validated executable generation."""

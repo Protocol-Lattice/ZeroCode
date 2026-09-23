@@ -33,8 +33,10 @@ fi
 # fragments (up to 14 MiB with escaping). Keep the patch exact and repeatable;
 # the application reserves a 64 MiB stack before entering its buffer frames.
 node "$project_dir/scripts/configure-zero-buffers.mjs" "$source_dir/native/zero-c/include/zero.h"
+node "$project_dir/scripts/configure-zero-live.mjs" "$source_dir/native/zero-c/src/c_import.c"
 make -C "$source_dir/native/zero-c"
 cp "$source_dir/.zero/bin/zero" "$project_dir/.tools/bin/zero"
 printf '%s\n' "$revision" > "$project_dir/.tools/compiler-revision"
 printf '%s\n' '16777216' > "$project_dir/.tools/compiler-frame-limit"
+printf '%s\n' '2' > "$project_dir/.tools/compiler-live-abi"
 printf '\nCompiler ready. Run ./scripts/build.sh, then ./dist/zero-code.\n'

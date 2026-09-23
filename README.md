@@ -20,6 +20,7 @@ A terminal coding assistant built with **Zero**, with native file tools, streami
 - **1M context budget** – configurable token budgeting, provider usage calibration and multi-megabyte history; `/context` shows the estimate and actual reported usage
 - **Agentic workflow** – optional discovery, planning, implementation, review and verification stages, with repairs driven by tool results
 - **Streaming** – incremental text and tool-call deltas for all four providers, with cancellation
+- **Internet access** – built-in `web_fetch` retrieves web pages and text APIs by URL for all four providers
 - **Large files** – UTF-8 range reads and approved edits of files up to 64 MiB
 - **Bounded context** – automatic shortening of old tool output and a digest of older exchanges
 - **Project memory** – automatic task recaps and saved facts persist across sessions, with commands to inspect and forget them
@@ -44,6 +45,7 @@ zero-code/
 ├── src/workspace.0     # Path checks, range reads and atomic file edits
 ├── src/providers.0     # Provider configuration and request/response mapping
 ├── src/streaming.0     # SSE parsing and incremental message assembly
+├── src/web.0           # URL fetching, validation and bounded text results
 ├── src/stream_arguments.0 # Separate buffers for streamed tool arguments
 ├── src/context.0       # History, tool results and automatic compaction
 ├── src/context_budget.0 # 1M token target, provider calibration and context status
@@ -57,6 +59,7 @@ zero-code/
 ├── src/skill_fetch.0   # Repository fetching and project skill imports
 ├── src/ui.0            # Terminal rendering and keyboard input
 ├── native/http_stream.c # HTTP transport worker
+├── native/web_fetch.c   # Read-only HTTP/HTTPS GET worker
 ├── native/session_log.c # Bounded native append writer
 ├── native/learning_store.c # Private journals and atomic graph transactions
 ├── native/peer_network.c # Symmetric authenticated gossip and durable set union
@@ -345,6 +348,34 @@ Large file arguments remain intact for execution but their text is replaced by a
 explicit omission notice in subsequent model history. Paths, call IDs, metadata,
 and results are retained. Calls whose arguments exceed the worker batch buffer
 run sequentially. Provider output-token limits still apply independently.
+
+## Internet access
+
+The built-in `web_fetch` tool lets Zero read a web page or text API by URL with
+any supported provider. It is available automatically when tools are enabled;
+no MCP server, extra API key, shell command, or `--approve` flag is needed.
+
+```sh
+zero-code --prompt 'Fetch https://example.com and summarize the page.'
+```
+
+The model calls `web_fetch` with a required `url`, optional `max_bytes` (4–12,000,
+default 8,000), and optional `timeout_seconds` (1–60, default 30). Successful
+results contain `url`, `effective_url`, HTTP `status`, `content_type`, `content`,
+and `truncated`. Cite `effective_url` when using the retrieved information.
+
+Requests use HTTP/HTTPS GET, verify TLS certificates, and follow up to five
+HTTP/HTTPS redirects. Text, HTML, JSON and XML are returned as UTF-8; HTML stays
+as source without running JavaScript. Binary responses and URLs with embedded
+credentials are rejected. Provider keys, cookies and `.netrc` credentials are
+not sent. HTTP errors, connection failures and timeouts become tool errors.
+
+Downloads stop at the content limit, including decompressed responses. Content
+may be shortened further so the complete JSON result fits within 16 KiB; check
+`truncated` before treating a page as complete. Press **Esc** to cancel a fetch.
+`--chat-only` and `/tools off` disable it. Delegated file workers keep their
+existing file-only scope. Retrieved content is reference data, not instructions.
+OpenRouter's existing hosted web-search integration remains separate.
 
 ## Project memory
 

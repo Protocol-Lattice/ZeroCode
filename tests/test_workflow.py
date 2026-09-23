@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 
-from tests.test_agent import EXE, MockAPI, Terminal, environment, reply
+from tests.test_agent import EXE, MockAPI, Terminal, environment, function_tools, reply
 
 
 def step(action, summary="Requirements, implementation and edge cases checked.", **fields):
@@ -61,8 +61,7 @@ class WorkflowTests(unittest.TestCase):
                     self.assertEqual(len(api.requests), 5)
                     self.assertEqual(Path(folder, "result.txt").read_text(), "verified")
                     self.assertIn("TASK COMPLETE", run.stdout)
-                    tools = api.requests[0][1]["tools"]
-                    names = [(t if provider == "claude" else t["function"])["name"] for t in tools]
+                    names = [t["name"] for t in function_tools(api.requests[0][1], provider)]
                     self.assertIn("workflow", names)
                     last = system(api.requests[-1][1])
                     self.assertIn("Stage: verify", last)
@@ -305,7 +304,7 @@ class WorkflowTests(unittest.TestCase):
                 terminal.wait_for("Workflow disabled")
                 terminal.send("A plain answer please.\r")
                 terminal.wait_for("Direct answer.")
-                self.assertNotIn("workflow", [t["function"]["name"] for t in api.requests[6][1]["tools"]])
+                self.assertNotIn("workflow", [t["name"] for t in function_tools(api.requests[6][1], "openrouter")])
             finally:
                 terminal.close()
 

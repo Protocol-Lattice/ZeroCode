@@ -46,6 +46,9 @@ fn toolLabel(output: MutSpan<u8>, name: Span<u8>, args: Span<u8>) -> Void {
     } else if decode(target, field(args, "function")) {
         append(output, " ")
         workerLabel(output, bytes(target), 128_usize)
+    } else if decode(target, field(args, "url")) {
+        append(output, " ")
+        workerLabel(output, bytes(target), 160_usize)
     } else if decode(target, field(args, "query")) {
         append(output, " \"")
         workerLabel(output, bytes(target), 100_usize)
@@ -118,13 +121,25 @@ fn toolResultSummary(output: MutSpan<u8>, name: Span<u8>, args: Span<u8>, result
             append(output, " · ")
             append(output, bytes(saved))
         }
-        append(output, " · restart to activate")
+        append(output, " · activating in this session")
         if decode(saved, field(result, "graph_path")) {
             put(output, 10_u8)
             append(output, bytes(saved))
         }
     } else if std.mem.eql(name, "read_file") {
         readResultSummary(output, args, result)
+    } else if std.mem.eql(name, "web_fetch") {
+        append(output, "HTTP ")
+        append(output, field(result, "status"))
+        var webStorage: [12016]u8 = [0_u8; 12016]
+        let content: MutSpan<u8> = buffer(webStorage)
+        if decode(content, field(result, "content")) {
+            append(output, " · ")
+            displayBytes(output, bufLen(content))
+        }
+        if std.mem.eql(field(result, "truncated"), "true") {
+            append(output, " · truncated")
+        }
     } else if std.mem.eql(name, "write_file") {
         var writeStorage: [1000016]u8 = [0_u8; 1000016]
         let content: MutSpan<u8> = buffer(writeStorage)

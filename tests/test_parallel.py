@@ -32,8 +32,7 @@ def results(body, provider):
 
 
 def advertised_tools(body, provider):
-    return {tool["name"] if provider == "claude" else tool["function"]["name"]
-            for tool in body.get("tools", [])}
+    return {tool["name"] for tool in agent.function_tools(body, provider)}
 
 
 def start_agent(api, folder, provider="openrouter", extra=(), prompt="ROOT_PARALLEL_TASK"):

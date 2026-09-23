@@ -10,6 +10,10 @@ if [ -z "${ZERO_COMPILER:-}" ] && { [ ! -f "$project_dir/.tools/compiler-frame-l
     printf 'Update the pinned compiler for 1000 KB file tools: ./scripts/setup-zero.sh\n' >&2
     exit 1
 fi
+if [ -z "${ZERO_COMPILER:-}" ] && { [ ! -f "$project_dir/.tools/compiler-live-abi" ] || [ "$(cat "$project_dir/.tools/compiler-live-abi")" != 2 ]; }; then
+    printf 'Update the pinned compiler for live evolution: ./scripts/setup-zero.sh\n' >&2
+    exit 1
+fi
 cd "$project_dir"
 mkdir -p dist
 "$compiler" build --target host --out "$project_dir/dist/zero-code"

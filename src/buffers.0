@@ -339,7 +339,7 @@ fn inspectSelfGraph(app: mutref<App>) -> Void {
     var requestStorage: [8192]u8 = [0_u8; 8192]
     let request: MutSpan<u8> = buffer(requestStorage)
     append(request, "{\"version\":")
-    quoted(request, learningProgramVersion())
+    quoted(request, learningProgramVersion(app))
     append(request, ",\"arguments\":")
     append(request, bytes(app.arguments))
     put(request, 125_u8)

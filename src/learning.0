@@ -253,7 +253,10 @@ fn learningProgramEnabled() -> Bool {
     return std.mem.len(std.env.getOr("ZERO_LEARNING_PROGRAM_ROOT", "")) > 0
 }
 
-fn learningProgramVersion() -> Span<u8> {
+fn learningProgramVersion(app: ref<App>) -> Span<u8> {
+    if bufLen(app.liveVersion) > 0 {
+        return bytes(app.liveVersion)
+    }
     return std.env.getOr("ZERO_LEARNING_PROGRAM_VERSION", "base")
 }
 
@@ -294,7 +297,7 @@ fn learningEvolveProgram(app: mutref<App>, total: usize) -> Void {
         return
     }
     append(request, "{\"action\":\"evolve\",\"parent\":")
-    quoted(request, learningProgramVersion())
+    quoted(request, learningProgramVersion(app))
     append(request, ",\"workspace\":")
     quoted(request, bytes(app.workspace))
     append(request, ",\"experience\":")
@@ -342,6 +345,10 @@ fn learningEvolveProgram(app: mutref<App>, total: usize) -> Void {
         return
     }
     learningEvent(app, "program_evaluation", result)
+    if std.mem.eql(field(result, "accepted"), "true") && !stageLiveProgram(app, result) {
+        logEntry(app, "  EVOLUTION", "Graph saved, but live activation failed; the running generation is unchanged.")
+        return
+    }
     logEntry(app, "  EVOLUTION", result)
 }
 
@@ -499,7 +506,7 @@ fn learningStartGraph(app: mutref<App>, prompt: Span<u8>) -> Void {
     append(record, ",\"policy\":")
     number(record, app.learningSelectedPolicy)
     append(record, ",\"program_version\":")
-    quoted(record, learningProgramVersion())
+    quoted(record, learningProgramVersion(app))
     append(record, ",\"mode\":")
     if hasArg("--learning-frozen") {
         quoted(record, "frozen")
@@ -782,7 +789,7 @@ fn learningExperience(app: mutref<App>, status: Span<u8>, summary: Span<u8>) -> 
     append(record, ",\"selected_policy\":")
     number(record, app.learningSelectedPolicy)
     append(record, ",\"program_version\":")
-    quoted(record, learningProgramVersion())
+    quoted(record, learningProgramVersion(app))
     append(record, ",\"provider\":")
     quoted(record, providerSlug(app.provider))
     append(record, ",\"model\":")

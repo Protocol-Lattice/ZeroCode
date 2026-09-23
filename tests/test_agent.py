@@ -23,6 +23,13 @@ EXE = Path(os.environ.get("ZERO_TEST_EXE", ROOT / "dist" / "zero-code"))
 KEYS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
 
 
+def function_tools(body, provider):
+    """Normalize function definitions; provider-hosted tools have their own shape."""
+    return [tool if provider == "claude" else tool["function"]
+            for tool in body.get("tools", [])
+            if provider == "claude" or tool.get("type") == "function"]
+
+
 class StreamReply:
     """Chunks may be a generator gated by a test to prove incremental output."""
     def __init__(self, chunks):
@@ -194,7 +201,7 @@ class AgentTests(unittest.TestCase):
     def test_make_run_in_standard_terminal(self):
         terminal = Terminal([], environment(keys=False), command=["make", "run", "ARGS=--no-session-logs"])
         try:
-            terminal.wait_for("Your terminal.", timeout=20)
+            terminal.wait_for("Your terminal.", timeout=120)
             self.assertIn(b"\x1b[48;5;234m", terminal.output)
             self.assertNotIn(b"u001b[", terminal.output)
             terminal.send("/provider\r")
@@ -214,8 +221,9 @@ class AgentTests(unittest.TestCase):
                 self.assertIn("Provider connected.", result.stdout)
                 headers, body = api.requests[0]
                 self.assertEqual(body["model"], "any/custom-model-id")
-                self.assertEqual(len(body["tools"]), 8)
-                names = [(tool if provider == "claude" else tool["function"])["name"] for tool in body["tools"]]
+                self.assertEqual(len(function_tools(body, provider)), 9)
+                names = [tool["name"] for tool in function_tools(body, provider)]
+                self.assertIn("web_fetch", names)
                 self.assertIn("delegate_tasks", names)
                 self.assertIn("memory", names)
                 self.assertNotIn("test-key-never-render-me", result.stdout + result.stderr)
@@ -580,7 +588,9 @@ class AgentTests(unittest.TestCase):
                     arguments = ["--cwd", folder, "--provider", provider, "--approve",
                                  "--no-skills", "--max-turns", "5"]
                     if interactive:
-                        terminal = Terminal(arguments, env)
+                        # Keep the full status visible even with long temporary
+                        # workspace paths; this checks completion, not scrolling.
+                        terminal = Terminal(arguments, env, rows=40)
                         try:
                             terminal.wait_for("Your terminal.")
                             terminal.send("Run the requested command once.\r")

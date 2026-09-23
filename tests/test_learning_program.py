@@ -5,14 +5,17 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from scripts.learning_program import (ProgramStore, Rejected, clean_environment,
                                       copy_package, replay_gate, validate_patches)
-from tests.test_agent import ROOT, MockAPI, environment, reply
+from tests.test_agent import ROOT, MockAPI, Terminal, environment, reply
 from tests.test_learning import read_route
+from tests import test_extensions
+from tests.test_memory import system_text
 from tests.test_parallel import results
 
 
@@ -112,6 +115,7 @@ class ProgramEvolutionTests(unittest.TestCase):
             shutil.copyfile(ROOT / ".tools/bin/zero", root / ".tools/bin/zero")
             (root / ".tools/bin/zero").chmod(0o700)
             (root / ".tools/compiler-frame-limit").write_text("16777216\n")
+            (root / ".tools/compiler-live-abi").write_text("2\n")
             shutil.copyfile(ROOT / "install.sh", root / "install.sh")
             checkout = root
             prefix = temporary / "prefix with 'quotes' $literal `literal`"
@@ -221,6 +225,139 @@ class ProgramEvolutionTests(unittest.TestCase):
             self.assertNotEqual(corrupt.returncode, 0)
             self.assertIn("changed after validation", corrupt.stdout)
             self.assertEqual(launch(["--learning-rollback", "base"]).returncode, 0)
+
+
+class LiveProgramTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory(prefix="zero-live-test-")
+        cls.addClassCleanup(cls.temporary.cleanup)
+        cls.root = Path(cls.temporary.name) / "program with spaces"
+        copy_package(ROOT, cls.root)
+        (cls.root / "scripts").mkdir()
+        for name in ("learning_program.py", "learning_benchmark.py"):
+            shutil.copyfile(ROOT / "scripts" / name, cls.root / "scripts" / name)
+        (cls.root / ".tools/bin").mkdir(parents=True)
+        shutil.copyfile(ROOT / ".tools/bin/zero", cls.root / ".tools/bin/zero")
+        (cls.root / ".tools/bin/zero").chmod(0o700)
+        cls.store = ProgramStore(cls.root)
+        with cls.store.locked():
+            cls.store.initialize()
+        cls.launcher = [sys.executable, str(cls.root / "scripts/learning_program.py"),
+                        "--root", str(cls.root), "--run", "--"]
+
+    def setUp(self):
+        with self.store.locked():
+            self.store.rollback("base")
+
+    def test_self_patches_activate_in_one_session_and_preserve_mcp(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            (workspace / "book.txt").write_text("x" * 55000)
+            test_extensions.ExtensionTests.configure_mcp(self, workspace)
+            responses = [
+                reply("openrouter", calls=[("mcp__demo__0_echo", {"text": "before"})]),
+                reply("openrouter", calls=[("self_patch", {"patches": [
+                    {"function": "systemPrompt", "return_text": "LIVE_PROMPT_TWO"},
+                    {"function": "renderInput", "body": 'paint(app, row, 4_usize, "", "LIVE_UI_TWO")'},
+                    {"function": "learningWindowValue", "body": "return 12000"}]}),
+                    ("self_inspect", {"function": "renderInput"})]),
+                reply("openrouter", calls=[("read_file", {"path": "book.txt"})]),
+                reply("openrouter", calls=[("self_patch", {"patches": [
+                    {"function": "systemPrompt", "return_text": "LIVE_PROMPT_THREE"},
+                    {"function": "renderInput", "body": 'paint(app, row, 4_usize, "", "LIVE_UI_THREE")'}]}),
+                    ("self_inspect", {"function": "renderInput"})]),
+                reply("openrouter", calls=[("mcp__demo__0_echo", {"text": "after"})]),
+                reply("openrouter", calls=[("self_patch", {"patches": [
+                    {"function": "learningWindowValue", "body": 'return "invalid"'}]})]),
+                reply("openrouter", calls=[("self_inspect", {"function": "renderInput"})]),
+                reply("openrouter", calls=[("finish_task", {"summary": "LIVE_SESSION_VERIFIED"})]),
+            ]
+            with MockAPI(responses) as api:
+                terminal = Terminal(["--cwd", str(workspace), "--no-memory", "--no-skills",
+                                     "--learning-frozen", "--parallel", "1", "--approve", "--mcp", "all"],
+                                    environment(api.url), command=self.launcher)
+                try:
+                    pid = terminal.process.pid
+                    terminal.wait_for("coding agent", timeout=30)
+                    terminal.send("Evolve twice and preserve the session\r")
+                    # Real graph replacements plus two complete native builds.
+                    terminal.wait_for("LIVE_SESSION_VERIFIED", timeout=1200)
+                    self.assertIsNone(terminal.process.poll())
+                    self.assertEqual(terminal.process.pid, pid)
+                    terminal.wait_for("LIVE_UI_THREE")
+                    start = len(terminal.output)
+                    terminal.send("/status\r")
+                    terminal.wait_for("CONTEXT", after=start)
+                    self.assertEqual(len(api.requests), len(responses), api.errors)
+                    first = [json.loads(text) for _, text in results(api.requests[2][1], "openrouter")[-2:]]
+                    second = [json.loads(text) for _, text in results(api.requests[4][1], "openrouter")[-2:]]
+                    self.assertTrue(first[0]["accepted"])
+                    self.assertEqual(first[1]["version"], first[0]["version"])
+                    self.assertIn("LIVE_UI_TWO", first[1]["content"])
+                    self.assertEqual(second[0]["parent"], first[0]["version"])
+                    self.assertEqual(second[1]["version"], second[0]["version"])
+                    self.assertIn("LIVE_UI_THREE", second[1]["content"])
+                    self.assertIn("LIVE_PROMPT_TWO", system_text(api.requests[2][1]))
+                    self.assertIn("LIVE_PROMPT_THREE", system_text(api.requests[4][1]))
+                    window = json.loads(results(api.requests[3][1], "openrouter")[-1][1])
+                    self.assertEqual(window["next_offset"], 12000)
+                    self.assertIn("MCP ECHO 2: after", results(api.requests[5][1], "openrouter")[-1][1])
+                    self.assertTrue(results(api.requests[6][1], "openrouter")[-1][1].startswith("Error:"))
+                    last = json.loads(results(api.requests[7][1], "openrouter")[-1][1])
+                    self.assertEqual(last["version"], second[0]["version"])
+                    self.assertEqual(self.store.state()["head"], last["version"])
+                    starts = [json.loads(line) for line in (workspace / "demo.jsonl").read_text().splitlines()
+                              if json.loads(line).get("event") == "started"]
+                    self.assertEqual(len(starts), 1)
+                    self.assertEqual(len(list((workspace / ".zero-agent/sessions").iterdir())), 1)
+                finally:
+                    terminal.close()
+            module = self.store.generation(self.store.state()["head"]) / "zero-live.so"
+            original = module.read_bytes()
+            try:
+                module.write_bytes(original + b"tampered")
+                with self.assertRaisesRegex(Rejected, "live module changed after validation"):
+                    self.store.generation(self.store.state()["head"])
+            finally:
+                module.write_bytes(original)
+
+    def test_automatic_evolution_changes_the_next_task_without_restart(self):
+        completed = []
+        def route(body):
+            messages = body["messages"]
+            start = max(i for i, message in enumerate(messages) if message["role"] == "user")
+            current = {**body, "messages": messages[start:]}
+            observations = results(current, "openrouter")
+            if observations and not json.loads(observations[-1][1])["truncated"]:
+                completed.append(len(observations))
+                return reply("openrouter", f"LIVE_READ_DONE_{len(completed)}")
+            return read_route(current)
+
+        with tempfile.TemporaryDirectory() as temporary, MockAPI([route]) as api:
+            workspace = Path(temporary)
+            (workspace / "book.txt").write_text("x" * 55000)
+            terminal = Terminal(["--cwd", str(workspace), "--no-memory", "--no-skills", "--parallel", "1"],
+                                environment(api.url), command=self.launcher)
+            try:
+                terminal.wait_for("coding agent", timeout=30)
+                terminal.send("Read book.txt completely\r")
+                terminal.wait_for("live activation", timeout=900)
+                first = self.store.state()["head"]
+                self.assertNotEqual(first, "base")
+                terminal.send("Read book.txt completely again\r")
+                terminal.wait_for("LIVE_READ_DONE_2", timeout=60)
+                self.assertEqual(completed, [7, 5])
+                self.assertEqual(self.store.state()["head"], first)
+                self.assertIsNone(terminal.process.poll())
+                self.assertEqual(len(list((workspace / ".zero-agent/sessions").iterdir())), 1)
+                # Both tasks use one native session, but record the code actually
+                # executing each task, rather than retaining the launch version.
+                outcomes = [row["data"] for path in (workspace / ".zero-agent/program-learning/experiences").glob("*.jsonl")
+                            for row in map(json.loads, path.read_text().splitlines()) if row["event"] == "outcome"]
+                self.assertEqual({row["program_version"] for row in outcomes}, {"base", first})
+            finally:
+                terminal.close()
 
 
 if __name__ == "__main__":

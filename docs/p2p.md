@@ -8,20 +8,30 @@ Seed addresses are bootstrap links, not privileged agents.
 ## Start a local mesh
 
 Build with `./scripts/build.sh`. Set the same randomly generated group secret in
-each terminal (`ZERO_PEER_TOKEN`, 32–256 printable characters). For example,
-generate one with `openssl rand -hex 32`, then export that value in each terminal.
+each terminal (`ZERO_PEER_TOKEN`, 32–256 printable characters). Generate it once:
+
+```sh
+openssl rand -hex 32
+```
+
+Copy the resulting 64-character value into each terminal's export below.
+`ZERO_PEER_TOKEN` is an environment variable, not a command-line argument or a
+token-length setting. Both peers must use the same value.
 Configure the provider's API key separately; it is never sent to other peers.
 
 ```sh
 # Terminal A
+export ZERO_PEER_TOKEN='<paste the generated value here>'
 ./zero-code --peer-name alpha --peer-port 4311 \
   --peers http://127.0.0.1:4312 --workflow agentic --context-window 1000000
 
 # Terminal B (may use another --cwd and another provider/model)
+export ZERO_PEER_TOKEN='<paste the same generated value here>'
 ./zero-code --peer-name beta --peer-port 4312 \
   --peers http://127.0.0.1:4311 --workflow agentic --context-window 1000000
 
 # Terminal C only needs a link into the mesh. Lessons propagate transitively.
+export ZERO_PEER_TOKEN='<paste the same generated value here>'
 ./zero-code --peer-name gamma --peer-port 4313 \
   --peers http://127.0.0.1:4312 --workflow agentic --context-window 1000000
 ```
@@ -168,22 +178,27 @@ request data plus one byte to detect overflow.
 The TUI previews the proposal and uses the normal approval flow (`--approve` for
 an unattended run). The driver copies the active program, applies real
 `zero patch --replace-fn` operations, exports projections and compiles it. Only a
-successful build is atomically selected for the **next launch**. The running
-process keeps its current executable. A failed or stale proposal leaves HEAD
-unchanged. Cancellation stops the compiler process group. Explicit patches use
-compiler validation; they are not claimed to improve behavior and the candidate
+successful build is atomically saved and loaded into the **current session**.
+The event loop switches to the new code before the next tool or model request,
+keeping the process, conversation, terminal and connections alive. A failed
+build or stale proposal leaves HEAD unchanged. A module load or integrity failure
+keeps the old code running and explicitly reports that activation failed.
+Cancellation stops the compiler process group. Explicit patches use compiler
+validation; they are not claimed to improve behavior and the candidate
 is not executed during admission.
 
 Rejected patches are shown as failures with compiler diagnostics. After three
 failed `self_patch` calls within one user task, the loop stops, including when
 other tools were called between attempts. Send a new message with a corrected
 proposal to start another task. An accepted patch is displayed with its saved
-generation and blocks further edits in that process until restart.
+generation and can be followed by another patch in the same session.
 
-After a successful patch, `self_inspect` with `"target":"selected"` reads the
-generation selected for the next launch. The default `"target":"running"` still
-reads this process's generation. Restart before editing again when those
-generations differ.
+After a successful patch and activation, the default `self_inspect` target
+`"running"` reads the active generation. `"target":"selected"` reads the latest
+saved generation; these can differ if activation failed or another session
+changed HEAD. Changes apply on subsequent calls; startup work already completed
+is not rerun. Existing workers complete with their original generation and new
+workers use the updated executable.
 
 Each `--peer-name` has a separate lineage under
 `.zero-agent/evolution/peers/NAME/` in the source checkout or installed program
@@ -203,17 +218,12 @@ file tools enforce their existing workspace, path and approval rules.
 
 In a session started with `--self-evolve --peer-name alpha`, ask:
 
-> Call self_inspect with function helpText and read its complete source. Then use
-> self_patch to append a separate line `[zero.graph: v2]` to the returned help
-> text. Preserve the complete existing help. Report the compiler result, new
-> generation ID and graph_path. Use self_inspect with target selected to show
-> the new function, and explain that activation requires a restart.
+> Call self_inspect with function renderInput and read its complete source. Then
+> use self_patch to add a visible `[zero.graph: v2]` marker to the input renderer.
+> Preserve the existing input behavior. Report the compiler result, new
+> generation ID and graph_path. Use self_inspect with target running to show
+> the active function.
 
-After the proposal is accepted, exit and run:
-
-```sh
-./zero-code --self-evolve --peer-name alpha --help
-```
-
-The added line is emitted by the newly compiled program. Reuse the same peer
-name and program checkout/bundle when inspecting history or rolling back.
+After the proposal is accepted, the marker appears in the same TUI. The updated
+renderer runs without restarting the program. Reuse the
+same peer name and program checkout/bundle when inspecting history or rolling back.

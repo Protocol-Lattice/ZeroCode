@@ -578,7 +578,7 @@ fn renderInput(app: mutref<App>, row: usize, columns: usize) -> Void {
     }
 }
 
-fn render(world: World, app: mutref<App>) -> Void raises {
+fn render(app: mutref<App>) -> Void raises {
     let transcriptData: MutSpan<u8> = app.transcript
     let modelData: MutSpan<u8> = app.model
     let keyData: MutSpan<u8> = app.key
@@ -596,7 +596,7 @@ fn render(world: World, app: mutref<App>) -> Void raises {
     append(frameData, "\x1b[0m\x1b[48;5;234m\x1b[38;5;252m\x1b[2J\x1b[H")
     if columns < 72 || rows < 24 {
         append(frameData, "\n  ZERO · Expand your terminal to at least 72 × 24.\n\n  Ctrl-C to exit.")
-        check writeFrame(world, app, rows, columns)
+        check writeFrame(app, rows, columns)
         return
     }
     paint(app, 2_usize, 4_usize, "\x1b[1;38;5;183m", "◇ ZERO")
@@ -657,6 +657,9 @@ fn render(world: World, app: mutref<App>) -> Void raises {
         }
         if app.phase == 3 {
             status = "running command · esc to stop"
+            if std.mem.eql(bytes(app.toolName), "web_fetch") {
+                status = "fetching web page · esc to stop"
+            }
             color = "\x1b[38;5;183m"
         }
         if app.phase == 6 {
@@ -707,7 +710,7 @@ fn render(world: World, app: mutref<App>) -> Void raises {
     append(frameData, "k")
     append(frameData, "\x1b[0m\x1b[?25l")
     if bufOk(frameData) {
-        check writeFrame(world, app, rows, columns)
+        check writeFrame(app, rows, columns)
     }
 }
 
@@ -735,12 +738,12 @@ fn frameRow(output: MutSpan<u8>, frame: Span<u8>, index: Span<u8>, row: usize) -
     }
 }
 
-fn writeFrame(world: World, app: mutref<App>, rows: usize, columns: usize) -> Void raises {
+fn writeFrame(app: mutref<App>, rows: usize, columns: usize) -> Void raises {
     if !bufOk(app.frameIndex) {
         return
     }
     if bufLen(app.previousFrame) == 0 || rows != app.frameRows || columns != app.frameColumns {
-        check world.out.write(bytes(app.frame))
+        check liveOutput(bytes(app.frame))
     } else if !std.mem.eql(bytes(app.frame), bytes(app.previousFrame)) {
         var storage: [49152]u8 = [0_u8; 49152]
         var currentStorage: [4096]u8 = [0_u8; 4096]
@@ -761,7 +764,7 @@ fn writeFrame(world: World, app: mutref<App>, rows: usize, columns: usize) -> Vo
         }
         if bufLen(changes) > 0 && bufOk(changes) {
             append(changes, "\x1b[0m\x1b[?25l")
-            check world.out.write(bytes(changes))
+            check liveOutput(bytes(changes))
         }
     }
     setText(app.previousFrame, bytes(app.frame))

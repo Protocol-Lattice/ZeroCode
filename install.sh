@@ -171,7 +171,11 @@ main() {
         fi
         compiler=${ZERO_COMPILER:-"$project_dir/.tools/bin/zero"}
         if [ -z "${ZERO_COMPILER:-}" ]; then
-            if [ ! -x "$compiler" ] || [ ! -f "$project_dir/.tools/compiler-frame-limit" ] || [ "$(cat "$project_dir/.tools/compiler-frame-limit")" != 16777216 ]; then
+            if [ ! -x "$compiler" ] ||
+               [ ! -f "$project_dir/.tools/compiler-frame-limit" ] ||
+               [ "$(cat "$project_dir/.tools/compiler-frame-limit")" != 16777216 ] ||
+               [ ! -f "$project_dir/.tools/compiler-live-abi" ] ||
+               [ "$(cat "$project_dir/.tools/compiler-live-abi")" != 2 ]; then
                 sh "$project_dir/scripts/setup-zero.sh"
             fi
         fi

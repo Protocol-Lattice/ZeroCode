@@ -3,10 +3,6 @@ fn prepareSelfPatch(app: mutref<App>) -> Bool {
         toolResult(app, "Error: self_patch requires launching this peer with --self-evolve.")
         return false
     }
-    if app.selfPatchSelected {
-        toolResult(app, "Error: a graph update is already saved for the next launch. Inspect target selected and finish_task; restart before another self_patch.")
-        return false
-    }
     let patches: Span<u8> = field(bytes(app.arguments), "patches")
     let count: Maybe<usize> = std.json.arrayCount(patches)
     if !count.has {
@@ -18,7 +14,7 @@ fn prepareSelfPatch(app: mutref<App>) -> Bool {
         return false
     }
     logEntry(app, "  PROPOSED ZERO.GRAPH CHANGE", bytes(app.arguments))
-    logEntry(app, "  ACTIVATION", "Compile the replacement function bodies and select a new executable for the next launch. The compiler checks the graph; runtime behavior is not evaluated. Previous generations remain available for rollback.")
+    logEntry(app, "  ACTIVATION", "Compile replacement function bodies and activate them in this session between event-loop steps. The compiler checks the graph; runtime behavior is not evaluated. Previous generations remain available for rollback.")
     return true
 }
 
@@ -35,7 +31,7 @@ fn applySelfPatch(app: mutref<App>) -> Void {
     var requestStorage: [65552]u8 = [0_u8; 65552]
     let request: MutSpan<u8> = buffer(requestStorage)
     append(request, "{\"action\":\"patch\",\"parent\":")
-    quoted(request, learningProgramVersion())
+    quoted(request, learningProgramVersion(app))
     append(request, ",\"patches\":")
     append(request, field(bytes(app.arguments), "patches"))
     put(request, 125_u8)
@@ -67,9 +63,127 @@ fn appendProgramContext(app: mutref<App>) -> Void {
     if !learningProgramEnabled() || app.workerMode > 0 {
         return
     }
-    append(app.systemContext, "\nOwn-program tools: self_inspect reads a function from your executable zero.graph even outside the workspace. Read every page via next_offset while truncated. self_patch compiles replacements after approval. For systemPrompt use return_text with the complete prompt; the driver generates valid Zero code. For other code, body contains Zero statements, with no function wrapper, Markdown or trailing semicolon. On failure read the diagnostic and correct the cause; three failures stop the task. Only accepted:true confirms a saved generation. Then self_inspect with target selected reads the next-launch graph; target running still reads this process. Call finish_task after confirming the change and tell the user to restart. Further self_patch calls require restart. Sealed generations remain available for rollback; never edit them directly.\nRunning generation: ")
-    append(app.systemContext, learningProgramVersion())
-    append(app.systemContext, "\nGeneration directory (metadata, not a workspace path): ")
-    append(app.systemContext, std.env.getOr("ZERO_LEARNING_PROGRAM_GRAPH_DIR", ""))
+    append(app.systemContext, "\nOwn-program tools: self_inspect reads a function from your executable zero.graph even outside the workspace. Read every page via next_offset while truncated. self_patch compiles replacements after approval and activates them in this session before the next tool or model request. For systemPrompt use return_text with the complete prompt; the driver generates valid Zero code. For other code, body contains Zero statements, with no function wrapper, Markdown or trailing semicolon. On failure read the diagnostic and correct the cause; three failures stop the task. Only accepted:true confirms a saved generation; activation errors are reported separately. After success, self_inspect target running reads the active replacement; further patches may use it immediately. Existing conversation and connections are retained. Changes affect subsequent calls, not startup work that already completed. Sealed generations remain available for rollback; never edit them directly.\nRunning generation: ")
+    append(app.systemContext, learningProgramVersion(app))
+    append(app.systemContext, "\nGeneration executable (metadata, not a workspace path): ")
+    append(app.systemContext, bytes(app.executable))
     append(app.systemContext, "\n")
+}
+
+fn liveOutput(text: Span<u8>) -> Void raises {
+    var i: usize = 0
+    while i < std.mem.len(text) {
+        process.zero_output_byte(text[i] as u32)
+        i = i + 1
+    }
+    if process.zero_output_flush() == 0 {
+        raise OutputFailed
+    }
+}
+
+fn liveField(value: Span<u8>, key: u32) -> Bool {
+    process.zero_live_reset()
+    var i: usize = 0
+    while i < std.mem.len(value) {
+        process.zero_live_byte(value[i] as u32)
+        i = i + 1
+    }
+    return process.zero_live_field(key) == 1
+}
+
+fn stageLiveProgram(app: mutref<App>, result: Span<u8>) -> Bool {
+    if !std.mem.eql(field(result, "accepted"), "true") {
+        return false
+    }
+    var pathStorage: [8192]u8 = [0_u8; 8192]
+    var versionStorage: [256]u8 = [0_u8; 256]
+    var hashStorage: [256]u8 = [0_u8; 256]
+    var digest: [64]u8 = [0_u8; 64]
+    var moduleStorage: [4194304]u8 = [0_u8; 4194304]
+    let path: MutSpan<u8> = buffer(pathStorage)
+    let version: MutSpan<u8> = buffer(versionStorage)
+    let expected: MutSpan<u8> = buffer(hashStorage)
+    if !decode(path, field(result, "generation_dir")) || !decode(version, field(result, "version")) || !decode(expected, field(result, "module_sha256")) {
+        return false
+    }
+    if !liveField(bytes(path), 0_u32) || !liveField(bytes(version), 1_u32) {
+        return false
+    }
+    append(path, "/zero-live.so")
+    if !bufOk(path) {
+        return false
+    }
+    let loaded: Maybe<usize> = std.fs.readBytes(bytes(path), moduleStorage)
+    if !loaded.has || loaded.value >= 4194304 {
+        return false
+    }
+    let hashed: Maybe<Span<u8>> = std.crypto.sha256Hex(digest, std.mem.prefix(moduleStorage, loaded.value))
+    if !hashed.has || !std.mem.eql(hashed.value, bytes(expected)) {
+        return false
+    }
+    return process.zero_live_stage() == 1
+}
+
+export c fn zero_live_tick_v1(app: mutref<App>) -> i32 {
+    return rescue liveTick(app) err(-1)
+}
+
+fn liveTick(app: mutref<App>) -> i32 raises {
+    if process.zero_live_changed() == 1 {
+        clear(app.executable)
+        clear(app.liveVersion)
+        var i: usize = 0
+        while i < 4096 && process.zero_live_at(0_u32, i as u32) > 0 {
+            put(app.executable, process.zero_live_at(0_u32, i as u32) as u8)
+            i = i + 1
+        }
+        append(app.executable, "/zero-code")
+        i = 0
+        while i < 64 && process.zero_live_at(1_u32, i as u32) > 0 {
+            put(app.liveVersion, process.zero_live_at(1_u32, i as u32) as u8)
+            i = i + 1
+        }
+        if !bufOk(app.executable) || !bufOk(app.liveVersion) {
+            raise LiveProgramMetadataLimit
+        }
+    }
+    if !app.headless {
+        readKeyboard(app)
+    }
+    if !app.alive {
+        return 1
+    }
+    if app.workerMode > 0 {
+        workerControl(app)
+    }
+    pollJobs(app)
+    pollMcp(app)
+    pollSkillFetch(app)
+    if app.phase == 1 || app.phase == 3 {
+        pollProcess(app)
+    }
+    if process.zero_live_pending() == 1 {
+        return 0
+    }
+    if app.phase == 2 {
+        nextTool(app)
+    }
+    if app.workerMode == 0 && app.headless && bufLen(app.transcript) > 0 {
+        check liveOutput(bytes(app.transcript))
+        clear(app.transcript)
+    }
+    if app.phase == 0 && app.learningActive && app.learningRequests == 0 {
+        learningFinish(app, "control", "Local operation finished; inspect trajectory for its result.")
+    }
+    if process.zero_live_pending() == 1 {
+        return 0
+    }
+    if app.headless && app.phase == 0 {
+        return 1
+    }
+    if !app.headless && app.tick % 4 == 0 {
+        check render(app)
+    }
+    app.tick = app.tick + 1
+    return 0
 }
