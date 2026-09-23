@@ -1,11 +1,16 @@
 #!/bin/sh
 set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ "${1:-}" = "--execution-program" ]; then
+    shift
+    exec python3 "$project_dir/scripts/execution_program.py" --binary "$project_dir/dist/zero-code" "$@"
+fi
 if [ "${1:-}" = "--self-evolve" ]; then
     shift
     exec python3 "$project_dir/scripts/learning_program.py" --root "$project_dir" --run -- "$@"
 fi
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    printf 'Bounded execution: ./zero-code --execution-program --help (checkout launcher only).\n'
     printf 'Executable evolution: zero-code --self-evolve [options] (put --self-evolve first).\n\n'
 fi
 exec "$project_dir/dist/zero-code" "$@"
