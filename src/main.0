@@ -67,6 +67,7 @@ type App {
     toolId: MutSpan<u8>,
     toolName: MutSpan<u8>,
     result: MutSpan<u8>,
+    commandOutput: MutSpan<u8>,
     packet: MutSpan<u8>,
     response: MutSpan<u8>,
     errors: MutSpan<u8>,
@@ -309,7 +310,7 @@ fn failTurn(app: mutref<App>, message: Span<u8>) -> Void {
 
 fn launchCommand(app: mutref<App>, script: Span<u8>) -> Void {
     let workspaceData: MutSpan<u8> = app.workspace
-    let resultData: MutSpan<u8> = app.result
+    let resultData: MutSpan<u8> = app.commandOutput
     let packetData: MutSpan<u8> = app.packet
     let errorsData: MutSpan<u8> = app.errors
     clear(packetData)
@@ -1051,11 +1052,17 @@ fn toolDescription(index: usize) -> String {
     if index == 3 {
         return "List workspace files respecting nested .gitignore rules and exceptions. Excludes secrets, version control and dependencies. Bounded output."
     }
-    return "Run a shell command after approval: searches, builds, checks or workspace graph operations. Timeout: 60 seconds."
+    return "Run a shell command after approval: searches, builds, checks or workspace graph operations. Timeout: 60 seconds. Combined stdout/stderr limit: 1 MiB (1048576 bytes); redirect larger output to a file."
 }
 
 fn pollProcess(app: mutref<App>) -> Void {
-    let resultData: MutSpan<u8> = app.result
+    let shellOutput: Bool = app.phase == 3 && (std.mem.eql(bytes(app.toolName), "run_command") || std.mem.eql(bytes(app.toolName), "list_files"))
+    var resultData: MutSpan<u8> = app.result
+    var outputError: String = "Error: command output exceeded 16 KiB. Re-run with a narrower query or redirect output."
+    if shellOutput {
+        resultData = app.commandOutput
+        outputError = "Error: command output exceeded 1 MiB (1048576 bytes combined stdout/stderr). Re-run with a narrower query or redirect output."
+    }
     var packetData: MutSpan<u8> = app.packet
     if app.phase == 1 {
         packetData = app.arguments
@@ -1092,16 +1099,25 @@ fn pollProcess(app: mutref<App>) -> Void {
             break
         }
     }
-    let errorCount: Maybe<usize> = std.proc.readStderr(app.child, chunk)
-    if errorCount.has {
-        append(errorsData, std.mem.prefix(chunk, errorCount.value))
+    drain = 0
+    while drain < 16 {
+        let errorCount: Maybe<usize> = std.proc.readStderr(app.child, chunk)
+        if errorCount.has {
+            if errorCount.value == 0 {
+                break
+            }
+            append(errorsData, std.mem.prefix(chunk, errorCount.value))
+            drain = drain + 1
+        } else {
+            break
+        }
     }
-    if !bufOk(responseData) || !bufOk(resultData) || !bufOk(errorsData) {
+    if !bufOk(responseData) || !bufOk(resultData) || !bufOk(errorsData) || shellOutput && bufLen(resultData) + bufLen(errorsData) > 1048576 {
         if app.phase == 1 {
             failTurn(app, "Provider response exceeded the 12 MiB message limit.")
         } else {
             stopChild(app)
-            toolResult(app, "Error: command output exceeded 16 KiB. Re-run with a narrower query or redirect output.")
+            toolResult(app, outputError)
         }
         return
     }
@@ -1176,8 +1192,8 @@ fn pollProcess(app: mutref<App>) -> Void {
         }
         finishHttp(app)
     } else {
-        if !bufOk(resultData) || !bufOk(errorsData) {
-            toolResult(app, "Error: command output exceeded the limit. Use a narrower query.")
+        if !bufOk(resultData) || !bufOk(errorsData) || shellOutput && bufLen(resultData) + bufLen(errorsData) > 1048576 {
+            toolResult(app, outputError)
             return
         }
         if std.mem.eql(bytes(app.toolName), "web_fetch") {
@@ -1191,6 +1207,11 @@ fn pollProcess(app: mutref<App>) -> Void {
         if bufLen(errorsData) > 0 {
             append(resultData, "\n[stderr]\n")
             append(resultData, bytes(errorsData))
+        }
+        if !bufOk(resultData) {
+            app.commandResult = false
+            toolResult(app, outputError)
+            return
         }
         if std.mem.eql(bytes(app.toolName), "self_patch") || std.mem.eql(bytes(app.toolName), "self_inspect") {
             app.commandResult = false
@@ -1234,6 +1255,11 @@ fn pollProcess(app: mutref<App>) -> Void {
             append(resultData, "\n[exit ")
             append(resultData, code.value)
             put(resultData, 93_u8)
+        }
+        if !bufOk(resultData) {
+            app.commandResult = false
+            toolResult(app, outputError)
+            return
         }
         toolResult(app, bytes(resultData))
     }
@@ -1913,7 +1939,9 @@ fn runApplication(world: World) -> i32 {
     var toolId: [256]u8 = [0_u8; 256]
     var toolName: [128]u8 = [0_u8; 128]
     var result: [16400]u8 = [0_u8; 16400]
-    var errors: [8192]u8 = [0_u8; 8192]
+    // 1 MiB of command output plus buffer metadata and stderr/exit labels.
+    var commandOutput: [1048656]u8 = [0_u8; 1048656]
+    var errors: [1048592]u8 = [0_u8; 1048592]
     var keyboard: [8192]u8 = [0_u8; 8192]
     var frame: [49152]u8 = [0_u8; 49152]
     var historyEmpty: [32]u8 = [0_u8; 32]
@@ -1935,7 +1963,7 @@ fn runApplication(world: World) -> i32 {
     var mcpRx2Empty: [32]u8 = [0_u8; 32]
     var mcpRx3Empty: [32]u8 = [0_u8; 32]
     var workerEmpty: [1024]u8 = [0_u8; 1024]
-    var app: App = App { provider: 0, view: 0, selection: 0, phase: 0, alive: true, headless: false, approve: false, demo: false, paste: false, history: buffer(historyEmpty), transcript: buffer(transcriptEmpty), input: buffer(input), model: buffer(model), key: buffer(key), endpoint: buffer(endpoint), workspace: buffer(workspace), executable: buffer(executable), pending: buffer(pendingEmpty), arguments: buffer(arguments), toolId: buffer(toolId), toolName: buffer(toolName), result: buffer(result), packet: buffer(packetEmpty), response: buffer(responseEmpty), errors: buffer(errors), scratch: buffer(scratchEmpty), frame: buffer(frame), keyboard: buffer(keyboard), previousFrame: buffer(responseEmpty), frameIndex: buffer(responseEmpty), previousFrameIndex: buffer(responseEmpty), frameRows: 0, frameColumns: 0, child: std.proc.spawnChild(""), sent: 0, toolIndex: 0, turn: 0, maxTurns: 20, maxOutputTokens: 0, contextWindow: 1000000, contextTokenMicros: 333334, contextRequestBytes: 0, contextOverheadBytes: 0, contextLastInputTokens: 0, outputTruncations: 0, outputBatching: false, toolCount: 0, commandResult: false, commandExitCode: 0, commandOutputBytes: 0, commandElapsedMs: 0, filesChanged: 0, tokens: 0, scroll: 0, turnStart: 0, started: std.time.monotonic(), tick: 0, exitCode: 0, toolsEnabled: true, workflowEnabled: false, workflowStage: 0, workflowObserved: false, workflowVerified: false, workflowInspection: false, workflowEvidenceTurn: 0, workflowNudges: 0, workflowRepairs: 0, workflowGoal: buffer(responseEmpty), workflowPlan: buffer(responseEmpty), workflowCheck: buffer(responseEmpty), workflowNote: buffer(responseEmpty), workflowEvidence: buffer(responseEmpty), lastToolSnapshot: buffer(snapshotEmpty), repeatCount: 0, selfPatchFailures: 0, liveVersion: buffer(liveVersion), mcpConfig: buffer(mcpConfigEmpty), mcpTools: buffer(mcpToolsEmpty), mcpTx: buffer(mcpTxEmpty), mcpCursor: buffer(mcpCursorEmpty), skills: buffer(skillsEmpty), activeSkill: buffer(activeSkillEmpty), systemContext: buffer(systemContextEmpty), memory: buffer(responseEmpty), memoryEnabled: true, memorySkipSave: false, learningSelectedPolicy: 0, learningGlobalHead: buffer(responseEmpty), learningGlobalPolicy: 0, learningGlobalMode: false, learningPromoteRead: false, learningPromoteRetry: false, learningEnabled: false, learningActive: false, learningComplete: false, learningGraph: buffer(responseEmpty), learningNodes: buffer(responseEmpty), learningEdges: buffer(responseEmpty), learningEvidence: buffer(responseEmpty), learningIdentity: buffer(responseEmpty), learningTask: buffer(responseEmpty), learningProject: buffer(responseEmpty), learningHead: buffer(responseEmpty), learningSequence: 0, learningFailures: 0, learningCorrections: 0, learningTestsPassed: 0, learningTestsFailed: 0, learningTraversals: 0, learningRequests: 0, learningUsageReports: 0, learningInputTokens: 0, learningOutputTokens: 0, learningTools: 0, learningTokenStart: 0, learningStarted: std.time.zero(), learningPreviousFailed: false, learningRepeatedInvalid: 0, logEnabled: false, logFailed: false, logStreaming: false, logSequence: 0, logPath: buffer(responseEmpty), logSecrets: buffer(responseEmpty), logTail: buffer(responseEmpty), logWorkerTail0: buffer(responseEmpty), logWorkerTail1: buffer(responseEmpty), logWorkerTail2: buffer(responseEmpty), logWorkerTail3: buffer(responseEmpty), mcpRx0: buffer(mcpRx0Empty), mcpRx1: buffer(mcpRx1Empty), mcpRx2: buffer(mcpRx2Empty), mcpRx3: buffer(mcpRx3Empty), mcpChild0: std.proc.spawnChild(""), mcpChild1: std.proc.spawnChild(""), mcpChild2: std.proc.spawnChild(""), mcpChild3: std.proc.spawnChild(""), mcpCount: 0, mcpIndex: 0, mcpStage: 0, mcpRequest: 0, mcpSent: 0, mcpPage: 0, mcpConnectAll: false, skillCount: 0, streamMode: 0, httpStatus: 0, streamActive: 0, streamDone: false, streamVisible: false, streamLine: buffer(responseEmpty), streamEvent: buffer(responseEmpty), streamMessage: buffer(responseEmpty), streamArguments: buffer(responseEmpty), streamArgumentBytes: 0, workerMode: 0, workerApprovalSent: false, workerEvents: buffer(responseEmpty), workerToolActive: false, workerCompletedTools: 0, workerData0: buffer(workerEmpty), workerState0: workerQueued, workerToolCount0: 0, workerToolActive0: false, workerHasStarted0: false, workerStarted0: std.time.zero(), workerFinished0: std.time.zero(), workerData1: buffer(workerEmpty), workerState1: workerQueued, workerToolCount1: 0, workerToolActive1: false, workerHasStarted1: false, workerStarted1: std.time.zero(), workerFinished1: std.time.zero(), workerData2: buffer(workerEmpty), workerState2: workerQueued, workerToolCount2: 0, workerToolActive2: false, workerHasStarted2: false, workerStarted2: std.time.zero(), workerFinished2: std.time.zero(), workerData3: buffer(workerEmpty), workerState3: workerQueued, workerToolCount3: 0, workerToolActive3: false, workerHasStarted3: false, workerStarted3: std.time.zero(), workerFinished3: std.time.zero(), workersVisible: false, workerDisplayLines: 0, parallelLimit: 4, jobsMode: 0, jobsCount: 0, jobsCommitted: 0, jobsRepeated: false, jobsApproval: 0, jobsPlan: buffer(responseEmpty), jobChild0: std.proc.spawnChild(""), jobTx0: buffer(responseEmpty), jobRx0: buffer(responseEmpty), jobState0: 0, jobSent0: 0, jobStarted0: std.time.monotonic(), jobFailed0: false, jobChild1: std.proc.spawnChild(""), jobTx1: buffer(responseEmpty), jobRx1: buffer(responseEmpty), jobState1: 0, jobSent1: 0, jobStarted1: std.time.monotonic(), jobFailed1: false, jobChild2: std.proc.spawnChild(""), jobTx2: buffer(responseEmpty), jobRx2: buffer(responseEmpty), jobState2: 0, jobSent2: 0, jobStarted2: std.time.monotonic(), jobFailed2: false, jobChild3: std.proc.spawnChild(""), jobTx3: buffer(responseEmpty), jobRx3: buffer(responseEmpty), jobState3: 0, jobSent3: 0, jobStarted3: std.time.monotonic(), jobFailed3: false }
+    var app: App = App { provider: 0, view: 0, selection: 0, phase: 0, alive: true, headless: false, approve: false, demo: false, paste: false, history: buffer(historyEmpty), transcript: buffer(transcriptEmpty), input: buffer(input), model: buffer(model), key: buffer(key), endpoint: buffer(endpoint), workspace: buffer(workspace), executable: buffer(executable), pending: buffer(pendingEmpty), arguments: buffer(arguments), toolId: buffer(toolId), toolName: buffer(toolName), result: buffer(result), commandOutput: buffer(commandOutput), packet: buffer(packetEmpty), response: buffer(responseEmpty), errors: buffer(errors), scratch: buffer(scratchEmpty), frame: buffer(frame), keyboard: buffer(keyboard), previousFrame: buffer(responseEmpty), frameIndex: buffer(responseEmpty), previousFrameIndex: buffer(responseEmpty), frameRows: 0, frameColumns: 0, child: std.proc.spawnChild(""), sent: 0, toolIndex: 0, turn: 0, maxTurns: 20, maxOutputTokens: 0, contextWindow: 1000000, contextTokenMicros: 333334, contextRequestBytes: 0, contextOverheadBytes: 0, contextLastInputTokens: 0, outputTruncations: 0, outputBatching: false, toolCount: 0, commandResult: false, commandExitCode: 0, commandOutputBytes: 0, commandElapsedMs: 0, filesChanged: 0, tokens: 0, scroll: 0, turnStart: 0, started: std.time.monotonic(), tick: 0, exitCode: 0, toolsEnabled: true, workflowEnabled: false, workflowStage: 0, workflowObserved: false, workflowVerified: false, workflowInspection: false, workflowEvidenceTurn: 0, workflowNudges: 0, workflowRepairs: 0, workflowGoal: buffer(responseEmpty), workflowPlan: buffer(responseEmpty), workflowCheck: buffer(responseEmpty), workflowNote: buffer(responseEmpty), workflowEvidence: buffer(responseEmpty), lastToolSnapshot: buffer(snapshotEmpty), repeatCount: 0, selfPatchFailures: 0, liveVersion: buffer(liveVersion), mcpConfig: buffer(mcpConfigEmpty), mcpTools: buffer(mcpToolsEmpty), mcpTx: buffer(mcpTxEmpty), mcpCursor: buffer(mcpCursorEmpty), skills: buffer(skillsEmpty), activeSkill: buffer(activeSkillEmpty), systemContext: buffer(systemContextEmpty), memory: buffer(responseEmpty), memoryEnabled: true, memorySkipSave: false, learningSelectedPolicy: 0, learningGlobalHead: buffer(responseEmpty), learningGlobalPolicy: 0, learningGlobalMode: false, learningPromoteRead: false, learningPromoteRetry: false, learningEnabled: false, learningActive: false, learningComplete: false, learningGraph: buffer(responseEmpty), learningNodes: buffer(responseEmpty), learningEdges: buffer(responseEmpty), learningEvidence: buffer(responseEmpty), learningIdentity: buffer(responseEmpty), learningTask: buffer(responseEmpty), learningProject: buffer(responseEmpty), learningHead: buffer(responseEmpty), learningSequence: 0, learningFailures: 0, learningCorrections: 0, learningTestsPassed: 0, learningTestsFailed: 0, learningTraversals: 0, learningRequests: 0, learningUsageReports: 0, learningInputTokens: 0, learningOutputTokens: 0, learningTools: 0, learningTokenStart: 0, learningStarted: std.time.zero(), learningPreviousFailed: false, learningRepeatedInvalid: 0, logEnabled: false, logFailed: false, logStreaming: false, logSequence: 0, logPath: buffer(responseEmpty), logSecrets: buffer(responseEmpty), logTail: buffer(responseEmpty), logWorkerTail0: buffer(responseEmpty), logWorkerTail1: buffer(responseEmpty), logWorkerTail2: buffer(responseEmpty), logWorkerTail3: buffer(responseEmpty), mcpRx0: buffer(mcpRx0Empty), mcpRx1: buffer(mcpRx1Empty), mcpRx2: buffer(mcpRx2Empty), mcpRx3: buffer(mcpRx3Empty), mcpChild0: std.proc.spawnChild(""), mcpChild1: std.proc.spawnChild(""), mcpChild2: std.proc.spawnChild(""), mcpChild3: std.proc.spawnChild(""), mcpCount: 0, mcpIndex: 0, mcpStage: 0, mcpRequest: 0, mcpSent: 0, mcpPage: 0, mcpConnectAll: false, skillCount: 0, streamMode: 0, httpStatus: 0, streamActive: 0, streamDone: false, streamVisible: false, streamLine: buffer(responseEmpty), streamEvent: buffer(responseEmpty), streamMessage: buffer(responseEmpty), streamArguments: buffer(responseEmpty), streamArgumentBytes: 0, workerMode: 0, workerApprovalSent: false, workerEvents: buffer(responseEmpty), workerToolActive: false, workerCompletedTools: 0, workerData0: buffer(workerEmpty), workerState0: workerQueued, workerToolCount0: 0, workerToolActive0: false, workerHasStarted0: false, workerStarted0: std.time.zero(), workerFinished0: std.time.zero(), workerData1: buffer(workerEmpty), workerState1: workerQueued, workerToolCount1: 0, workerToolActive1: false, workerHasStarted1: false, workerStarted1: std.time.zero(), workerFinished1: std.time.zero(), workerData2: buffer(workerEmpty), workerState2: workerQueued, workerToolCount2: 0, workerToolActive2: false, workerHasStarted2: false, workerStarted2: std.time.zero(), workerFinished2: std.time.zero(), workerData3: buffer(workerEmpty), workerState3: workerQueued, workerToolCount3: 0, workerToolActive3: false, workerHasStarted3: false, workerStarted3: std.time.zero(), workerFinished3: std.time.zero(), workersVisible: false, workerDisplayLines: 0, parallelLimit: 4, jobsMode: 0, jobsCount: 0, jobsCommitted: 0, jobsRepeated: false, jobsApproval: 0, jobsPlan: buffer(responseEmpty), jobChild0: std.proc.spawnChild(""), jobTx0: buffer(responseEmpty), jobRx0: buffer(responseEmpty), jobState0: 0, jobSent0: 0, jobStarted0: std.time.monotonic(), jobFailed0: false, jobChild1: std.proc.spawnChild(""), jobTx1: buffer(responseEmpty), jobRx1: buffer(responseEmpty), jobState1: 0, jobSent1: 0, jobStarted1: std.time.monotonic(), jobFailed1: false, jobChild2: std.proc.spawnChild(""), jobTx2: buffer(responseEmpty), jobRx2: buffer(responseEmpty), jobState2: 0, jobSent2: 0, jobStarted2: std.time.monotonic(), jobFailed2: false, jobChild3: std.proc.spawnChild(""), jobTx3: buffer(responseEmpty), jobRx3: buffer(responseEmpty), jobState3: 0, jobSent3: 0, jobStarted3: std.time.monotonic(), jobFailed3: false }
     return frameStorage(world, &mut app)
 }
 

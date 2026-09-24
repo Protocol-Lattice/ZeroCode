@@ -298,6 +298,9 @@ configured token budget; use `/context` for the current values.
 Each HTTP request has a 360-second deadline. The application allows ten additional
 seconds for worker cleanup, so slow responses are not cut off after 100 seconds.
 `Esc` still cancels immediately; shell commands retain their 60-second limit.
+`run_command` and `list_files` accept up to **1 MiB (1,048,576 bytes)** of
+combined stdout and stderr. Exit-status and stderr labels do not count toward
+this limit. Redirect larger command output to a file and read the needed ranges.
 Tool argument fragments accumulate in separate buffers for each call; the final
 response JSON is assembled once when the stream ends. File content is copied in
 bounded blocks, and events without new usage or finish metadata skip the extra

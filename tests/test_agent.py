@@ -432,6 +432,60 @@ class AgentTests(unittest.TestCase):
             self.assertIn("[exit 7]", history)
             self.assertIn("[stderr]", history)
 
+    def test_large_command_output_reaches_each_provider_intact(self):
+        stdout = ('stdout: żółw 🐢 "quoted" \\path\n' * 1800) + "STDOUT_END"
+        stderr = ('stderr: żółw 🐢 "quoted" \\path\n' * 1800) + "STDERR_END"
+        expected = stdout + "\n[stderr]\n" + stderr + "\n[exit 7]"
+        for provider in ("openrouter", "openai", "claude", "gemini"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as folder, MockAPI([
+                reply(provider, calls=[("run_command", {"command": "cat stdout.txt; cat stderr.txt >&2; exit 7"})]),
+                reply(provider, "Output received.")]) as api:
+                (Path(folder) / "stdout.txt").write_text(stdout)
+                (Path(folder) / "stderr.txt").write_text(stderr)
+                result = self.run_agent(api, provider, folder, extra=("--approve",))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(len(api.requests), 2)
+                message = api.requests[-1][1]["messages"][-1]
+                actual = message["content"][0]["content"] if provider == "claude" else message["content"]
+                self.assertEqual(actual, expected)
+
+    def test_command_output_accepts_one_mib_including_stderr(self):
+        limit = 1024 * 1024
+        for stdout_size, stderr_size in ((limit, 0), (0, limit), (limit // 2, limit // 2)):
+            with self.subTest(stdout=stdout_size, stderr=stderr_size), tempfile.TemporaryDirectory() as folder, MockAPI([
+                reply("openrouter", calls=[("run_command", {"command": "cat stdout.txt; cat stderr.txt >&2; exit 7"})]),
+                reply("openrouter", "Output received.")]) as api:
+                stdout = "o" * stdout_size
+                stderr = "e" * stderr_size
+                (Path(folder) / "stdout.txt").write_text(stdout)
+                (Path(folder) / "stderr.txt").write_text(stderr)
+                result = self.run_agent(api, directory=folder, extra=("--approve",))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(len(api.requests), 2)
+                actual = api.requests[-1][1]["messages"][-1]["content"]
+                expected = stdout + ("\n[stderr]\n" + stderr if stderr else "") + "\n[exit 7]"
+                self.assertEqual(len(actual), len(expected))
+                self.assertTrue(actual == expected, "Command output was altered or truncated")
+
+    def test_command_output_rejects_over_one_mib_and_next_command_runs(self):
+        limit = 1024 * 1024
+        for stdout_size, stderr_size in ((limit + 1, 0), (0, limit + 1), (limit // 2, limit // 2 + 1)):
+            with self.subTest(stdout=stdout_size, stderr=stderr_size), tempfile.TemporaryDirectory() as folder, MockAPI([
+                reply("openrouter", calls=[
+                    ("run_command", {"command": "cat stdout.txt; cat stderr.txt >&2"}),
+                    ("run_command", {"command": "printf recovered"})]),
+                reply("openrouter", "Handled output limit.")]) as api:
+                (Path(folder) / "stdout.txt").write_text("o" * stdout_size)
+                (Path(folder) / "stderr.txt").write_text("e" * stderr_size)
+                result = self.run_agent(api, directory=folder, extra=("--approve",))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(len(api.requests), 2)
+                outputs = [message["content"] for message in api.requests[-1][1]["messages"]
+                           if message["role"] == "tool"]
+                self.assertEqual(len(outputs), 2)
+                self.assertIn("Error: command output exceeded 1 MiB", outputs[0])
+                self.assertEqual(outputs[1], "recovered\n[exit 0]")
+
     def test_api_errors(self):
         for response in ((401, {"error": {"message": "Invalid API key"}}), b"not json"):
             with self.subTest(response=response), MockAPI([response]) as api:
